@@ -1,0 +1,19 @@
+{
+  "login":{
+    "username": "/html/body/div[1]/div/div/form/div/div/div[1]/div/div/div/div[2]/input",
+    "password": "/html/body/div[1]/div/div/form/div/div/div[1]/div/div/div/div[3]/span[2]/input[2]",
+    "acessar": "/html/body/div[1]/div/div/form/div/div/div[1]/div/div/div/div[5]/button"
+    },
+  
+  "tela_inicio": {
+    "remove_pup_pop": "/html/body/div[7]/div[2]/div[1]/div[3]/a/img",
+    "bloco": "/html/body/div[1]/div/div[1]/div/ul/li[3]/a",
+    "interno": "/html/body/div[1]/div/div[1]/div/ul/li[3]/ul/li[2]/a"         
+  },
+
+  "interno": {
+    "numero_interno": "//a[@class='ancoraPadraoPreta ancoraBlocoAberto']",
+    "processo": "//a[contains(@class,'protocoloFechado')]",
+    "documentos_do_processo": "//a[contains(@class,'infraArvoreNoAcesso')]//span"
+  }
+}
