@@ -14,6 +14,7 @@
   "interno": {
     "numero_interno": "//a[@class='ancoraPadraoPreta ancoraBlocoAberto']",
     "processo": "//a[contains(@class,'protocoloFechado')]",
-    "documentos_do_processo": "//a[contains(@class,'infraArvoreNoAcesso')]//span"
+    "documentos_do_processo": "//a[contains(@class,'infraArvoreNoAcesso')]//span",
+    "plus": "a[@id='ancjoinPASTA2']/img"
   }
 }

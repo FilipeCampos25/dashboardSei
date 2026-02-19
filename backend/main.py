@@ -3,8 +3,7 @@ from __future__ import annotations
 import logging
 
 from app.config import get_settings
-from app.rpa.core.driver_factory import create_chrome_driver
-from app.rpa.core.logging_config import setup_logging
+from app.core.logging_config import setup_logging
 from app.rpa.scraping import SEIScraper
 
 
@@ -13,15 +12,20 @@ def main() -> None:
     setup_logging(settings.log_level)
     logger = logging.getLogger(__name__)
 
-    logger.info("Iniciando fluxo de acesso e login no SEI")
-    driver = create_chrome_driver(headless=settings.headless)
+    logger.info("Iniciando fluxo assistido no SEI")
 
+    # Importante: para login manual/2FA, configure HEADLESS=False no .env.
+    scraper = SEIScraper()
     try:
-        scraper = SEIScraper(driver=driver, settings=settings)
-        scraper.run_login_only()
-        logger.info("Fluxo de login finalizado com sucesso")
+        scraper.run_full_flow(
+            manual_login=True,
+            # Limites iniciais para você validar se está no caminho certo:
+            max_internos=3,
+            max_processos_por_interno=5,
+        )
+        logger.info("Fluxo assistido finalizado")
     finally:
-        driver.quit()
+        scraper.driver.quit()
 
 
 if __name__ == "__main__":
