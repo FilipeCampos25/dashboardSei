@@ -13,8 +13,13 @@
 
   "interno": {
     "numero_interno": "//a[@class='ancoraPadraoPreta ancoraBlocoAberto']",
+    "tabela_blocos_rows": "//tr[td]",
+    "numero_interno_link": ".//a[contains(@class,'ancoraBlocoAberto')]",
+    "descricao_cell": ".//a[contains(@class,'ancoraBlocoAberto')]/ancestor::td/following-sibling::td[not(contains(@class,'d-none')) and not(descendant::a) and normalize-space(.)!='']",
+    "paginacao_proxima": "//a[@title='Próxima' or @title='Proxima']",
     "processo": "//a[contains(@class,'protocoloFechado')]",
     "documentos_do_processo": "//div[contains(@class,'infraArvore')]//a[contains(@class,'infraArvoreNo')]/span",
     "plus": "a[@id='ancjoinPASTA2']/img"
   }
 }
+

@@ -78,6 +78,14 @@ class Settings(BaseSettings):
         default="INFO",
         validation_alias=AliasChoices("LOG_LEVEL", "log_level"),
     )
+    descricoes_busca: str = Field(
+        default="",
+        validation_alias=AliasChoices("DESCRICOES_BUSCA", "descricoes_busca"),
+    )
+    descricoes_match_mode: str = Field(
+        default="contains",
+        validation_alias=AliasChoices("DESCRICOES_MATCH_MODE", "descricoes_match_mode"),
+    )
 
 
 settings = Settings()
