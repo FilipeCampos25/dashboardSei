@@ -1,0 +1,22 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Backend SEI (Debug)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/backend/main.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "justMyCode": false,
+      "env": {
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "DEBUG": "true",
+        "LOG_LEVEL": "DEBUG",
+        "MANUAL_LOGIN": "true",
+        "HEADLESS": "false"
+      },
+      "purpose": ["debug-in-terminal"]
+    }
+  ]
+}
