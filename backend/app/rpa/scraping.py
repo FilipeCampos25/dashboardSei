@@ -6,7 +6,12 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Set
 
-from selenium.common.exceptions import TimeoutException, WebDriverException
+from selenium.common.exceptions import (
+    NoSuchFrameException,
+    StaleElementReferenceException,
+    TimeoutException,
+    WebDriverException,
+)
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
@@ -148,17 +153,73 @@ class SEIScraper:
             )
         return frames
 
-    def wait_for_elements(self, xpath: str, tag: str, timeout: int | None = None) -> List[Any]:
+    def wait_for_elements(
+        self,
+        xpath: str,
+        tag: str,
+        timeout: int | None = None,
+        restore_context: bool = True,
+    ) -> List[Any]:
         effective_timeout = timeout or self.timeout_seconds
         self._wait_for_document_ready(effective_timeout, tag)
-
-        def _finder(driver: Any) -> List[Any] | bool:
-            elems = driver.find_elements(By.XPATH, xpath)
-            return elems if elems else False
+        deadline = time.time() + effective_timeout
+        iframe_count_logged = False
 
         try:
-            return WebDriverWait(self.driver, effective_timeout).until(_finder)
-        except TimeoutException as exc:
+            while time.time() < deadline:
+                self.driver.switch_to.default_content()
+                elems = self.driver.find_elements(By.XPATH, xpath)
+                if elems:
+                    return elems
+
+                iframes = self.driver.find_elements(By.TAG_NAME, "iframe")
+                if iframes and not iframe_count_logged:
+                    self.logger.info(
+                        "wait_for_elements(%s): fallback em %d iframe(s)",
+                        tag,
+                        len(iframes),
+                    )
+                    iframe_count_logged = True
+
+                for idx in range(len(iframes)):
+                    if time.time() >= deadline:
+                        break
+
+                    try:
+                        self.driver.switch_to.default_content()
+                        current_iframes = self.driver.find_elements(By.TAG_NAME, "iframe")
+                        if idx >= len(current_iframes):
+                            continue
+
+                        frame = current_iframes[idx]
+                        frame_id = frame.get_attribute("id")
+                        frame_name = frame.get_attribute("name")
+                        frame_src = frame.get_attribute("src")
+
+                        self.logger.debug(
+                            "wait_for_elements(%s): tentando iframe[%d] id=%s name=%s src=%s",
+                            tag,
+                            idx,
+                            frame_id,
+                            frame_name,
+                            frame_src,
+                        )
+
+                        self.driver.switch_to.frame(frame)
+                        elems = self.driver.find_elements(By.XPATH, xpath)
+                        if elems:
+                            return elems
+                    except (StaleElementReferenceException, NoSuchFrameException, WebDriverException) as frame_exc:
+                        self.logger.debug(
+                            "wait_for_elements(%s): iframe[%d] indisponivel/stale (%s)",
+                            tag,
+                            idx,
+                            frame_exc,
+                        )
+                        continue
+
+                time.sleep(min(0.5, max(0.0, deadline - time.time())))
+
             frames = self._log_iframe_hint(f"wait_for_elements falhou ({tag})")
             self.logger.error(
                 "Timeout aguardando elementos: tag=%s xpath=%s timeout=%ss",
@@ -167,7 +228,15 @@ class SEIScraper:
                 effective_timeout,
             )
             self.logger.error("Contexto: iframe_count=%d url=%s", len(frames), self.driver.current_url)
-            raise exc
+            raise TimeoutException(
+                f"Timeout aguardando elementos: tag={tag} xpath={xpath} timeout={effective_timeout}s"
+            )
+        finally:
+            if restore_context:
+                try:
+                    self.driver.switch_to.default_content()
+                except WebDriverException:
+                    pass
 
     def wait_for_clickable(self, xpath: str, tag: str, timeout: int | None = None) -> Any:
         effective_timeout = timeout or self.timeout_seconds
@@ -421,7 +490,11 @@ class SEIScraper:
             return
 
         try:
-            elems = self.wait_for_elements(x_docs, tag="collect_documentos")
+            elems = self.wait_for_elements(
+                x_docs,
+                tag="collect_documentos",
+                restore_context=False,
+            )
             for elem in elems:
                 text = (elem.text or "").strip()
                 if text:
@@ -430,6 +503,11 @@ class SEIScraper:
                     self.found.add(text)
         except Exception as exc:
             self.logger.exception("Falha ao coletar documentos: %s", exc)
+        finally:
+            try:
+                self.driver.switch_to.default_content()
+            except WebDriverException:
+                pass
 
     def _close_current_tab_and_back(self) -> None:
         try:
