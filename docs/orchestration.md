@@ -1,43 +1,77 @@
 # Orquestracao
 
-## Panorama
-Atualmente a orquestracao e manual, com dois comandos separados:
+## Panorama atual
+A orquestracao ainda e operacional/manual, mas o backend ja executa um fluxo assistido completo (nao apenas login).
 
-1. Backend para autenticar no SEI.
-2. Streamlit para visualizacao.
+Comandos separados:
+1. Backend (`python backend/main.py`) para navegacao/coleta no SEI.
+2. Dashboard (`streamlit run dashboard_streamlit.py`) para analise.
 
-Nao existe scheduler ou pipeline automatizado no codigo atual.
-
-## Fluxo operacional atual
+## Fluxo operacional atual (real)
 1. Operador executa `python backend/main.py`.
-2. Script inicializa driver, realiza login e finaliza.
-3. Operador executa `streamlit run dashboard_streamlit.py`.
-4. Dashboard carrega CSV local se existir; caso contrario usa mock interno.
+2. Backend carrega `.env`, configura logs e sobe o Chrome WebDriver.
+3. `SEIScraper.run_full_flow(...)`:
+   - login manual/automatico;
+   - fechamento de pop-up;
+   - menu `Bloco > Interno`;
+   - selecao guiada de internos por `DESCRICOES_BUSCA`;
+   - coleta preview de `PARCERIAS VIGENTES` (quando aplicavel);
+   - abertura de processos e coleta de documentos na arvore.
+4. Backend encerra o driver.
+5. Operador executa `streamlit run dashboard_streamlit.py`.
+6. Dashboard tenta ler `output/sei_dashboard.csv`; se nao existir, usa dataset de exemplo.
 
-## Fluxo alvo (ja suportado parcialmente pelos modulos)
-1. Executar `SEIScraper.run()` para login, navegacao e coleta.
-2. Persistir resultado com `ReportBuilder` em `output/sei_dashboard.csv`.
-3. Iniciar Streamlit apontando para o arquivo atualizado.
+## Destaque de coletagem no fluxo
+O fluxo de orquestracao foi desenhado para suportar coletagem de:
 
-## Contratos entre etapas
-- Saida esperada da coleta: lista de dicionarios com timestamp e campos de negocio.
-- Artefato de integracao: `output/sei_dashboard.csv`.
-- Entrada do dashboard: CSV com colunas canonicas ou aliases reconhecidos.
+- parcerias vigentes
+- Memorando de Entendimento
+- TED
+- ACT
+- Plano de Trabalho (metas, acoes e prazos)
 
-## Dependencias de orquestracao
-- `.env` valido.
-- XPaths de login e navegacao atualizados.
-- XPath `coleta.linhas_tabela` definido para captura real.
-- Permissao de escrita em `output/`.
+Estado atual por etapa:
+- Backend (preview estruturado): `PARCERIAS VIGENTES` com `processo`, `parceiro`, `vigencia`, `objeto`, `numero_act` (ACT).
+- Backend (varredura de documentos): captura nomes dos documentos dos processos, incluindo documentos como Memorando/TED/ACT/Plano de Trabalho.
+- Dashboard (consumo): schema pronto para armazenar `documento`, `atribuicao`, `meta`, `acao`, `prazo`, `status`, `fonte`.
 
-## Proposta minima de automacao (proximo passo)
-- Criar um script unico (ex.: `run_pipeline.py`) que:
-1. Carrega configuracao.
-2. Executa `SEIScraper.run()`.
-3. Salva CSV com `ReportBuilder`.
-4. Opcionalmente inicia dashboard.
+## Contratos entre etapas (atual vs alvo)
+### Contrato atual efetivamente produzido
+- Arquivo preview: `backend/output/parcerias_vigentes_*.csv`
+- Colunas: `interno_descricao`, `seq`, `processo`, `parceiro`, `vigencia`, `numero_act`, `objeto`
 
-## Validacoes recomendadas no pipeline
-- Falha rapida se `username/password` estiverem vazios.
-- Falha clara se `coleta.linhas_tabela` nao estiver configurado.
-- Logar quantidade de registros coletados e caminho final do arquivo.
+### Contrato alvo para o dashboard
+- Arquivo: `output/sei_dashboard.csv` (raiz)
+- Colunas canonicas:
+  - `processo`
+  - `documento`
+  - `parceiro`
+  - `vigencia_inicio`
+  - `vigencia_fim`
+  - `objeto`
+  - `atribuicao`
+  - `meta`
+  - `acao`
+  - `prazo`
+  - `status`
+  - `fonte`
+  - `collected_at`
+
+## Dependencias operacionais
+- `.env` valido (especialmente `SEI_URL`, login e `DESCRICOES_BUSCA`)
+- `xpath_selector.json` atualizado conforme a UI do SEI
+- Google Chrome instalado
+- Permissao de escrita em `backend/output/` (preview) e/ou `output/` (pipeline dashboard)
+
+## Proposta minima de orquestracao (proximo passo)
+1. Criar etapa de transformacao do preview `parcerias_vigentes_*.csv` para o schema canonico do dashboard.
+2. Persistir em `output/sei_dashboard.csv` na raiz.
+3. Padronizar `documento`/`fonte` para distinguir Memorando de Entendimento, TED, ACT e Plano de Trabalho.
+4. Extrair `vigencia_inicio` e `vigencia_fim` a partir de `vigencia`.
+5. Evoluir parser dos documentos para preencher `atribuicao`, `meta`, `acao` e `prazo`.
+
+## Validacoes recomendadas
+- Falha rapida se `DESCRICOES_BUSCA` estiver vazio.
+- Logar internos selecionados e quantidade de processos percorridos.
+- Logar caminho do CSV preview gerado em `backend/output/`.
+- Validar schema antes de gravar `output/sei_dashboard.csv`.
