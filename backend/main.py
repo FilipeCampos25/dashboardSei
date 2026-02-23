@@ -13,8 +13,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--debug", action="store_true", help="Force DEBUG log level")
     parser.add_argument("--manual-login", action="store_true", help="Wait for manual login")
     parser.add_argument("--auto-login", action="store_true", help="Try automated login")
-    parser.add_argument("--max-internos", type=int, default=3)
-    parser.add_argument("--max-processos", type=int, default=5)
+    parser.add_argument("--max-internos", type=int, default=0)
+    parser.add_argument("--max-processos", type=int, default=0)
     return parser
 
 
@@ -35,6 +35,9 @@ def main() -> None:
     if args.auto_login:
         manual_login = False
 
+    max_internos = args.max_internos if args.max_internos > 0 else None
+    max_processos = args.max_processos if args.max_processos > 0 else None
+
     logger.info("Iniciando fluxo assistido no SEI")
     logger.debug(
         "Debug ativo. headless=%s manual_login=%s timeout=%s",
@@ -47,8 +50,8 @@ def main() -> None:
     try:
         scraper.run_full_flow(
             manual_login=manual_login,
-            max_internos=args.max_internos,
-            max_processos_por_interno=args.max_processos,
+            max_internos=max_internos,
+            max_processos_por_interno=max_processos,
         )
         logger.info("Fluxo assistido finalizado")
     except KeyboardInterrupt:

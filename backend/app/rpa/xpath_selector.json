@@ -20,6 +20,14 @@
     "processo": "//a[contains(@class,'protocoloFechado')]",
     "documentos_do_processo": "//div[contains(@class,'infraArvore')]//a[contains(@class,'infraArvoreNo')]/span",
     "plus": "a[@id='ancjoinPASTA2']/img"
+  },
+
+  "sei_processos": {
+    "processo": "//table[@id='tblProtocolosBlocos']//tr[contains(@class,'infraTr')]//td[2]//a",
+    "documento": "//table[@id='tblProtocolosBlocos']//tr[contains(@class,'infraTr')]//td[3]",
+    "parceiro": "//table[@id='tblProtocolosBlocos']//tr[contains(@class,'infraTr')]//td[last()][contains(.,'PARCEIRO')]",
+    "vingencia": "//table[@id='tblProtocolosBlocos']//tr[contains(@class,'infraTr')]//td[last()]//text()[contains(.,'VIGÊNCIA')]",
+    "objeto": "//table[@id='tblProtocolosBlocos']//tr[contains(@class,'infraTr')]//td[last()]//text()[contains(.,'OBJETO')]"
   }
 }
 

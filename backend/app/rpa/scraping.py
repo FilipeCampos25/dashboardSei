@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 import time
 import unicodedata
 from dataclasses import dataclass
-from typing import Any, Dict, List, Set
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from selenium.common.exceptions import (
     NoSuchFrameException,
@@ -20,6 +23,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from app.config import get_settings
 from app.core.driver_factory import create_chrome_driver
 from app.core.logging_config import setup_logger
+from app.services.reporting import ReportBuilder
 from app.services.selectors import load_selectors
 
 
@@ -75,7 +79,9 @@ class SEIScraper:
         self.found: Set[str] = set()
         self.descricoes_busca = self._parse_descricoes_busca(cfg.descricoes_busca)
         self.descricao_match_mode = (cfg.descricoes_match_mode or "contains").strip().lower()
-        if self.descricao_match_mode not in {"contains", "exact"}:
+        if self.descricao_match_mode == "exact":
+            self.descricao_match_mode = "equals"
+        if self.descricao_match_mode not in {"contains", "equals"}:
             self.logger.warning(
                 "DESCRICOES_MATCH_MODE invalido (%s). Usando 'contains'.",
                 self.descricao_match_mode,
@@ -85,8 +91,8 @@ class SEIScraper:
     def run_full_flow(
         self,
         manual_login: bool = True,
-        max_internos: int = 3,
-        max_processos_por_interno: int = 5,
+        max_internos: Optional[int] = None,
+        max_processos_por_interno: Optional[int] = None,
     ) -> List[str]:
         if not self.base_url:
             raise RuntimeError("Config ausente: sei_url / URL / SEI_URL")
@@ -101,8 +107,8 @@ class SEIScraper:
 
         self._close_popup_if_exists()
         self._open_interno_menu()
-        selecionado = self._open_guided_interno_by_descricao()
-        if not selecionado:
+        selecionados = self._select_guided_internos_by_descricao()
+        if not selecionados:
             self.logger.warning(
                 "Modo guiado: nenhum interno selecionado pelas descricoes configuradas."
             )
@@ -111,13 +117,28 @@ class SEIScraper:
             print(result)
             return result
 
-        processos = self._list_processos()[:max_processos_por_interno]
-        for proc in processos:
-            self._open_processo(proc)
-            self._collect_documentos()
-            self._close_current_tab_and_back()
+        if max_internos is not None:
+            self.logger.info("Limitando internos para %d", max_internos)
+            selecionados = selecionados[:max_internos]
 
-        self._back_to_interno_list()
+        if max_processos_por_interno is not None:
+            self.logger.info("Limitando processos por interno para %d", max_processos_por_interno)
+
+        for selecionado, selected_target, list_url in selecionados:
+            if not self._click_selected_interno(selecionado, selected_target, list_url):
+                continue
+
+            self._collect_preview_if_parcerias_vigencias()
+            processos = self._list_processos()
+            if max_processos_por_interno is not None:
+                processos = processos[:max_processos_por_interno]
+
+            for proc in processos:
+                self._open_processo(proc)
+                self._collect_documentos()
+                self._close_current_tab_and_back()
+
+            self._back_to_interno_list()
 
         result = sorted(self.found)
         self.logger.info("Itens unicos encontrados: %d", len(result))
@@ -445,7 +466,7 @@ class SEIScraper:
         return [part for part in (self._normalize_text(x) for x in raw_value.split("|")) if part]
 
     def _descricao_match(self, descricao_normalizada: str, alvo_normalizado: str) -> bool:
-        if self.descricao_match_mode == "exact":
+        if self.descricao_match_mode == "equals":
             return descricao_normalizada == alvo_normalizado
         return alvo_normalizado in descricao_normalizada
 
@@ -652,18 +673,18 @@ class SEIScraper:
         self.logger.info("Total coletado na tabela de internos: %d", len(collected))
         return collected
 
-    def _open_guided_interno_by_descricao(self) -> InternoRow | None:
+    def _select_guided_internos_by_descricao(self) -> List[Tuple[InternoRow, str, str]]:
         if not self.descricoes_busca:
             self.logger.warning(
                 "DESCRICOES_BUSCA vazio. Defina no .env (ex.: DESCRICOES_BUSCA=\"A|B|C\")."
             )
-            return None
+            return []
 
         list_url = self.driver.current_url
         internos = self._collect_interno_rows_with_pagination(max_pages=10)
         if not internos:
             self.logger.warning("Nenhum numero interno elegivel foi encontrado na tabela.")
-            return None
+            return []
 
         matches_by_target: Dict[str, List[InternoRow]] = {target: [] for target in self.descricoes_busca}
         for item in internos:
@@ -680,23 +701,23 @@ class SEIScraper:
 
         if total_matches == 0:
             self.logger.warning("Nenhuma descricao da lista teve match na tabela.")
-            return None
+            return []
 
-        selected: InternoRow | None = None
-        selected_target = ""
+        selected_items: List[Tuple[InternoRow, str, str]] = []
+        seen: Set[Tuple[str, str]] = set()
         for target in self.descricoes_busca:
-            if matches_by_target[target]:
-                selected = matches_by_target[target][0]
-                selected_target = target
-                break
+            for item in matches_by_target[target]:
+                signature = (item.numero_interno, item.descricao_normalizada)
+                if signature in seen:
+                    continue
+                seen.add(signature)
+                selected_items.append((item, target, list_url))
 
-        if not selected:
+        if not selected_items:
             self.logger.warning("Houve match contabilizado, mas nenhum item selecionavel.")
-            return None
+            return []
 
-        if self._click_selected_interno(selected, selected_target, list_url):
-            return selected
-        return None
+        return selected_items
 
     def _click_selected_interno(
         self,
@@ -780,6 +801,370 @@ class SEIScraper:
         frames = self._log_iframe_hint("Nao consegui encontrar o interno na lista")
         self.logger.error("Contexto: iframe_count=%d url=%s", len(frames), self.driver.current_url)
         raise RuntimeError(f"Nao consegui abrir o interno: {interno_text}")
+
+    def _get_current_interno_descricao_value(self) -> str:
+        contexts_to_try: List[tuple[str, Any]] = [("default", None)]
+        try:
+            self.driver.switch_to.default_content()
+            iframes = self.driver.find_elements(By.TAG_NAME, "iframe")
+            for frame in iframes:
+                contexts_to_try.append(("iframe", frame))
+        except WebDriverException:
+            pass
+
+        for kind, frame in contexts_to_try:
+            try:
+                self.driver.switch_to.default_content()
+                if kind == "iframe" and frame is not None:
+                    self.driver.switch_to.frame(frame)
+
+                elem = self.driver.find_element(
+                    By.XPATH,
+                    "//input[@id='txtDescricao' or @name='txtDescricao']",
+                )
+                value = (elem.get_attribute("value") or elem.get_attribute("title") or elem.text or "").strip()
+                if value:
+                    return value
+            except WebDriverException:
+                continue
+            finally:
+                try:
+                    self.driver.switch_to.default_content()
+                except WebDriverException:
+                    pass
+
+        return ""
+
+    def _should_collect_preview_for_current_descricao(self, descricao_atual: str) -> bool:
+        if not descricao_atual or not self.descricoes_busca:
+            return False
+
+        descricao_norm = self._normalize_text(descricao_atual)
+        for alvo in self.descricoes_busca:
+            if self._descricao_match(descricao_norm, alvo):
+                return True
+        return False
+
+    def _extract_prefixed_value(self, line: str) -> tuple[str, str] | None:
+        compact = " ".join((line or "").split()).strip()
+        if not compact or ":" not in compact:
+            return None
+
+        label, value = compact.split(":", 1)
+        label_norm = re.sub(r"\s+", " ", self._normalize_text(label)).strip()
+
+        if label_norm == "PARCEIRO":
+            return ("parceiro", value.strip())
+        if label_norm == "VIGENCIA":
+            return ("vigencia", value.strip())
+        if label_norm == "OBJETO":
+            return ("objeto", value.strip())
+        if label_norm in {"NUMERO ACT", "NUMEROACT"}:
+            return ("numero_act", value.strip())
+        if label_norm == "TIPO":
+            return ("tipo_anotacao", value.strip())
+        return None
+
+    def _parse_preview_anotacoes(self, anotacoes_raw: str) -> Dict[str, str]:
+        parsed = {
+            "anotacoes_raw": (anotacoes_raw or "").strip(),
+            "parceiro": "",
+            "vigencia": "",
+            "objeto": "",
+            "numero_act": "",
+            "status_ou_primeira_linha": "",
+        }
+
+        object_lines: List[str] = []
+        collecting_objeto = False
+        objeto_stop_prefixes = (
+            "TIPO",
+            "NUMERO",
+            "PARCEIRO",
+            "VIGENCIA",
+            "GESTOR",
+            "PORTARIA",
+            "DOU",
+            "DATA",
+        )
+
+        for raw_line in (anotacoes_raw or "").splitlines():
+            line = " ".join(raw_line.split()).strip()
+            if not line:
+                continue
+
+            generic_label_match = re.match(r"^\s*([^:]{2,80})\s*:\s*(.*)$", line)
+            if collecting_objeto and generic_label_match:
+                generic_label_norm = re.sub(
+                    r"\s+",
+                    " ",
+                    self._normalize_text(generic_label_match.group(1)),
+                ).strip()
+                if any(generic_label_norm.startswith(prefix) for prefix in objeto_stop_prefixes):
+                    collecting_objeto = False
+
+            prefixed = self._extract_prefixed_value(line)
+            if prefixed:
+                key, value = prefixed
+                collecting_objeto = key == "objeto"
+                if key == "objeto":
+                    object_lines = [value] if value else []
+                elif key in parsed and not parsed[key]:
+                    parsed[key] = value
+                continue
+
+            if collecting_objeto:
+                object_lines.append(line)
+                continue
+
+            if not parsed["status_ou_primeira_linha"]:
+                parsed["status_ou_primeira_linha"] = line
+
+        if object_lines:
+            parsed["objeto"] = " ".join(part for part in object_lines if part).strip()
+
+        return parsed
+
+    def _infer_seq_coluna(self, cell_texts: List[str], processo: str) -> str:
+        for text in cell_texts[:3]:
+            if not text:
+                continue
+            if processo and text == processo:
+                continue
+            if re.fullmatch(r"\d{1,6}", text):
+                return text
+
+        for text in cell_texts[:3]:
+            if not text:
+                continue
+            if processo and text == processo:
+                continue
+            return text
+
+        return ""
+
+    def _cell_looks_like_anotacoes(self, text: str) -> bool:
+        if not text:
+            return False
+        normalized = self._normalize_text(text)
+        markers = ("PARCEIRO:", "VIGENCIA:", "OBJETO:", "NUMERO ACT:", "TIPO:")
+        normalized_markers = [self._normalize_text(m) for m in markers]
+        return any(marker in normalized for marker in normalized_markers)
+
+    def _find_anotacoes_cell_index(self, tds: List[Any], cell_texts: List[str]) -> int:
+        for idx, text in enumerate(cell_texts):
+            if self._cell_looks_like_anotacoes(text):
+                return idx
+
+        best_idx = -1
+        best_score = -1
+        for idx, td in enumerate(tds):
+            text = cell_texts[idx] if idx < len(cell_texts) else ""
+            if not text:
+                continue
+            try:
+                html = (td.get_attribute("innerHTML") or "").upper()
+            except WebDriverException:
+                html = ""
+
+            score = 0
+            score += text.count(":") * 3
+            score += text.count("\n") * 2
+            if "<BR" in html:
+                score += 6
+            if len(text) > 80:
+                score += 2
+
+            if score > best_score:
+                best_score = score
+                best_idx = idx
+
+        return best_idx
+
+    def _find_processo_cell_index(self, tds: List[Any]) -> int:
+        for idx, td in enumerate(tds):
+            try:
+                links = td.find_elements(By.CSS_SELECTOR, "a.protocoloFechado, a[class*='protocoloFechado']")
+            except WebDriverException:
+                links = []
+            if links:
+                return idx
+        return -1
+
+    def _infer_tipo_coluna(
+        self,
+        cell_texts: List[str],
+        processo: str,
+        processo_idx: int = -1,
+        anotacoes_idx: int = -1,
+    ) -> str:
+        if anotacoes_idx > 0:
+            for idx in range(anotacoes_idx - 1, -1, -1):
+                text = cell_texts[idx] if len(cell_texts) > idx else ""
+                if not text or text == processo:
+                    continue
+                if processo_idx >= 0 and idx == processo_idx:
+                    continue
+                if re.fullmatch(r"\d{1,6}", text):
+                    continue
+                return text
+
+        for idx in (2, 3):
+            if len(cell_texts) > idx and cell_texts[idx]:
+                text = cell_texts[idx]
+                if text != processo:
+                    return text
+
+        tipo_keywords = (
+            "ACORDO",
+            "COOPERACAO",
+            "CONVENIO",
+            "PARCERIA",
+            "TERMO",
+        )
+        normalized_keywords = [self._normalize_text(k) for k in tipo_keywords]
+        for text in cell_texts:
+            if not text:
+                continue
+            normalized = self._normalize_text(text)
+            if any(keyword in normalized for keyword in normalized_keywords):
+                return text
+        return ""
+
+    def _extract_preview_record_from_row(self, row: Any, interno_descricao: str) -> Optional[Dict[str, str]]:
+        try:
+            tds = row.find_elements(By.CSS_SELECTOR, "td")
+        except WebDriverException:
+            return None
+        if not tds:
+            return None
+
+        cell_texts = [(td.text or "").strip() for td in tds]
+
+        processo = ""
+        for selector in ("a.protocoloFechado", "a[class*='protocoloFechado']", "a"):
+            try:
+                links = row.find_elements(By.CSS_SELECTOR, selector)
+            except WebDriverException:
+                links = []
+            for link in links:
+                text = (link.text or "").strip()
+                if text:
+                    processo = text
+                    break
+            if processo:
+                break
+
+        if not processo:
+            return None
+
+        processo_idx = self._find_processo_cell_index(tds)
+        anotacoes_idx = self._find_anotacoes_cell_index(tds, cell_texts)
+        anotacoes_raw = ""
+        if anotacoes_idx >= 0 and anotacoes_idx < len(tds):
+            anotacoes_raw = (tds[anotacoes_idx].text or "").strip()
+        anotacoes_parsed = self._parse_preview_anotacoes(anotacoes_raw)
+        cell_texts_compact = [(" ".join(text.split()).strip()) for text in cell_texts]
+
+        return {
+            "interno_descricao": (interno_descricao or "").strip(),
+            "seq": self._infer_seq_coluna(cell_texts_compact, processo),
+            "processo": processo,
+            "tipo_coluna": self._infer_tipo_coluna(
+                cell_texts_compact,
+                processo,
+                processo_idx=processo_idx,
+                anotacoes_idx=anotacoes_idx,
+            ),
+            "anotacoes_raw": anotacoes_parsed["anotacoes_raw"],
+            "parceiro": anotacoes_parsed["parceiro"],
+            "vigencia": anotacoes_parsed["vigencia"],
+            "objeto": anotacoes_parsed["objeto"],
+            "numero_act": anotacoes_parsed["numero_act"],
+            "status_ou_primeira_linha": anotacoes_parsed["status_ou_primeira_linha"],
+        }
+
+    def _collect_preview_records_from_current_list(self, interno_descricao: str) -> List[Dict[str, str]]:
+        try:
+            rows = self.wait_for_elements(
+                "//table[@id='tblProtocolosBlocos']//tbody/tr[td]",
+                tag="preview_tblProtocolosBlocos_rows",
+                timeout=max(5, min(10, self.timeout_seconds)),
+                restore_context=False,
+            )
+        except TimeoutException:
+            self.logger.warning(
+                "Coleta preview pulada: tabela tblProtocolosBlocos nao encontrada para descricao '%s'.",
+                interno_descricao,
+            )
+            return []
+
+        records: List[Dict[str, str]] = []
+        try:
+            for row in rows:
+                record = self._extract_preview_record_from_row(row, interno_descricao)
+                if record:
+                    records.append(record)
+        finally:
+            try:
+                self.driver.switch_to.default_content()
+            except WebDriverException:
+                pass
+
+        return records
+
+    def _resolve_preview_output_dir(self) -> Path:
+        configured = (self.settings.output_dir or "output").strip()
+        backend_root = Path(__file__).resolve().parents[2]
+        output_dir = Path(configured)
+        if not output_dir.is_absolute():
+            output_dir = backend_root / output_dir
+        return output_dir
+
+    def _save_preview_records_csv(self, records: List[Dict[str, str]]) -> Optional[Path]:
+        if not records:
+            return None
+
+        output_dir = self._resolve_preview_output_dir()
+        output_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        csv_path = output_dir / f"parcerias_vigencias_preview_{timestamp}.csv"
+        ReportBuilder(records).to_csv(csv_path)
+        return csv_path
+
+    def _collect_preview_if_parcerias_vigencias(self) -> None:
+        try:
+            descricao_atual = self._get_current_interno_descricao_value()
+            if not descricao_atual:
+                self.logger.warning(
+                    "Coleta preview pulada: nao foi possivel ler txtDescricao (descricao atual do interno)."
+                )
+                return
+
+            if not self._should_collect_preview_for_current_descricao(descricao_atual):
+                self.logger.warning(
+                    "Coleta preview pulada: descricao atual '%s' nao bate com DESCRICOES_BUSCA=%s (mode=%s).",
+                    descricao_atual,
+                    self.descricoes_busca,
+                    self.descricao_match_mode,
+                )
+                return
+
+            records = self._collect_preview_records_from_current_list(descricao_atual)
+            csv_path = self._save_preview_records_csv(records)
+            if csv_path:
+                self.logger.info(
+                    "Preview coletado: %d linha(s) salvas em %s",
+                    len(records),
+                    csv_path,
+                )
+            else:
+                self.logger.info(
+                    "Preview coletado para '%s', mas nenhuma linha util foi extraida.",
+                    descricao_atual,
+                )
+        except Exception as exc:
+            self.logger.exception("Falha na coleta preview direcional: %s", exc)
 
     def _list_processos(self) -> List[str]:
         sel = self.selectors.get("interno", {})
