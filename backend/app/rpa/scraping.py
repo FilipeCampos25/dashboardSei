@@ -836,94 +836,137 @@ class SEIScraper:
         return ""
 
     def _should_collect_preview_for_current_descricao(self, descricao_atual: str) -> bool:
-        if not descricao_atual or not self.descricoes_busca:
-            return False
-
         descricao_norm = self._normalize_text(descricao_atual)
-        for alvo in self.descricoes_busca:
-            if self._descricao_match(descricao_norm, alvo):
-                return True
-        return False
+        return descricao_norm == "PARCERIAS VIGENTES"
 
-    def _extract_prefixed_value(self, line: str) -> tuple[str, str] | None:
-        compact = " ".join((line or "").split()).strip()
-        if not compact or ":" not in compact:
-            return None
+    def _clean_text_value(self, value: str) -> str:
+        return " ".join((value or "").replace("\xa0", " ").split()).strip()
 
-        label, value = compact.split(":", 1)
-        label_norm = re.sub(r"\s+", " ", self._normalize_text(label)).strip()
+    def _clean_numero_act(self, value: str) -> str:
+        cleaned = self._clean_text_value(value)
+        if not cleaned:
+            return ""
+        cleaned = re.sub(
+            r"^(?:N[º°oO]\s*|N\.\s*|NO\s+|NRO\.?\s*|NUM\.?\s*)",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        return cleaned.rstrip(" .;,:")
 
-        if label_norm == "PARCEIRO":
-            return ("parceiro", value.strip())
-        if label_norm == "VIGENCIA":
-            return ("vigencia", value.strip())
-        if label_norm == "OBJETO":
-            return ("objeto", value.strip())
-        if label_norm in {"NUMERO ACT", "NUMEROACT"}:
-            return ("numero_act", value.strip())
-        if label_norm == "TIPO":
-            return ("tipo_anotacao", value.strip())
-        return None
+    def _normalize_label(self, label: str) -> str:
+        return re.sub(r"\s+", " ", self._normalize_text(label)).strip()
 
-    def _parse_preview_anotacoes(self, anotacoes_raw: str) -> Dict[str, str]:
-        parsed = {
-            "anotacoes_raw": (anotacoes_raw or "").strip(),
-            "parceiro": "",
-            "vigencia": "",
-            "objeto": "",
-            "numero_act": "",
-            "status_ou_primeira_linha": "",
-        }
-
-        object_lines: List[str] = []
-        collecting_objeto = False
-        objeto_stop_prefixes = (
-            "TIPO",
-            "NUMERO",
-            "PARCEIRO",
-            "VIGENCIA",
+    def _looks_like_metadata_label(self, label_norm: str) -> bool:
+        if not label_norm:
+            return False
+        explicit_prefixes = (
             "GESTOR",
             "PORTARIA",
             "DOU",
             "DATA",
+            "STATUS",
+            "DESIGNACAO",
+            "VENCIMENTO",
+            "TERMO ADITIVO",
+            "PARCEIRO",
+            "PARCEIROS",
+            "VIGENCIA",
+            "NUMERO",
+            "NUMERO ACT",
+            "OBJETO",
+            "VALOR",
+            "TIPO",
+            "PROCESSO",
         )
+        if any(label_norm.startswith(prefix) for prefix in explicit_prefixes):
+            return True
 
-        for raw_line in (anotacoes_raw or "").splitlines():
-            line = " ".join(raw_line.split()).strip()
+        words = [w for w in label_norm.split(" ") if w]
+        if not words or len(words) > 4:
+            return False
+        if not re.fullmatch(r"[A-Z0-9 /().-]+", label_norm):
+            return False
+        return True
+
+    def _extract_anotacao_prefixed_value(self, line: str) -> tuple[str, str] | None:
+        compact = (line or "").strip()
+        if ":" not in compact:
+            return None
+
+        label, value = compact.split(":", 1)
+        label_norm = self._normalize_label(label)
+        value_clean = self._clean_text_value(value)
+
+        if label_norm in {"PARCEIRO", "PARCEIROS"}:
+            return ("parceiro", value_clean)
+        if label_norm == "VIGENCIA":
+            return ("vigencia", value_clean)
+        if label_norm in {"NUMERO ACT", "NUMEROACT", "NUMERO"}:
+            return ("numero_act", self._clean_numero_act(value_clean))
+        if label_norm == "OBJETO":
+            return ("objeto", value)
+        return None
+
+    def parse_anotacoes(self, anotacoes_raw: str) -> Dict[str, str]:
+        parsed = {
+            "parceiro": "",
+            "vigencia": "",
+            "numero_act": "",
+            "objeto": "",
+        }
+
+        objeto_lines: List[str] = []
+        collecting_objeto = False
+
+        for raw_line in (anotacoes_raw or "").replace("\r", "\n").splitlines():
+            line = raw_line.strip()
             if not line:
                 continue
 
-            generic_label_match = re.match(r"^\s*([^:]{2,80})\s*:\s*(.*)$", line)
-            if collecting_objeto and generic_label_match:
-                generic_label_norm = re.sub(
-                    r"\s+",
-                    " ",
-                    self._normalize_text(generic_label_match.group(1)),
-                ).strip()
-                if any(generic_label_norm.startswith(prefix) for prefix in objeto_stop_prefixes):
+            label_match = re.match(r"^\s*([^:\n]{2,80})\s*:\s*(.*)$", line)
+            if collecting_objeto and label_match:
+                candidate_label_norm = self._normalize_label(label_match.group(1))
+                if self._looks_like_metadata_label(candidate_label_norm) and candidate_label_norm != "OBJETO":
                     collecting_objeto = False
 
-            prefixed = self._extract_prefixed_value(line)
-            if prefixed:
+            prefixed = self._extract_anotacao_prefixed_value(line)
+            if prefixed and not collecting_objeto:
                 key, value = prefixed
-                collecting_objeto = key == "objeto"
                 if key == "objeto":
-                    object_lines = [value] if value else []
-                elif key in parsed and not parsed[key]:
+                    collecting_objeto = True
+                    objeto_lines = []
+                    initial_obj = self._clean_text_value(value)
+                    if initial_obj:
+                        objeto_lines.append(initial_obj)
+                elif not parsed[key]:
                     parsed[key] = value
                 continue
 
             if collecting_objeto:
-                object_lines.append(line)
-                continue
+                # Reprocessa a linha como novo rotulo quando o bloco de OBJETO termina.
+                if label_match:
+                    candidate_label_norm = self._normalize_label(label_match.group(1))
+                    if self._looks_like_metadata_label(candidate_label_norm) and candidate_label_norm != "OBJETO":
+                        prefixed_after_obj = self._extract_anotacao_prefixed_value(line)
+                        if prefixed_after_obj:
+                            key, value = prefixed_after_obj
+                            if key != "objeto" and not parsed[key]:
+                                parsed[key] = value
+                        continue
 
-            if not parsed["status_ou_primeira_linha"]:
-                parsed["status_ou_primeira_linha"] = line
+                cleaned_line = self._clean_text_value(line)
+                if cleaned_line:
+                    objeto_lines.append(cleaned_line)
 
-        if object_lines:
-            parsed["objeto"] = " ".join(part for part in object_lines if part).strip()
+        if objeto_lines:
+            parsed["objeto"] = self._clean_text_value(" ".join(objeto_lines))
 
         return parsed
+
+    def _parse_preview_anotacoes(self, anotacoes_raw: str) -> Dict[str, str]:
+        # Compatibilidade com chamadas legadas internas.
+        return self.parse_anotacoes(anotacoes_raw)
 
     def _infer_seq_coluna(self, cell_texts: List[str], processo: str) -> str:
         for text in cell_texts[:3]:
@@ -947,7 +990,7 @@ class SEIScraper:
         if not text:
             return False
         normalized = self._normalize_text(text)
-        markers = ("PARCEIRO:", "VIGENCIA:", "OBJETO:", "NUMERO ACT:", "TIPO:")
+        markers = ("PARCEIRO:", "PARCEIROS:", "VIGENCIA:", "OBJETO:", "NUMERO ACT:", "NUMERO:")
         normalized_markers = [self._normalize_text(m) for m in markers]
         return any(marker in normalized for marker in normalized_markers)
 
@@ -1062,29 +1105,24 @@ class SEIScraper:
         anotacoes_idx = self._find_anotacoes_cell_index(tds, cell_texts)
         anotacoes_raw = ""
         if anotacoes_idx >= 0 and anotacoes_idx < len(tds):
-            anotacoes_raw = (tds[anotacoes_idx].text or "").strip()
+            try:
+                anotacoes_raw = (tds[anotacoes_idx].get_attribute("innerText") or "").strip()
+            except WebDriverException:
+                anotacoes_raw = (tds[anotacoes_idx].text or "").strip()
         anotacoes_parsed = self._parse_preview_anotacoes(anotacoes_raw)
         cell_texts_compact = [(" ".join(text.split()).strip()) for text in cell_texts]
 
         return {
-            "interno_descricao": (interno_descricao or "").strip(),
+            "interno_descricao": "PARCERIAS VIGENTES",
             "seq": self._infer_seq_coluna(cell_texts_compact, processo),
             "processo": processo,
-            "tipo_coluna": self._infer_tipo_coluna(
-                cell_texts_compact,
-                processo,
-                processo_idx=processo_idx,
-                anotacoes_idx=anotacoes_idx,
-            ),
-            "anotacoes_raw": anotacoes_parsed["anotacoes_raw"],
             "parceiro": anotacoes_parsed["parceiro"],
             "vigencia": anotacoes_parsed["vigencia"],
             "objeto": anotacoes_parsed["objeto"],
             "numero_act": anotacoes_parsed["numero_act"],
-            "status_ou_primeira_linha": anotacoes_parsed["status_ou_primeira_linha"],
         }
 
-    def _collect_preview_records_from_current_list(self, interno_descricao: str) -> List[Dict[str, str]]:
+    def _collect_preview_records_from_current_page(self, interno_descricao: str) -> List[Dict[str, str]]:
         try:
             rows = self.wait_for_elements(
                 "//table[@id='tblProtocolosBlocos']//tbody/tr[td]",
@@ -1113,6 +1151,46 @@ class SEIScraper:
 
         return records
 
+    def _collect_preview_records_from_current_list(self, interno_descricao: str) -> List[Dict[str, str]]:
+        all_records: List[Dict[str, str]] = []
+        seen_rows: Set[Tuple[str, str, str]] = set()
+        seen_pages: Set[Tuple[str, int]] = set()
+        page = 1
+        max_pages = 100
+
+        while page <= max_pages:
+            page_records = self._collect_preview_records_from_current_page(interno_descricao)
+            page_signature = (
+                page_records[0]["processo"] if page_records else "",
+                len(page_records),
+            )
+            if page_signature in seen_pages and page_records:
+                self.logger.warning(
+                    "Coleta PARCERIAS VIGENTES: pagina repetida detectada na pagina %d; encerrando paginacao.",
+                    page,
+                )
+                break
+            seen_pages.add(page_signature)
+
+            for record in page_records:
+                row_key = (record.get("seq", ""), record.get("processo", ""), record.get("numero_act", ""))
+                if row_key in seen_rows:
+                    continue
+                seen_rows.add(row_key)
+                all_records.append(record)
+
+            if not self._click_next_page_if_available(page=page):
+                break
+            page += 1
+
+        if page > max_pages:
+            self.logger.warning(
+                "Coleta PARCERIAS VIGENTES: limite de seguranca de paginacao atingido (%d paginas).",
+                max_pages,
+            )
+
+        return all_records
+
     def _resolve_preview_output_dir(self) -> Path:
         configured = (self.settings.output_dir or "output").strip()
         backend_root = Path(__file__).resolve().parents[2]
@@ -1128,8 +1206,22 @@ class SEIScraper:
         output_dir = self._resolve_preview_output_dir()
         output_dir.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        csv_path = output_dir / f"parcerias_vigencias_preview_{timestamp}.csv"
-        ReportBuilder(records).to_csv(csv_path)
+        csv_path = output_dir / f"parcerias_vigentes_{timestamp}.csv"
+        ordered_columns = [
+            "interno_descricao",
+            "seq",
+            "processo",
+            "parceiro",
+            "vigencia",
+            "numero_act",
+            "objeto",
+        ]
+        sanitized_records: List[Dict[str, str]] = []
+        for record in records:
+            sanitized_records.append(
+                {col: self._clean_text_value(str(record.get(col, "") or "")) for col in ordered_columns}
+            )
+        ReportBuilder(sanitized_records).to_csv(csv_path)
         return csv_path
 
     def _collect_preview_if_parcerias_vigencias(self) -> None:
@@ -1142,27 +1234,20 @@ class SEIScraper:
                 return
 
             if not self._should_collect_preview_for_current_descricao(descricao_atual):
-                self.logger.warning(
-                    "Coleta preview pulada: descricao atual '%s' nao bate com DESCRICOES_BUSCA=%s (mode=%s).",
+                self.logger.info(
+                    "Coleta PARCERIAS VIGENTES pulada: interno atual '%s' nao e 'PARCERIAS VIGENTES'.",
                     descricao_atual,
-                    self.descricoes_busca,
-                    self.descricao_match_mode,
                 )
                 return
 
+            self.logger.info("Entrou no interno '%s'. Iniciando coleta direcional de PARCERIAS VIGENTES.", descricao_atual)
             records = self._collect_preview_records_from_current_list(descricao_atual)
             csv_path = self._save_preview_records_csv(records)
+            self.logger.info("Coleta PARCERIAS VIGENTES: %d registro(s) coletado(s).", len(records))
             if csv_path:
-                self.logger.info(
-                    "Preview coletado: %d linha(s) salvas em %s",
-                    len(records),
-                    csv_path,
-                )
+                self.logger.info("CSV PARCERIAS VIGENTES gerado em: %s", csv_path)
             else:
-                self.logger.info(
-                    "Preview coletado para '%s', mas nenhuma linha util foi extraida.",
-                    descricao_atual,
-                )
+                self.logger.info("CSV PARCERIAS VIGENTES nao gerado: nenhuma linha util foi extraida.")
         except Exception as exc:
             self.logger.exception("Falha na coleta preview direcional: %s", exc)
 
@@ -1359,4 +1444,3 @@ class SEIScraper:
             time.sleep(1)
         except Exception:
             return
-
