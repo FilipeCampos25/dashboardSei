@@ -19,7 +19,7 @@
     "paginacao_proxima": "//a[@title='Próxima' or @title='Proxima']",
     "processo": "//a[contains(@class,'protocoloFechado')]",
     "documentos_do_processo": "//div[contains(@class,'infraArvore')]//a[contains(@class,'infraArvoreNo')]/span",
-    "plus": "a[@id='ancjoinPASTA2']/img"
+    "expandir_todas_pastas": "//img[starts-with(@id,'iconAP') and @title='Abrir todas as Pastas'] | //div[contains(@class,'infraArvore')]//img[@title='Abrir todas as Pastas']"
   },
 
   "sei_processos": {

@@ -44,6 +44,17 @@ class InternoRow:
 
 class SEIScraper:
     XPATH_PASTAS_FECHADAS = "//img[starts-with(@id,'joinPASTA') and contains(@title,'Abrir')]"
+    XPATH_ARVORE_DOCUMENTOS = "//div[contains(@class,'infraArvore')]//a[contains(@class,'infraArvoreNo')]/span"
+    XPATH_ARVORE_NOS = "//div[contains(@class,'infraArvore')]//a[contains(@class,'infraArvoreNo')]"
+    XPATH_ARVORE_PARAGRAFOS = "//div[contains(@class,'infraArvore')]//p"
+    XPATH_ARVORE_PROCESSO_SELECIONADO = "//span[contains(@class,'infraArvoreNoSelecionado')]/parent::a"
+    XPATH_ABA_PESQUISAR_NO_PROCESSO = "//a[.//img[@title='Pesquisar no Processo']]"
+    XPATH_TITULO_PESQUISAR_NO_PROCESSO = "//h2[contains(text(),'Pesquisar no Processo')]"
+    XPATH_EXPANDIR_TODAS_PASTAS = (
+        "//img[starts-with(@id,'iconAP') and @title='Abrir todas as Pastas']"
+        " | //div[contains(@class,'infraArvore')]//img[@title='Abrir todas as Pastas']"
+        " | //img[@title='Abrir todas as Pastas' and contains(@src,'/infra_css/img/mais.svg')]"
+    )
 
     def __init__(self) -> None:
         self.logger = setup_logger()
@@ -1310,27 +1321,53 @@ class SEIScraper:
         raise RuntimeError(f"Nao consegui abrir o processo: {processo_text}")
 
     def _collect_documentos(self) -> None:
-        sel = self.selectors.get("interno", {})
-        x_docs = sel.get("documentos_do_processo")
-        if not x_docs:
-            self.logger.info("Seletor de documentos nao encontrado; pulando coleta.")
-            return
-
         try:
             self._expand_all_pastas(max_cycles=15)
-            elems = self.wait_for_elements(
-                x_docs,
-                tag="collect_documentos",
-                restore_context=False,
-            )
-            for elem in elems:
-                text = (elem.text or "").strip()
-                if text:
-                    if text not in self.found:
-                        self.logger.info("[ACHEI] %s", text)
-                    self.found.add(text)
+            self._navigate_to_pesquisar_no_processo()
         except Exception as exc:
-            self.logger.exception("Falha ao coletar documentos: %s", exc)
+            self.logger.exception("Falha ao navegar no processo apos expandir pastas: %s", exc)
+        finally:
+            try:
+                self.driver.switch_to.default_content()
+            except WebDriverException:
+                pass
+
+    def _navigate_to_pesquisar_no_processo(self) -> None:
+        try:
+            self.driver.switch_to.default_content()
+
+            if not self._switch_to_ifr_arvore():
+                raise RuntimeError("iframe ifrArvore nao encontrado")
+
+            self.logger.info("[NAV] Clicando no processo selecionado na árvore")
+            processo_link = WebDriverWait(self.driver, self.timeout_seconds).until(
+                EC.element_to_be_clickable((By.XPATH, self.XPATH_ARVORE_PROCESSO_SELECIONADO))
+            )
+            try:
+                self.driver.execute_script("arguments[0].click();", processo_link)
+            except WebDriverException:
+                processo_link.click()
+
+            # A árvore fica dentro do ifrArvore, mas a barra de ações (com "Pesquisar no Processo")
+            # fica no contexto principal da página.
+            self.driver.switch_to.default_content()
+            self.logger.info("[NAV] Processo clicado, abrindo 'Pesquisar no Processo'")
+
+            aba_pesquisar = WebDriverWait(self.driver, self.timeout_seconds).until(
+                EC.element_to_be_clickable((By.XPATH, self.XPATH_ABA_PESQUISAR_NO_PROCESSO))
+            )
+            try:
+                self.driver.execute_script("arguments[0].click();", aba_pesquisar)
+            except WebDriverException:
+                aba_pesquisar.click()
+
+            WebDriverWait(self.driver, self.timeout_seconds).until(
+                EC.visibility_of_element_located((By.XPATH, self.XPATH_TITULO_PESQUISAR_NO_PROCESSO))
+            )
+            self.logger.info("[NAV] Tela 'Pesquisar no Processo' carregada com sucesso")
+        except Exception as exc:
+            self.logger.error("[NAV][ERRO] Falha ao abrir 'Pesquisar no Processo': %s", exc)
+            raise RuntimeError("Falha na navegacao para 'Pesquisar no Processo'") from exc
         finally:
             try:
                 self.driver.switch_to.default_content()
@@ -1355,7 +1392,131 @@ class SEIScraper:
             self.logger.debug("Nao foi possivel acessar iframe ifrArvore por id/name.")
             return False
 
-    def _expand_all_pastas(self, max_cycles: int = 15) -> None:
+    def _get_arvore_snapshot(self) -> Dict[str, int]:
+        snapshot = {
+            "docs": -1,
+            "nos": -1,
+            "paragrafos": -1,
+            "pastas_fechadas": -1,
+        }
+        counters = (
+            ("docs", self.XPATH_ARVORE_DOCUMENTOS),
+            ("nos", self.XPATH_ARVORE_NOS),
+            ("paragrafos", self.XPATH_ARVORE_PARAGRAFOS),
+            ("pastas_fechadas", self.XPATH_PASTAS_FECHADAS),
+        )
+        for key, xpath in counters:
+            try:
+                snapshot[key] = len(self.driver.find_elements(By.XPATH, xpath))
+            except WebDriverException:
+                snapshot[key] = -1
+        return snapshot
+
+    def _arvore_expandiu(self, before: Dict[str, int], after: Dict[str, int]) -> bool:
+        growth_keys = ("docs", "nos", "paragrafos")
+        for key in growth_keys:
+            before_value = before.get(key, -1)
+            after_value = after.get(key, -1)
+            if before_value >= 0 and after_value > before_value:
+                return True
+
+        before_closed = before.get("pastas_fechadas", -1)
+        after_closed = after.get("pastas_fechadas", -1)
+        return before_closed >= 0 and after_closed >= 0 and after_closed < before_closed
+
+    def _wait_arvore_stabilize(
+        self,
+        stable_cycles: int = 3,
+        interval_seconds: float = 0.3,
+        timeout_seconds: Optional[float] = None,
+    ) -> Dict[str, int]:
+        deadline = time.time() + (timeout_seconds or max(4.0, min(12.0, float(self.timeout_seconds))))
+        last_snapshot: Optional[Dict[str, int]] = None
+        unchanged_cycles = 0
+        final_snapshot = {"docs": -1, "nos": -1, "paragrafos": -1, "pastas_fechadas": -1}
+
+        while time.time() < deadline:
+            if not self._switch_to_ifr_arvore():
+                break
+
+            current_snapshot = self._get_arvore_snapshot()
+            final_snapshot = current_snapshot
+
+            if last_snapshot == current_snapshot:
+                unchanged_cycles += 1
+            else:
+                unchanged_cycles = 0
+                last_snapshot = current_snapshot
+
+            if unchanged_cycles >= stable_cycles:
+                break
+
+            time.sleep(interval_seconds)
+
+        return final_snapshot
+
+    def _expandir_tudo_pastas(self) -> Tuple[bool, str]:
+        if not self._switch_to_ifr_arvore():
+            return False, "ifrArvore nao encontrado"
+
+        before_snapshot = self._get_arvore_snapshot()
+        interno_sel = self.selectors.get("interno", {})
+        x_expandir_todas = interno_sel.get("expandir_todas_pastas") or self.XPATH_EXPANDIR_TODAS_PASTAS
+
+        try:
+            buttons = self.driver.find_elements(By.XPATH, x_expandir_todas)
+        except WebDriverException as exc:
+            self.logger.debug("Expandir tudo: erro ao localizar botao (%s)", exc)
+            buttons = []
+
+        if not buttons:
+            self.logger.info("Expandir tudo: botão não encontrado")
+            return False, "botao nao encontrado"
+
+        self.logger.info("Expandir tudo: botão encontrado")
+        button = buttons[0]
+        started_at = time.perf_counter()
+
+        try:
+            self.driver.execute_script("arguments[0].click();", button)
+        except (StaleElementReferenceException, WebDriverException) as js_exc:
+            try:
+                if not self._switch_to_ifr_arvore():
+                    raise js_exc
+                buttons = self.driver.find_elements(By.XPATH, x_expandir_todas)
+                if not buttons:
+                    raise js_exc
+                buttons[0].click()
+            except (StaleElementReferenceException, WebDriverException) as click_exc:
+                elapsed = time.perf_counter() - started_at
+                self.logger.info(
+                    "Expandir tudo: contagem antes=%s depois=%s tempo=%.2fs",
+                    before_snapshot,
+                    before_snapshot,
+                    elapsed,
+                )
+                return False, f"botao nao clicavel ({click_exc})"
+
+        # Aguarda a arvore estabilizar por repeticao de contagens em ciclos curtos,
+        # evitando sleep fixo longo e adaptando ao tempo real de carregamento.
+        after_snapshot = self._wait_arvore_stabilize(stable_cycles=3, interval_seconds=0.3)
+        elapsed = time.perf_counter() - started_at
+        self.logger.info(
+            "Expandir tudo: contagem antes=%s depois=%s tempo=%.2fs",
+            before_snapshot,
+            after_snapshot,
+            elapsed,
+        )
+
+        if not self._arvore_expandiu(before_snapshot, after_snapshot):
+            return False, "botao clicado sem alteracao na arvore"
+
+        if after_snapshot.get("pastas_fechadas", -1) > 0:
+            return False, "ainda restaram pastas fechadas apos expandir tudo"
+
+        return True, "ok"
+
+    def _expand_all_pastas_manual(self, max_cycles: int = 15) -> None:
         total_clicked = 0
         previous_doc_count = -1
 
@@ -1365,7 +1526,7 @@ class SEIScraper:
                 return
 
             try:
-                doc_count = len(self.driver.find_elements(By.XPATH, "//a[contains(@class,'infraArvoreNo')]/span"))
+                doc_count = len(self.driver.find_elements(By.XPATH, self.XPATH_ARVORE_DOCUMENTOS))
             except WebDriverException:
                 doc_count = -1
 
@@ -1415,7 +1576,7 @@ class SEIScraper:
             if not self._switch_to_ifr_arvore():
                 break
             try:
-                current_doc_count = len(self.driver.find_elements(By.XPATH, "//a[contains(@class,'infraArvoreNo')]/span"))
+                current_doc_count = len(self.driver.find_elements(By.XPATH, self.XPATH_ARVORE_DOCUMENTOS))
             except WebDriverException:
                 current_doc_count = -1
 
@@ -1428,6 +1589,20 @@ class SEIScraper:
                 break
 
             previous_doc_count = current_doc_count
+
+    def _expand_all_pastas(self, max_cycles: int = 15) -> None:
+        try:
+            expanded_all, reason = self._expandir_tudo_pastas()
+        except Exception as exc:
+            self.logger.exception("Expandir tudo: falha inesperada (%s)", exc)
+            expanded_all = False
+            reason = f"erro inesperado ({exc})"
+
+        if expanded_all:
+            return
+
+        self.logger.info("Fallback acionado: motivo=%s", reason)
+        self._expand_all_pastas_manual(max_cycles=max_cycles)
 
     def _close_current_tab_and_back(self) -> None:
         try:
