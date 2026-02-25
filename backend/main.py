@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import sys
 
 from app.config import get_settings
 from app.core.logging_config import setup_logging
@@ -15,6 +16,16 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--auto-login", action="store_true", help="Try automated login")
     parser.add_argument("--max-internos", type=int, default=0)
     parser.add_argument("--max-processos", type=int, default=0)
+    if hasattr(argparse, "BooleanOptionalAction"):
+        parser.add_argument(
+            "--stop-at-filter",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help="Open process filter and stop there (default: true). Use --no-stop-at-filter for manual debug.",
+        )
+    else:
+        parser.add_argument("--stop-at-filter", dest="stop_at_filter", action="store_true", default=True)
+        parser.add_argument("--no-stop-at-filter", dest="stop_at_filter", action="store_false")
     return parser
 
 
@@ -52,8 +63,14 @@ def main() -> None:
             manual_login=manual_login,
             max_internos=max_internos,
             max_processos_por_interno=max_processos,
+            stop_at_filter=args.stop_at_filter,
         )
         logger.info("Fluxo assistido finalizado")
+        if not args.stop_at_filter and sys.stdin and sys.stdin.isatty():
+            try:
+                input("Filtro aberto para debug manual. Pressione ENTER para encerrar o navegador...")
+            except EOFError:
+                logger.warning("STDIN indisponivel; encerrando navegador sem pausa adicional.")
     except KeyboardInterrupt:
         logger.warning("Execucao interrompida pelo usuario (Ctrl+C).")
     finally:

@@ -22,6 +22,21 @@
     "expandir_todas_pastas": "//img[starts-with(@id,'iconAP') and @title='Abrir todas as Pastas'] | //div[contains(@class,'infraArvore')]//img[@title='Abrir todas as Pastas']"
   },
 
+  "processo": {
+    "iframe_arvore": "//iframe[@id='ifrArvore' or @name='ifrArvore']",
+    "iframe_visualizacao": "//iframe[@id='ifrVisualizacao' or @name='ifrVisualizacao']",
+    "abrir_todas_as_pastas": [
+      "//img[@id='iconAP2465802' and contains(@title,'Abrir todas as Pastas')]",
+      "//img[contains(@title,'Abrir todas as Pastas')]"
+    ],
+    "pesquisar_no_processo": [
+      "//a[contains(@href,'acao=procedimento_pesquisar') and @target='ifrVisualizacao']",
+      "//img[contains(@alt,'Pesquisar no Processo') or contains(@title,'Pesquisar no Processo')]",
+      "//img[contains(@src,'processo_pesquisar')]"
+    ],
+    "pesquisa_anchor": "//form[contains(@action,'procedimento_pesquisar')] | //h2[contains(normalize-space(.),'Pesquisar no Processo')]"
+  },
+
   "sei_processos": {
     "processo": "//table[@id='tblProtocolosBlocos']//tr[contains(@class,'infraTr')]//td[2]//a",
     "documento": "//table[@id='tblProtocolosBlocos']//tr[contains(@class,'infraTr')]//td[3]",
