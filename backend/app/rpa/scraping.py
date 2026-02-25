@@ -145,8 +145,9 @@ class SEIScraper:
                 processos = processos[:max_processos_por_interno]
 
             for proc in processos:
+                self.logger.info("Abrindo processo %s", proc)
                 self._open_processo(proc)
-                self._collect_documentos()
+                self.logger.info("Fechando aba do processo e voltando")
                 self._close_current_tab_and_back()
 
             self._back_to_interno_list()
