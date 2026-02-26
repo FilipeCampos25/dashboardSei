@@ -11,21 +11,25 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from selenium.common.exceptions import (
-    ElementClickInterceptedException,
-    NoSuchFrameException,
     StaleElementReferenceException,
     TimeoutException,
     WebDriverException,
 )
 from selenium.webdriver.common.by import By
-from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
 from app.config import get_settings
 from app.core.driver_factory import create_chrome_driver
 from app.core.logging_config import setup_logger
-from app.services.reporting import ReportBuilder
-from app.services.selectors import load_selectors
+from app.output import csv_writer
+from app.rpa.sei import process_navigation
+from app.rpa.sei import toolbar_actions
+from app.rpa.selenium_utils import (
+    wait_for_clickable as selenium_wait_for_clickable,
+    wait_for_document_ready as selenium_wait_for_document_ready,
+    wait_for_elements as selenium_wait_for_elements,
+)
+from app.rpa.selectors import load_xpath_selectors
 
 
 @dataclass
@@ -44,19 +48,8 @@ class InternoRow:
 
 
 class SEIScraper:
-    XPATH_PASTAS_FECHADAS = "//img[starts-with(@id,'joinPASTA') and contains(@title,'Abrir')]"
-    XPATH_ARVORE_DOCUMENTOS = "//div[contains(@class,'infraArvore')]//a[contains(@class,'infraArvoreNo')]/span"
-    XPATH_ARVORE_NOS = "//div[contains(@class,'infraArvore')]//a[contains(@class,'infraArvoreNo')]"
-    XPATH_ARVORE_PARAGRAFOS = "//div[contains(@class,'infraArvore')]//p"
-    XPATH_ARVORE_PROCESSO_SELECIONADO = "//span[contains(@class,'infraArvoreNoSelecionado')]/parent::a"
-    XPATH_ABA_PESQUISAR_NO_PROCESSO = "//a[.//img[@title='Pesquisar no Processo']]"
-    XPATH_TITULO_PESQUISAR_NO_PROCESSO = "//h2[contains(text(),'Pesquisar no Processo')]"
-    XPATH_EXPANDIR_TODAS_PASTAS = (
-        "//img[starts-with(@id,'iconAP') and @title='Abrir todas as Pastas']"
-        " | //div[contains(@class,'infraArvore')]//img[@title='Abrir todas as Pastas']"
-        " | //img[@title='Abrir todas as Pastas' and contains(@src,'/infra_css/img/mais.svg')]"
-    )
 
+    # Setup / lifecycle
     def __init__(self) -> None:
         self.logger = setup_logger()
 
@@ -87,7 +80,7 @@ class SEIScraper:
         self.driver = create_chrome_driver(headless=cfg.headless)
         self.wait = WebDriverWait(self.driver, cfg.timeout_seconds)
         self.timeout_seconds = cfg.timeout_seconds
-        self.selectors = load_selectors()
+        self.selectors = load_xpath_selectors()
         self.found: Set[str] = set()
         self.descricoes_busca = self._parse_descricoes_busca(cfg.descricoes_busca)
         self.descricao_match_mode = (cfg.descricoes_match_mode or "contains").strip().lower()
@@ -100,6 +93,7 @@ class SEIScraper:
             )
             self.descricao_match_mode = "contains"
 
+    # Fluxo principal
     def run_full_flow(
         self,
         manual_login: bool = True,
@@ -177,59 +171,10 @@ class SEIScraper:
         print(result)
         return result
 
-    def _get_iframes_info(self) -> List[Dict[str, Any]]:
-        frames: List[Dict[str, Any]] = []
-        try:
-            elems = self.driver.find_elements(By.TAG_NAME, "iframe")
-        except WebDriverException:
-            return frames
-
-        for idx, frame in enumerate(elems):
-            try:
-                frames.append(
-                    {
-                        "index": idx,
-                        "id": frame.get_attribute("id"),
-                        "name": frame.get_attribute("name"),
-                        "src": frame.get_attribute("src"),
-                    }
-                )
-            except WebDriverException:
-                frames.append(
-                    {
-                        "index": idx,
-                        "id": None,
-                        "name": None,
-                        "src": None,
-                    }
-                )
-        return frames
-
-    def _get_ready_state(self) -> str:
-        try:
-            value = self.driver.execute_script("return document.readyState")
-        except WebDriverException:
-            return "unavailable"
-        return str(value) if value else "unknown"
-
+    # Utils wrappers (selenium_utils)
     def _wait_for_document_ready(self, timeout: int, tag: str) -> None:
-        try:
-            WebDriverWait(self.driver, timeout).until(
-                lambda d: d.execute_script("return document.readyState") == "complete"
-            )
-        except TimeoutException as exc:
-            self.logger.error("Timeout aguardando readyState=complete (%s)", tag)
-            raise exc
+        selenium_wait_for_document_ready(self.driver, timeout, tag, self.logger)
 
-    def _log_iframe_hint(self, context: str) -> List[Dict[str, Any]]:
-        frames = self._get_iframes_info()
-        if frames:
-            self.logger.error(
-                "%s: encontrados %d iframe(s). O XPath pode estar em outro contexto.",
-                context,
-                len(frames),
-            )
-        return frames
 
     def wait_for_elements(
         self,
@@ -239,101 +184,26 @@ class SEIScraper:
         restore_context: bool = True,
     ) -> List[Any]:
         effective_timeout = timeout or self.timeout_seconds
-        self._wait_for_document_ready(effective_timeout, tag)
-        deadline = time.time() + effective_timeout
-        iframe_count_logged = False
-
-        try:
-            while time.time() < deadline:
-                self.driver.switch_to.default_content()
-                elems = self.driver.find_elements(By.XPATH, xpath)
-                if elems:
-                    return elems
-
-                iframes = self.driver.find_elements(By.TAG_NAME, "iframe")
-                if iframes and not iframe_count_logged:
-                    self.logger.info(
-                        "wait_for_elements(%s): fallback em %d iframe(s)",
-                        tag,
-                        len(iframes),
-                    )
-                    iframe_count_logged = True
-
-                for idx in range(len(iframes)):
-                    if time.time() >= deadline:
-                        break
-
-                    try:
-                        self.driver.switch_to.default_content()
-                        current_iframes = self.driver.find_elements(By.TAG_NAME, "iframe")
-                        if idx >= len(current_iframes):
-                            continue
-
-                        frame = current_iframes[idx]
-                        frame_id = frame.get_attribute("id")
-                        frame_name = frame.get_attribute("name")
-                        frame_src = frame.get_attribute("src")
-
-                        self.logger.debug(
-                            "wait_for_elements(%s): tentando iframe[%d] id=%s name=%s src=%s",
-                            tag,
-                            idx,
-                            frame_id,
-                            frame_name,
-                            frame_src,
-                        )
-
-                        self.driver.switch_to.frame(frame)
-                        elems = self.driver.find_elements(By.XPATH, xpath)
-                        if elems:
-                            return elems
-                    except (StaleElementReferenceException, NoSuchFrameException, WebDriverException) as frame_exc:
-                        self.logger.debug(
-                            "wait_for_elements(%s): iframe[%d] indisponivel/stale (%s)",
-                            tag,
-                            idx,
-                            frame_exc,
-                        )
-                        continue
-
-                time.sleep(min(0.5, max(0.0, deadline - time.time())))
-
-            frames = self._log_iframe_hint(f"wait_for_elements falhou ({tag})")
-            self.logger.error(
-                "Timeout aguardando elementos: tag=%s xpath=%s timeout=%ss",
-                tag,
-                xpath,
-                effective_timeout,
-            )
-            self.logger.error("Contexto: iframe_count=%d url=%s", len(frames), self.driver.current_url)
-            raise TimeoutException(
-                f"Timeout aguardando elementos: tag={tag} xpath={xpath} timeout={effective_timeout}s"
-            )
-        finally:
-            if restore_context:
-                try:
-                    self.driver.switch_to.default_content()
-                except WebDriverException:
-                    pass
+        return selenium_wait_for_elements(
+            self.driver,
+            self.logger,
+            xpath,
+            tag,
+            timeout_seconds=effective_timeout,
+            restore_context=restore_context,
+        )
 
     def wait_for_clickable(self, xpath: str, tag: str, timeout: int | None = None) -> Any:
         effective_timeout = timeout or self.timeout_seconds
-        self._wait_for_document_ready(effective_timeout, tag)
-        try:
-            return WebDriverWait(self.driver, effective_timeout).until(
-                EC.element_to_be_clickable((By.XPATH, xpath))
-            )
-        except TimeoutException as exc:
-            frames = self._log_iframe_hint(f"wait_for_clickable falhou ({tag})")
-            self.logger.error(
-                "Timeout aguardando clique: tag=%s xpath=%s timeout=%ss",
-                tag,
-                xpath,
-                effective_timeout,
-            )
-            self.logger.error("Contexto: iframe_count=%d url=%s", len(frames), self.driver.current_url)
-            raise exc
+        return selenium_wait_for_clickable(
+            self.driver,
+            self.logger,
+            xpath,
+            tag,
+            timeout_seconds=effective_timeout,
+        )
 
+    # Login / tela inicial
     def _wait_for_manual_login(self) -> None:
         cfg = self.settings
         self.logger.info("Aguardando login manual no SEI.")
@@ -392,11 +262,6 @@ class SEIScraper:
             for marker in ("gateway timeout", "erro 504", "http error 504")
         )
 
-    def _safe_refresh(self) -> None:
-        try:
-            self.driver.refresh()
-        except WebDriverException as exc:
-            self.logger.debug("Falha ao atualizar pagina durante espera de login: %s", exc)
 
     def _login_if_possible(self) -> None:
         if not self.username or not self.password:
@@ -433,6 +298,7 @@ class SEIScraper:
         except Exception:
             return
 
+    # Helpers de seletores / clique
     def _click_first_clickable(self, xpaths: List[str], label: str) -> None:
         checked: List[str] = []
         candidate_timeout = max(3, min(8, self.timeout_seconds))
@@ -454,191 +320,35 @@ class SEIScraper:
             f"Nao localizei elemento clicavel para '{label}'. XPaths tentados: {checked}"
         )
 
-    def _get_selector_candidates(self, section: str, key: str) -> List[str]:
-        section_data = self.selectors.get(section, {}) or {}
-        raw_value = section_data.get(key)
-        if isinstance(raw_value, str):
-            value = raw_value.strip()
-            if value:
-                return [value]
-        if isinstance(raw_value, list):
-            values = [
-                str(item).strip()
-                for item in raw_value
-                if isinstance(item, str) and str(item).strip()
-            ]
-            if values:
-                return values
-        raise RuntimeError(f"Seletor {section}.{key} ausente em xpath_selector.json")
-
-    def _click_xpath_with_retry(
-        self,
-        xpaths: List[str],
-        label: str,
-        timeout_seconds: Optional[float] = None,
-    ) -> str:
-        deadline = time.time() + (timeout_seconds or max(8.0, min(15.0, float(self.timeout_seconds))))
-        last_error: Optional[BaseException] = None
-        tried: List[str] = []
-
-        while time.time() < deadline:
-            for xpath in xpaths:
-                if xpath not in tried:
-                    tried.append(xpath)
-                try:
-                    elems = self.driver.find_elements(By.XPATH, xpath)
-                    if not elems:
-                        continue
-                    elem = elems[0]
-                    try:
-                        self.driver.execute_script(
-                            "arguments[0].scrollIntoView({block: 'center', inline: 'center'});",
-                            elem,
-                        )
-                    except WebDriverException:
-                        pass
-                    try:
-                        elem.click()
-                    except (ElementClickInterceptedException, WebDriverException):
-                        self.driver.execute_script("arguments[0].click();", elem)
-                    return xpath
-                except (StaleElementReferenceException, WebDriverException) as exc:
-                    last_error = exc
-                    continue
-            time.sleep(0.2)
-
-        if last_error:
-            raise RuntimeError(
-                f"Falha ao clicar '{label}' apos tentativas. XPaths={tried} erro={last_error}"
-            ) from last_error
-        raise TimeoutException(f"Timeout ao localizar '{label}'. XPaths={tried}")
-
+    # Toolbar do processo (ate abrir filtro)
     def _wait_page_ready_in_processo(self) -> None:
-        processo_sel = self.selectors.get("processo", {}) or {}
-        x_iframe_arvore = processo_sel.get("iframe_arvore")
-        pesquisar_candidates = self._get_selector_candidates("processo", "pesquisar_no_processo")
-
-        self.driver.switch_to.default_content()
-        WebDriverWait(self.driver, max(10, min(20, self.timeout_seconds))).until(
-            lambda d: d.execute_script("return document.readyState") == "complete"
+        toolbar_actions.wait_page_ready_in_processo(
+            self.driver,
+            self.logger,
+            timeout=self.timeout_seconds,
         )
 
-        def _toolbar_or_frame_ready(driver: Any) -> bool:
-            try:
-                driver.switch_to.default_content()
-            except WebDriverException:
-                return False
-
-            if x_iframe_arvore and driver.find_elements(By.XPATH, str(x_iframe_arvore)):
-                return True
-
-            for xpath in pesquisar_candidates:
-                try:
-                    if driver.find_elements(By.XPATH, xpath):
-                        return True
-                except WebDriverException:
-                    continue
-            return False
-
-        WebDriverWait(self.driver, max(10, min(20, self.timeout_seconds))).until(_toolbar_or_frame_ready)
-
     def _click_abrir_todas_as_pastas(self) -> None:
-        xpaths = self._get_selector_candidates("processo", "abrir_todas_as_pastas")
-        before_snapshot = {"docs": -1, "nos": -1, "paragrafos": -1, "pastas_fechadas": -1}
-        clicked = False
-
-        try:
-            if not self._switch_to_ifr_arvore():
-                raise RuntimeError("iframe ifrArvore nao encontrado")
-
-            before_snapshot = self._get_arvore_snapshot()
-            self._click_xpath_with_retry(xpaths, label="processo.abrir_todas_as_pastas", timeout_seconds=10.0)
-            clicked = True
-
-            after_snapshot = self._wait_arvore_stabilize(
-                stable_cycles=2,
-                interval_seconds=0.25,
-                timeout_seconds=max(5.0, min(12.0, float(self.timeout_seconds))),
-            )
-            if not self._arvore_expandiu(before_snapshot, after_snapshot):
-                self.logger.debug(
-                    "Abrir todas as Pastas: clique sem variacao detectavel na arvore (antes=%s depois=%s).",
-                    before_snapshot,
-                    after_snapshot,
-                )
-        finally:
-            try:
-                self.driver.switch_to.default_content()
-            except WebDriverException:
-                pass
-
-        if not clicked:
-            raise RuntimeError("Nao foi possivel clicar em 'Abrir todas as Pastas'")
+        toolbar_actions.click_abrir_todas_as_pastas(
+            self.driver,
+            self.selectors,
+            self.logger,
+        )
 
     def _click_pesquisar_no_processo(self) -> None:
-        processo_sel = self.selectors.get("processo", {}) or {}
-        x_iframe_visualizacao = processo_sel.get("iframe_visualizacao")
-        x_pesquisa_anchor = processo_sel.get("pesquisa_anchor")
-        if not x_pesquisa_anchor:
-            raise RuntimeError("Seletor processo.pesquisa_anchor ausente em xpath_selector.json")
+        toolbar_actions.click_pesquisar_no_processo(
+            self.driver,
+            self.selectors,
+            self.logger,
+        )
+        toolbar_actions.wait_pesquisa_anchor(
+            self.driver,
+            self.selectors,
+            self.logger,
+            timeout=self.timeout_seconds,
+        )
 
-        xpaths = self._get_selector_candidates("processo", "pesquisar_no_processo")
-
-        self.driver.switch_to.default_content()
-        self._click_xpath_with_retry(xpaths, label="processo.pesquisar_no_processo", timeout_seconds=10.0)
-
-        deadline = time.time() + max(10.0, min(20.0, float(self.timeout_seconds)))
-        while time.time() < deadline:
-            try:
-                self.driver.switch_to.default_content()
-            except WebDriverException:
-                pass
-
-            try:
-                if "procedimento_pesquisar" in (self.driver.current_url or ""):
-                    return
-            except WebDriverException:
-                pass
-
-            try:
-                if self.driver.find_elements(By.XPATH, str(x_pesquisa_anchor)):
-                    return
-            except WebDriverException:
-                pass
-
-            iframe_elems: List[Any] = []
-            if x_iframe_visualizacao:
-                try:
-                    iframe_elems = self.driver.find_elements(By.XPATH, str(x_iframe_visualizacao))
-                except WebDriverException:
-                    iframe_elems = []
-
-            if iframe_elems:
-                iframe_elem = iframe_elems[0]
-                try:
-                    iframe_src = (iframe_elem.get_attribute("src") or "").lower()
-                except WebDriverException:
-                    iframe_src = ""
-                if "procedimento_pesquisar" in iframe_src:
-                    return
-
-                try:
-                    self.driver.switch_to.default_content()
-                    self.driver.switch_to.frame(iframe_elem)
-                    if self.driver.find_elements(By.XPATH, str(x_pesquisa_anchor)):
-                        return
-                except (NoSuchFrameException, StaleElementReferenceException, WebDriverException):
-                    pass
-                finally:
-                    try:
-                        self.driver.switch_to.default_content()
-                    except WebDriverException:
-                        pass
-
-            time.sleep(0.2)
-
-        raise RuntimeError("Tela de filtro/pesquisa nao confirmou abertura (anchor/url)")
-
+    # Internos (menu, selecao guiada, paginacao)
     def _open_interno_menu(self) -> None:
         sel = self.selectors.get("tela_inicio", {})
         x_bloco = sel.get("bloco")
@@ -994,31 +704,6 @@ class SEIScraper:
         )
         return False
 
-    def _list_internos(self) -> List[str]:
-        sel = self.selectors.get("interno", {})
-        x = sel.get("numero_interno")
-        if not x:
-            raise RuntimeError("Seletor interno.numero_interno ausente em xpath_selector.json")
-
-        elems = self.wait_for_elements(x, tag="list_internos")
-        return [e.text.strip() for e in elems if e.text and e.text.strip()]
-
-    def _open_interno(self, interno_text: str) -> None:
-        sel = self.selectors.get("interno", {})
-        x = sel.get("numero_interno")
-        if not x:
-            raise RuntimeError("Seletor interno.numero_interno ausente em xpath_selector.json")
-
-        elems = self.wait_for_elements(x, tag="open_interno_list")
-        for elem in elems:
-            if elem.text.strip() == interno_text:
-                elem.click()
-                return
-
-        frames = self._log_iframe_hint("Nao consegui encontrar o interno na lista")
-        self.logger.error("Contexto: iframe_count=%d url=%s", len(frames), self.driver.current_url)
-        raise RuntimeError(f"Nao consegui abrir o interno: {interno_text}")
-
     def _get_current_interno_descricao_value(self) -> str:
         contexts_to_try: List[tuple[str, Any]] = [("default", None)]
         try:
@@ -1052,6 +737,7 @@ class SEIScraper:
 
         return ""
 
+    # Preview (PARCERIAS VIGENTES)
     def _should_collect_preview_for_current_descricao(self, descricao_atual: str) -> bool:
         descricao_norm = self._normalize_text(descricao_atual)
         return descricao_norm == "PARCERIAS VIGENTES"
@@ -1251,45 +937,6 @@ class SEIScraper:
                 return idx
         return -1
 
-    def _infer_tipo_coluna(
-        self,
-        cell_texts: List[str],
-        processo: str,
-        processo_idx: int = -1,
-        anotacoes_idx: int = -1,
-    ) -> str:
-        if anotacoes_idx > 0:
-            for idx in range(anotacoes_idx - 1, -1, -1):
-                text = cell_texts[idx] if len(cell_texts) > idx else ""
-                if not text or text == processo:
-                    continue
-                if processo_idx >= 0 and idx == processo_idx:
-                    continue
-                if re.fullmatch(r"\d{1,6}", text):
-                    continue
-                return text
-
-        for idx in (2, 3):
-            if len(cell_texts) > idx and cell_texts[idx]:
-                text = cell_texts[idx]
-                if text != processo:
-                    return text
-
-        tipo_keywords = (
-            "ACORDO",
-            "COOPERACAO",
-            "CONVENIO",
-            "PARCERIA",
-            "TERMO",
-        )
-        normalized_keywords = [self._normalize_text(k) for k in tipo_keywords]
-        for text in cell_texts:
-            if not text:
-                continue
-            normalized = self._normalize_text(text)
-            if any(keyword in normalized for keyword in normalized_keywords):
-                return text
-        return ""
 
     def _extract_preview_record_from_row(self, row: Any, interno_descricao: str) -> Optional[Dict[str, str]]:
         try:
@@ -1421,7 +1068,7 @@ class SEIScraper:
             return None
 
         output_dir = self._resolve_preview_output_dir()
-        output_dir.mkdir(parents=True, exist_ok=True)
+        csv_writer.ensure_output_dir(output_dir)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         csv_path = output_dir / f"parcerias_vigentes_{timestamp}.csv"
         ordered_columns = [
@@ -1438,7 +1085,7 @@ class SEIScraper:
             sanitized_records.append(
                 {col: self._clean_text_value(str(record.get(col, "") or "")) for col in ordered_columns}
             )
-        ReportBuilder(sanitized_records).to_csv(csv_path)
+        csv_writer.write_csv(sanitized_records, csv_path)
         return csv_path
 
     def _collect_preview_if_parcerias_vigencias(self) -> None:
@@ -1468,6 +1115,7 @@ class SEIScraper:
         except Exception as exc:
             self.logger.exception("Falha na coleta preview direcional: %s", exc)
 
+    # Processos (listagem / abertura)
     def _list_processos(self) -> List[str]:
         sel = self.selectors.get("interno", {})
         x = sel.get("processo")
@@ -1483,681 +1131,12 @@ class SEIScraper:
         return out
 
     def _open_processo(self, processo_text: str) -> None:
-        sel = self.selectors.get("interno", {})
-        x = sel.get("processo")
-        if not x:
-            raise RuntimeError("Seletor interno.processo ausente em xpath_selector.json")
+        setattr(self.driver, "_sei_timeout_seconds", self.timeout_seconds)
+        process_navigation.open_processo(self.driver, processo_text, self.selectors, self.logger)
 
-        elems = self.wait_for_elements(x, tag="open_processo_list")
-        for elem in elems:
-            if (elem.text or "").strip() == processo_text:
-                handles_before = set(self.driver.window_handles)
-                elem.click()
-
-                try:
-                    WebDriverWait(self.driver, self.timeout_seconds).until(
-                        lambda d: len(set(d.window_handles) - handles_before) > 0
-                    )
-                except TimeoutException as exc:
-                    frames = self._log_iframe_hint("Timeout aguardando nova janela do processo")
-                    self.logger.error("Contexto: iframe_count=%d url=%s", len(frames), self.driver.current_url)
-                    raise RuntimeError(
-                        f"Nao abriu nova janela para o processo: {processo_text}"
-                    ) from exc
-
-                handles_after = set(self.driver.window_handles)
-                new_handles = list(handles_after - handles_before)
-                if not new_handles:
-                    raise RuntimeError(
-                        f"Nao identifiquei o handle da nova janela do processo: {processo_text}"
-                    )
-
-                new_handle = new_handles[0]
-                self.driver.switch_to.window(new_handle)
-                self.logger.info(
-                    "Nova janela do processo aberta. handle=%s url=%s title=%s",
-                    new_handle,
-                    self.driver.current_url,
-                    self.driver.title,
-                )
-                return
-
-        frames = self._log_iframe_hint("Nao consegui localizar o processo para abrir")
-        self.logger.error("Contexto: iframe_count=%d url=%s", len(frames), self.driver.current_url)
-        raise RuntimeError(f"Nao consegui abrir o processo: {processo_text}")
-
-    def _collect_documentos(self) -> None:
-        try:
-            self._expand_all_pastas(max_cycles=15)
-            self._navigate_to_pesquisar_no_processo()
-        except Exception as exc:
-            self.logger.exception("Falha ao navegar no processo apos expandir pastas: %s", exc)
-        finally:
-            try:
-                self.driver.switch_to.default_content()
-            except WebDriverException:
-                pass
-
-    def _navigate_to_pesquisar_no_processo(self) -> None:
-        etapa = "init"
-        contexto = "default"
-        processo_hint = ""
-        x_iframes_geral = ""
-
-        def _get_required_interno_selector(key: str) -> str:
-            value = (self.selectors.get("interno", {}) or {}).get(key)
-            if not value:
-                raise RuntimeError(f"Seletor interno.{key} ausente em xpath_selector.json")
-            return value
-
-        def _is_webdriver_unavailable(exc: BaseException) -> bool:
-            message = str(exc).lower()
-            return (
-                "10061" in message
-                or "connection refused" in message
-                or "refused to connect" in message
-                or "max retries exceeded" in message
-            )
-
-        def _switch_to_frame_by_xpath(x_frame: str, timeout_seconds: float, frame_label: str) -> None:
-            nonlocal etapa, contexto
-            etapa = f"switch_{frame_label}"
-            self.driver.switch_to.default_content()
-            contexto = "default"
-            iframe_el = WebDriverWait(self.driver, timeout_seconds).until(
-                EC.presence_of_element_located((By.XPATH, x_frame))
-            )
-            self.driver.switch_to.frame(iframe_el)
-            contexto = frame_label
-
-        def _click_js_resiliente(element: Any) -> None:
-            self.driver.execute_script(
-                "arguments[0].scrollIntoView({block: 'center', inline: 'center'});",
-                element,
-            )
-            self.driver.execute_script("arguments[0].click();", element)
-
-        def _save_nav_debug_evidence() -> Tuple[Optional[Path], Optional[Path]]:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            debug_dir = self._resolve_preview_output_dir() / "debug"
-            debug_dir.mkdir(parents=True, exist_ok=True)
-
-            raw_hint = self._clean_text_value(processo_hint or "") or "processo_desconhecido"
-            safe_hint = re.sub(r"[^A-Za-z0-9._-]+", "_", raw_hint).strip("._-") or "processo_desconhecido"
-            safe_hint = safe_hint[:80]
-            base_name = f"pesquisar_no_processo_{timestamp}_{safe_hint}"
-
-            screenshot_path = debug_dir / f"{base_name}.png"
-            html_path = debug_dir / f"{base_name}.html"
-            saved_png: Optional[Path] = None
-            saved_html: Optional[Path] = None
-
-            try:
-                if self.driver.save_screenshot(str(screenshot_path)):
-                    saved_png = screenshot_path
-            except WebDriverException as debug_exc:
-                if _is_webdriver_unavailable(debug_exc):
-                    self.logger.warning(
-                        "[NAV][WARN] webdriver indisponivel ao gerar evidencias (driver morreu)."
-                    )
-                    return None, None
-                self.logger.warning("[NAV][ERRO] Falha ao salvar screenshot de debug: %s", debug_exc)
-
-            try:
-                html_path.write_text(self.driver.page_source or "", encoding="utf-8")
-                saved_html = html_path
-            except WebDriverException as debug_exc:
-                if _is_webdriver_unavailable(debug_exc):
-                    self.logger.warning(
-                        "[NAV][WARN] webdriver indisponivel ao gerar evidencias (driver morreu)."
-                    )
-                    return saved_png, None
-                self.logger.warning("[NAV][ERRO] Falha ao salvar HTML de debug: %s", debug_exc)
-            except Exception as debug_exc:
-                self.logger.warning("[NAV][ERRO] Falha ao salvar HTML de debug: %s", debug_exc)
-
-            return saved_png, saved_html
-
-        def _collect_iframes_from_xpath() -> List[Tuple[int, Any, Dict[str, Optional[str]]]]:
-            frames_data: List[Tuple[int, Any, Dict[str, Optional[str]]]] = []
-            try:
-                self.driver.switch_to.default_content()
-                iframe_elems = self.driver.find_elements(By.XPATH, x_iframes_geral)
-            except WebDriverException as exc:
-                if _is_webdriver_unavailable(exc):
-                    self.logger.warning(
-                        "[NAV][WARN] webdriver indisponivel ao gerar evidencias (driver morreu)."
-                    )
-                return frames_data
-
-            for idx, iframe in enumerate(iframe_elems):
-                info: Dict[str, Optional[str]] = {"id": None, "name": None, "src": None}
-                try:
-                    info["id"] = iframe.get_attribute("id")
-                    info["name"] = iframe.get_attribute("name")
-                    info["src"] = iframe.get_attribute("src")
-                except WebDriverException:
-                    pass
-                frames_data.append((idx, iframe, info))
-            return frames_data
-
-        def _log_iframes_debug() -> List[Tuple[int, Any, Dict[str, Optional[str]]]]:
-            frames_data = _collect_iframes_from_xpath()
-            log_payload = [
-                {
-                    "index": idx,
-                    "id": info.get("id"),
-                    "name": info.get("name"),
-                    "src": info.get("src"),
-                }
-                for idx, _, info in frames_data
-            ]
-            self.logger.info("[NAV][DEBUG] iframes encontrados: %s", log_payload)
-            return frames_data
-
-        def _wait_toolbar_ready() -> None:
-            nonlocal etapa, contexto
-            etapa = "wait_toolbar_ready"
-            contexto = "default"
-            self.driver.switch_to.default_content()
-            self.logger.info("[NAV] Aguardando toolbar pronta...")
-
-            if x_overlay_carregando:
-                try:
-                    WebDriverWait(self.driver, max(2, min(6, self.timeout_seconds))).until(
-                        EC.invisibility_of_element_located((By.XPATH, x_overlay_carregando))
-                    )
-                except TimeoutException:
-                    self.logger.debug("[NAV] overlay_carregando ainda visivel; seguindo para validar toolbar.")
-                except WebDriverException as exc:
-                    if _is_webdriver_unavailable(exc):
-                        raise
-
-            WebDriverWait(self.driver, max(4, min(10, self.timeout_seconds))).until(
-                EC.presence_of_element_located((By.XPATH, x_toolbar_container))
-            )
-
-        def _find_signals_in_current_context() -> Set[str]:
-            signals: Set[str] = set()
-            try:
-                if self.driver.find_elements(By.XPATH, x_titulo):
-                    signals.add("h2")
-            except WebDriverException:
-                pass
-            try:
-                if self.driver.find_elements(By.XPATH, x_form):
-                    signals.add("form")
-            except WebDriverException:
-                pass
-            return signals
-
-        def _format_signals(signals: Set[str]) -> str:
-            ordered = [name for name in ("h2", "form", "iframe_src") if name in signals]
-            return "|".join(ordered) if ordered else "nenhum"
-
-        def _click_toolbar_pesquisar() -> None:
-            nonlocal etapa, contexto
-            etapa = "click_aba_toolbar_default"
-            contexto = "default"
-            self.driver.switch_to.default_content()
-            self.logger.info("[NAV] Clicando Pesquisar no Processo na toolbar (default_content)...")
-            aba_el = WebDriverWait(self.driver, max(4, min(8, self.timeout_seconds))).until(
-                EC.presence_of_element_located((By.XPATH, x_aba_toolbar))
-            )
-            _click_js_resiliente(aba_el)
-
-        def _validate_pesquisar_screen() -> Tuple[bool, str, Set[str]]:
-            nonlocal etapa, contexto
-            etapa = "validar_tela_pesquisar"
-            contexto = "default"
-            timeout_total = max(10.0, min(15.0, float(self.timeout_seconds)))
-            deadline = time.time() + timeout_total
-            last_iframe_log = 0.0
-            last_signals: Set[str] = set()
-
-            while time.time() < deadline:
-                try:
-                    self.driver.switch_to.default_content()
-                    contexto = "default"
-                except WebDriverException as exc:
-                    if _is_webdriver_unavailable(exc):
-                        break
-
-                current_signals = _find_signals_in_current_context()
-                if current_signals:
-                    self.logger.info(
-                        "[NAV] Validando tela... sinais encontrados: %s",
-                        _format_signals(current_signals),
-                    )
-                    return True, "default", current_signals
-
-                try:
-                    iframe_pesquisa = self.driver.find_elements(By.XPATH, x_iframe_pesquisar_src)
-                except WebDriverException as exc:
-                    if _is_webdriver_unavailable(exc):
-                        break
-                    iframe_pesquisa = []
-
-                if iframe_pesquisa:
-                    current_signals = set(current_signals)
-                    current_signals.add("iframe_src")
-                    contexto_iframe = "iframe:procedimento_pesquisar"
-                    try:
-                        self.driver.switch_to.default_content()
-                        self.driver.switch_to.frame(iframe_pesquisa[0])
-                        current_signals.update(_find_signals_in_current_context())
-                    except (NoSuchFrameException, StaleElementReferenceException, WebDriverException):
-                        pass
-                    finally:
-                        try:
-                            self.driver.switch_to.default_content()
-                        except WebDriverException:
-                            pass
-
-                    self.logger.info(
-                        "[NAV] Validando tela... sinais encontrados: %s",
-                        _format_signals(current_signals),
-                    )
-                    return True, contexto_iframe, current_signals
-
-                if time.time() - last_iframe_log > 2.0:
-                    _log_iframes_debug()
-                    last_iframe_log = time.time()
-
-                frames_data = _collect_iframes_from_xpath()
-                for idx, _, info in frames_data:
-                    frame_id = info.get("id")
-                    frame_name = info.get("name")
-                    try:
-                        self.driver.switch_to.default_content()
-                        current_frames = self.driver.find_elements(By.XPATH, x_iframes_geral)
-                        if idx >= len(current_frames):
-                            continue
-                        self.driver.switch_to.frame(current_frames[idx])
-                        frame_signals = _find_signals_in_current_context()
-                        if frame_signals:
-                            contexto = f"iframe:{frame_id or frame_name or idx}"
-                            self.logger.info(
-                                "[NAV] Validando tela... sinais encontrados: %s",
-                                _format_signals(frame_signals),
-                            )
-                            return True, contexto, frame_signals
-                    except (NoSuchFrameException, StaleElementReferenceException, WebDriverException):
-                        continue
-                    finally:
-                        try:
-                            self.driver.switch_to.default_content()
-                        except WebDriverException:
-                            pass
-
-                last_signals = current_signals
-                time.sleep(0.3)
-
-            self.logger.info(
-                "[NAV] Validando tela... sinais encontrados: %s",
-                _format_signals(last_signals),
-            )
-            return False, contexto, last_signals
-
-        try:
-            interno_sel = self.selectors.get("interno", {}) or {}
-            x_ifr_arvore = _get_required_interno_selector("iframe_arvore")
-            x_proc_sel = _get_required_interno_selector("arvore_processo_selecionado")
-            x_overlay_carregando = interno_sel.get("overlay_carregando") or interno_sel.get("overlay_aguarde")
-            x_toolbar_container = _get_required_interno_selector("toolbar_container")
-            x_aba_toolbar = _get_required_interno_selector("aba_pesquisar_no_processo_toolbar")
-            x_titulo = _get_required_interno_selector("titulo_pesquisar_no_processo")
-            x_form = _get_required_interno_selector("form_pesquisar_no_processo")
-            x_iframes_geral = _get_required_interno_selector("iframes_geral")
-            x_iframe_pesquisar_src = _get_required_interno_selector("iframe_pesquisar_src")
-
-            self.driver.switch_to.default_content()
-            contexto = "default"
-
-            _switch_to_frame_by_xpath(
-                x_ifr_arvore,
-                timeout_seconds=max(4, min(self.timeout_seconds, 10)),
-                frame_label="ifrArvore",
-            )
-            self.logger.info("[NAV] Clicando processo...")
-
-            etapa = "click_processo_arvore"
-            processo_link = WebDriverWait(self.driver, self.timeout_seconds).until(
-                EC.presence_of_element_located((By.XPATH, x_proc_sel))
-            )
-            processo_hint = self._clean_text_value(
-                (processo_link.text or "")
-                or (processo_link.get_attribute("title") or "")
-                or (processo_link.get_attribute("aria-label") or "")
-            )
-            try:
-                _click_js_resiliente(processo_link)
-            except WebDriverException:
-                processo_link.click()
-
-            self.driver.switch_to.default_content()
-            contexto = "default"
-            _wait_toolbar_ready()
-            _click_toolbar_pesquisar()
-
-            ok, success_context, signals = _validate_pesquisar_screen()
-            if not ok:
-                raise RuntimeError(
-                    "Tela 'Pesquisar no Processo' nao validada apos clique "
-                    f"(sinais={_format_signals(signals)})"
-                )
-            self.logger.info(
-                "[NAV] Tela 'Pesquisar no Processo' carregada com sucesso (contexto=%s sinais=%s)",
-                success_context,
-                _format_signals(signals),
-            )
-        except Exception as exc:
-            screenshot_path: Optional[Path] = None
-            html_path: Optional[Path] = None
-            try:
-                screenshot_path, html_path = _save_nav_debug_evidence()
-            except Exception as evidence_exc:
-                if _is_webdriver_unavailable(evidence_exc):
-                    self.logger.warning(
-                        "[NAV][WARN] webdriver indisponivel ao gerar evidencias (driver morreu)."
-                    )
-                else:
-                    self.logger.warning("[NAV][ERRO] Falha ao gerar evidencias de debug: %s", evidence_exc)
-
-            current_url = ""
-            current_title = ""
-            iframe_count = -1
-
-            try:
-                self.driver.switch_to.default_content()
-            except WebDriverException:
-                pass
-
-            try:
-                current_url = self.driver.current_url or ""
-            except WebDriverException as driver_exc:
-                if _is_webdriver_unavailable(driver_exc):
-                    self.logger.warning(
-                        "[NAV][WARN] webdriver indisponivel ao gerar evidencias (driver morreu)."
-                    )
-
-            try:
-                current_title = self.driver.title or ""
-            except WebDriverException:
-                current_title = ""
-
-            try:
-                iframe_count = len(self.driver.find_elements(By.XPATH, x_iframes_geral)) if x_iframes_geral else -1
-            except WebDriverException:
-                iframe_count = -1
-
-            self.logger.error(
-                "[NAV][ERRO] Falha ao abrir 'Pesquisar no Processo' (etapa=%s): %s",
-                etapa,
-                exc,
-            )
-            self.logger.error("[NAV][ERRO] contexto=%s", contexto)
-            self.logger.error("[NAV][ERRO] current_url=%s", current_url)
-            self.logger.error("[NAV][ERRO] title=%s", current_title)
-            self.logger.error("[NAV][ERRO] quantidade_iframes=%s", iframe_count)
-            try:
-                _log_iframes_debug()
-            except Exception as iframe_debug_exc:
-                if _is_webdriver_unavailable(iframe_debug_exc):
-                    self.logger.warning(
-                        "[NAV][WARN] webdriver indisponivel ao gerar evidencias (driver morreu)."
-                    )
-                else:
-                    self.logger.warning("[NAV][ERRO] Falha ao logar iframes no erro: %s", iframe_debug_exc)
-            if screenshot_path:
-                self.logger.error("[NAV][ERRO] Screenshot debug salvo em: %s", screenshot_path)
-            if html_path:
-                self.logger.error("[NAV][ERRO] HTML debug salvo em: %s", html_path)
-            raise RuntimeError("Falha na navegacao para 'Pesquisar no Processo'") from exc
-        finally:
-            try:
-                self.driver.switch_to.default_content()
-            except WebDriverException:
-                pass
-
-    def _switch_to_ifr_arvore(self) -> bool:
-        try:
-            self.driver.switch_to.default_content()
-            iframe = self.driver.find_element(By.ID, "ifrArvore")
-            self.driver.switch_to.frame(iframe)
-            return True
-        except WebDriverException:
-            pass
-
-        try:
-            self.driver.switch_to.default_content()
-            iframe = self.driver.find_element(By.NAME, "ifrArvore")
-            self.driver.switch_to.frame(iframe)
-            return True
-        except WebDriverException:
-            self.logger.debug("Nao foi possivel acessar iframe ifrArvore por id/name.")
-            return False
-
-    def _get_arvore_snapshot(self) -> Dict[str, int]:
-        snapshot = {
-            "docs": -1,
-            "nos": -1,
-            "paragrafos": -1,
-            "pastas_fechadas": -1,
-        }
-        counters = (
-            ("docs", self.XPATH_ARVORE_DOCUMENTOS),
-            ("nos", self.XPATH_ARVORE_NOS),
-            ("paragrafos", self.XPATH_ARVORE_PARAGRAFOS),
-            ("pastas_fechadas", self.XPATH_PASTAS_FECHADAS),
-        )
-        for key, xpath in counters:
-            try:
-                snapshot[key] = len(self.driver.find_elements(By.XPATH, xpath))
-            except WebDriverException:
-                snapshot[key] = -1
-        return snapshot
-
-    def _arvore_expandiu(self, before: Dict[str, int], after: Dict[str, int]) -> bool:
-        growth_keys = ("docs", "nos", "paragrafos")
-        for key in growth_keys:
-            before_value = before.get(key, -1)
-            after_value = after.get(key, -1)
-            if before_value >= 0 and after_value > before_value:
-                return True
-
-        before_closed = before.get("pastas_fechadas", -1)
-        after_closed = after.get("pastas_fechadas", -1)
-        return before_closed >= 0 and after_closed >= 0 and after_closed < before_closed
-
-    def _wait_arvore_stabilize(
-        self,
-        stable_cycles: int = 3,
-        interval_seconds: float = 0.3,
-        timeout_seconds: Optional[float] = None,
-    ) -> Dict[str, int]:
-        deadline = time.time() + (timeout_seconds or max(4.0, min(12.0, float(self.timeout_seconds))))
-        last_snapshot: Optional[Dict[str, int]] = None
-        unchanged_cycles = 0
-        final_snapshot = {"docs": -1, "nos": -1, "paragrafos": -1, "pastas_fechadas": -1}
-
-        while time.time() < deadline:
-            if not self._switch_to_ifr_arvore():
-                break
-
-            current_snapshot = self._get_arvore_snapshot()
-            final_snapshot = current_snapshot
-
-            if last_snapshot == current_snapshot:
-                unchanged_cycles += 1
-            else:
-                unchanged_cycles = 0
-                last_snapshot = current_snapshot
-
-            if unchanged_cycles >= stable_cycles:
-                break
-
-            time.sleep(interval_seconds)
-
-        return final_snapshot
-
-    def _expandir_tudo_pastas(self) -> Tuple[bool, str]:
-        if not self._switch_to_ifr_arvore():
-            return False, "ifrArvore nao encontrado"
-
-        before_snapshot = self._get_arvore_snapshot()
-        interno_sel = self.selectors.get("interno", {})
-        x_expandir_todas = interno_sel.get("expandir_todas_pastas") or self.XPATH_EXPANDIR_TODAS_PASTAS
-
-        try:
-            buttons = self.driver.find_elements(By.XPATH, x_expandir_todas)
-        except WebDriverException as exc:
-            self.logger.debug("Expandir tudo: erro ao localizar botao (%s)", exc)
-            buttons = []
-
-        if not buttons:
-            self.logger.info("Expandir tudo: botão não encontrado")
-            return False, "botao nao encontrado"
-
-        self.logger.info("Expandir tudo: botão encontrado")
-        button = buttons[0]
-        started_at = time.perf_counter()
-
-        try:
-            self.driver.execute_script("arguments[0].click();", button)
-        except (StaleElementReferenceException, WebDriverException) as js_exc:
-            try:
-                if not self._switch_to_ifr_arvore():
-                    raise js_exc
-                buttons = self.driver.find_elements(By.XPATH, x_expandir_todas)
-                if not buttons:
-                    raise js_exc
-                buttons[0].click()
-            except (StaleElementReferenceException, WebDriverException) as click_exc:
-                elapsed = time.perf_counter() - started_at
-                self.logger.info(
-                    "Expandir tudo: contagem antes=%s depois=%s tempo=%.2fs",
-                    before_snapshot,
-                    before_snapshot,
-                    elapsed,
-                )
-                return False, f"botao nao clicavel ({click_exc})"
-
-        # Aguarda a arvore estabilizar por repeticao de contagens em ciclos curtos,
-        # evitando sleep fixo longo e adaptando ao tempo real de carregamento.
-        after_snapshot = self._wait_arvore_stabilize(stable_cycles=3, interval_seconds=0.3)
-        elapsed = time.perf_counter() - started_at
-        self.logger.info(
-            "Expandir tudo: contagem antes=%s depois=%s tempo=%.2fs",
-            before_snapshot,
-            after_snapshot,
-            elapsed,
-        )
-
-        if not self._arvore_expandiu(before_snapshot, after_snapshot):
-            return False, "botao clicado sem alteracao na arvore"
-
-        if after_snapshot.get("pastas_fechadas", -1) > 0:
-            return False, "ainda restaram pastas fechadas apos expandir tudo"
-
-        return True, "ok"
-
-    def _expand_all_pastas_manual(self, max_cycles: int = 15) -> None:
-        total_clicked = 0
-        previous_doc_count = -1
-
-        for cycle in range(1, max_cycles + 1):
-            if not self._switch_to_ifr_arvore():
-                self.logger.debug("Expandir pastas: ifrArvore nao encontrado; seguindo sem expansao.")
-                return
-
-            try:
-                doc_count = len(self.driver.find_elements(By.XPATH, self.XPATH_ARVORE_DOCUMENTOS))
-            except WebDriverException:
-                doc_count = -1
-
-            try:
-                closed = self.driver.find_elements(By.XPATH, self.XPATH_PASTAS_FECHADAS)
-            except WebDriverException as exc:
-                self.logger.debug("Expandir pastas: falha ao buscar pastas fechadas (%s)", exc)
-                break
-
-            if not closed:
-                self.logger.info(
-                    "Expandir pastas: nenhuma pasta fechada encontrada (ciclo=%d, total_cliques=%d).",
-                    cycle,
-                    total_clicked,
-                )
-                break
-
-            self.logger.info("Expandir pastas: pastas fechadas encontradas no ciclo %d: %d", cycle, len(closed))
-            clicked_this_cycle = 0
-
-            for idx in range(len(closed)):
-                if not self._switch_to_ifr_arvore():
-                    break
-
-                try:
-                    current_closed = self.driver.find_elements(By.XPATH, self.XPATH_PASTAS_FECHADAS)
-                    if idx >= len(current_closed):
-                        continue
-
-                    icon = current_closed[idx]
-                    pasta_id = icon.get_attribute("id") or f"idx_{idx}"
-                    self.logger.info("Abrindo pasta %s", pasta_id)
-                    self.driver.execute_script("arguments[0].click();", icon)
-                    clicked_this_cycle += 1
-                    total_clicked += 1
-                    time.sleep(0.2)
-                except (StaleElementReferenceException, WebDriverException) as exc:
-                    self.logger.debug("Expandir pastas: falha ao clicar pasta idx=%d (%s)", idx, exc)
-                    continue
-
-            if clicked_this_cycle == 0:
-                self.logger.info("Expandir pastas: nenhum clique efetivo no ciclo %d; encerrando.", cycle)
-                break
-
-            time.sleep(0.3)
-
-            if not self._switch_to_ifr_arvore():
-                break
-            try:
-                current_doc_count = len(self.driver.find_elements(By.XPATH, self.XPATH_ARVORE_DOCUMENTOS))
-            except WebDriverException:
-                current_doc_count = -1
-
-            if current_doc_count == previous_doc_count == doc_count:
-                self.logger.info(
-                    "Expandir pastas: sem alteracao na arvore (doc_count=%d) no ciclo %d; encerrando.",
-                    current_doc_count,
-                    cycle,
-                )
-                break
-
-            previous_doc_count = current_doc_count
-
-    def _expand_all_pastas(self, max_cycles: int = 15) -> None:
-        try:
-            expanded_all, reason = self._expandir_tudo_pastas()
-        except Exception as exc:
-            self.logger.exception("Expandir tudo: falha inesperada (%s)", exc)
-            expanded_all = False
-            reason = f"erro inesperado ({exc})"
-
-        if expanded_all:
-            return
-
-        self.logger.info("Fallback acionado: motivo=%s", reason)
-        self._expand_all_pastas_manual(max_cycles=max_cycles)
-
+    # Navegacao de abas / retorno
     def _close_current_tab_and_back(self) -> None:
-        try:
-            if len(self.driver.window_handles) > 1:
-                self.driver.close()
-                remaining = list(self.driver.window_handles)
-                self.driver.switch_to.window(remaining[-1])
-        except Exception as exc:
-            self.logger.exception("Falha ao fechar aba/voltar: %s", exc)
+        process_navigation.close_current_tab_and_back(self.driver, self.logger)
 
     def _back_to_interno_list(self) -> None:
         try:

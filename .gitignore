@@ -6,4 +6,5 @@ __pycache__/ *
 backend/.venv/
 .venv/
 backend/output/
-backend.zip  
+backend.zip 
+vba_codigo.txt
