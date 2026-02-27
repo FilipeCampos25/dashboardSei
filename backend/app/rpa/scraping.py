@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import re
-import sys
 import time
 import unicodedata
 from dataclasses import dataclass
@@ -206,15 +205,7 @@ class SEIScraper:
     # Login / tela inicial
     def _wait_for_manual_login(self) -> None:
         cfg = self.settings
-        self.logger.info("Aguardando login manual no SEI.")
-
-        if sys.stdin and sys.stdin.isatty():
-            try:
-                input("Quando terminar o login manual, pressione ENTER para continuar...")
-            except EOFError:
-                self.logger.warning("STDIN sem entrada disponivel; aplicando espera controlada.")
-        else:
-            self.logger.warning("Entrada nao interativa detectada; aplicando espera controlada.")
+        self.logger.info("Aguardando conclusao do login/autenticacao no SEI (modo automatico).")
 
         wait_seconds = max(5, cfg.manual_login_wait_seconds)
         self._wait_for_post_login_ready(wait_seconds)
@@ -223,16 +214,35 @@ class SEIScraper:
         sel = self.selectors.get("tela_inicio", {})
         x_bloco = sel.get("bloco")
 
-        if not x_bloco:
-            self.logger.warning("Seletor tela_inicio.bloco ausente; seguindo sem validacao de login.")
-            return
-
         self.logger.info("Validando se a tela principal do SEI ficou pronta.")
         deadline = time.time() + wait_seconds
+        login_url_markers = ("/sip/login.php", "sigla_sistema=sei")
+        post_login_url_markers = (
+            "/sei/controlador.php",
+            "acao=procedimento_controlar",
+            "acao_origem=principal",
+        )
 
         while time.time() < deadline:
-            if self.driver.find_elements(By.XPATH, x_bloco):
-                self.logger.info("Login manual confirmado: menu principal encontrado.")
+            current_url = (self.driver.current_url or "").lower()
+
+            # Sinal 1: URL de destino conhecida apos login.
+            if all(marker in current_url for marker in post_login_url_markers):
+                self.logger.info("Login confirmado por mudanca de URL: %s", self.driver.current_url)
+                return
+
+            # Sinal 2: URL nao parece mais ser a tela de login.
+            if current_url and not all(marker in current_url for marker in login_url_markers):
+                if x_bloco and self.driver.find_elements(By.XPATH, x_bloco):
+                    self.logger.info("Login confirmado: menu principal encontrado apos mudanca de URL.")
+                    return
+                if "/sei/" in current_url:
+                    self.logger.info("Login confirmado por URL no contexto /sei/: %s", self.driver.current_url)
+                    return
+
+            # Sinal 3: fallback por elemento do menu principal.
+            if x_bloco and self.driver.find_elements(By.XPATH, x_bloco):
+                self.logger.info("Login confirmado: menu principal encontrado.")
                 return
 
             if self._is_gateway_timeout_page():
@@ -244,8 +254,8 @@ class SEIScraper:
             time.sleep(1)
 
         raise RuntimeError(
-            "Login manual nao confirmado dentro do tempo limite. "
-            "Confirme se o login terminou no navegador antes de pressionar ENTER."
+            "Login/autenticacao nao confirmado dentro do tempo limite. "
+            "Confirme se o processo foi concluido no navegador."
         )
 
     def _is_gateway_timeout_page(self) -> bool:

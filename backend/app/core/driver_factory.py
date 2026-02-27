@@ -39,6 +39,8 @@ def create_chrome_driver(*, headless: bool = False) -> webdriver.Chrome:
     # Headless "novo" (Chrome moderno). Mantém compatibilidade com headless antigo.
     if headless:
         options.add_argument("--headless=new")
+    else:
+        options.add_argument("--start-maximized")
 
     # Flags úteis para estabilidade
     options.add_argument("--disable-gpu")
@@ -49,7 +51,19 @@ def create_chrome_driver(*, headless: bool = False) -> webdriver.Chrome:
     chromedriver_path = os.getenv("CHROMEDRIVER_PATH")
     if chromedriver_path:
         service = Service(executable_path=chromedriver_path)
-        return webdriver.Chrome(service=service, options=options)
+        driver = webdriver.Chrome(service=service, options=options)
+        if not headless:
+            try:
+                driver.maximize_window()
+            except Exception:
+                pass
+        return driver
 
     # Caso contrário, Selenium Manager tenta resolver automaticamente.
-    return webdriver.Chrome(options=options)
+    driver = webdriver.Chrome(options=options)
+    if not headless:
+        try:
+            driver.maximize_window()
+        except Exception:
+            pass
+    return driver
