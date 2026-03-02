@@ -77,7 +77,12 @@ def wait_page_ready_in_processo(driver: Any, logger: Any, timeout: int | float |
     WebDriverWait(driver, timeout_seconds).until(_toolbar_or_frame_ready)
 
 
-def click_abrir_todas_as_pastas(driver: Any, selectors: Any, logger: Any) -> None:
+def click_abrir_todas_as_pastas(
+    driver: Any,
+    selectors: Any,
+    logger: Any,
+    raise_on_fail: bool = True,
+) -> bool:
     """
     O SEI varia onde renderiza o botão/ícone "Abrir todas as Pastas" (às vezes no TOP, às vezes em iframe).
     Além disso, o id costuma ser dinâmico (iconAP<ID_PROCEDIMENTO>), então não dá pra depender de um id fixo.
@@ -132,7 +137,7 @@ def click_abrir_todas_as_pastas(driver: Any, selectors: Any, logger: Any) -> Non
     _safe_default()
     try:
         if _attempt_click_in_current_context("TOP", timeout_seconds=2.5):
-            return
+            return True
         tried_contexts.append("TOP")
     except TimeoutException as e:
         last_timeout = e
@@ -144,7 +149,7 @@ def click_abrir_todas_as_pastas(driver: Any, selectors: Any, logger: Any) -> Non
         if _safe_switch_frame_by_id_or_name("ifrArvore"):
             if _attempt_click_in_current_context("ifrArvore", timeout_seconds=3.5):
                 _safe_default()
-                return
+                return True
             tried_contexts.append("ifrArvore")
         else:
             tried_contexts.append("ifrArvore(não encontrado)")
@@ -160,7 +165,7 @@ def click_abrir_todas_as_pastas(driver: Any, selectors: Any, logger: Any) -> Non
         if _safe_switch_frame_by_id_or_name("ifrConteudoVisualizacao"):
             if _attempt_click_in_current_context("ifrConteudoVisualizacao", timeout_seconds=3.5):
                 _safe_default()
-                return
+                return True
             tried_contexts.append("ifrConteudoVisualizacao")
         else:
             tried_contexts.append("ifrConteudoVisualizacao(não encontrado)")
@@ -187,7 +192,7 @@ def click_abrir_todas_as_pastas(driver: Any, selectors: Any, logger: Any) -> Non
 
                     if _attempt_click_in_current_context(f"ifrConteudoVisualizacao->inner[{idx}]", timeout_seconds=2.5):
                         _safe_default()
-                        return
+                        return True
                     tried_contexts.append(f"ifrConteudoVisualizacao->inner[{idx}]")
                 except (StaleElementReferenceException, WebDriverException):
                     tried_contexts.append(f"ifrConteudoVisualizacao->inner[{idx}](stale/erro)")
@@ -201,7 +206,13 @@ def click_abrir_todas_as_pastas(driver: Any, selectors: Any, logger: Any) -> Non
         f"Timeout ao localizar 'processo.abrir_todas_as_pastas' em nenhum contexto. "
         f"Contextos tentados={tried_contexts}. XPaths={xpaths}"
     )
-    raise TimeoutException(msg) from last_timeout
+    if raise_on_fail:
+        raise TimeoutException(msg) from last_timeout
+
+    logger.info(
+        "Abrir todas as Pastas: botão não encontrado neste processo (seguindo sem expandir)."
+    )
+    return False
 
 
 def click_pesquisar_no_processo(driver: Any, selectors: Any, logger: Any) -> None:

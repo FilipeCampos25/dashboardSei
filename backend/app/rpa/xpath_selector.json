@@ -26,8 +26,8 @@
     "iframe_arvore": "//iframe[@id='ifrArvore' or @name='ifrArvore']",
     "iframe_visualizacao": "//iframe[@id='ifrVisualizacao' or @name='ifrVisualizacao']",
     "abrir_todas_as_pastas": [
-      "//img[@id='iconAP2465802' and contains(@title,'Abrir todas as Pastas')]",
-      "//img[contains(@title,'Abrir todas as Pastas')]"
+      "//img[starts-with(@id,'iconAP') and (contains(@title,'Abrir') or contains(@alt,'Abrir'))]",
+      "//img[contains(@title,'Abrir todas as Pastas') or contains(@alt,'Abrir todas as Pastas')]"
     ],
     "pesquisar_no_processo": [
       "//a[contains(@href,'acao=procedimento_pesquisar') and @target='ifrVisualizacao']",

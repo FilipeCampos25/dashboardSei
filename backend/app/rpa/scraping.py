@@ -343,6 +343,7 @@ class SEIScraper:
             self.driver,
             self.selectors,
             self.logger,
+            raise_on_fail=False,
         )
 
     def _click_pesquisar_no_processo(self) -> None:
