@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from selenium.common.exceptions import (
+    NoSuchElementException,
     StaleElementReferenceException,
     TimeoutException,
     WebDriverException,
@@ -23,6 +24,7 @@ from app.core.logging_config import setup_logger
 from app.output import csv_writer
 from app.rpa.sei import process_navigation
 from app.rpa.sei import toolbar_actions
+from app.rpa.sei import document_search
 from app.rpa.selenium_utils import (
     wait_for_clickable as selenium_wait_for_clickable,
     wait_for_document_ready as selenium_wait_for_document_ready,
@@ -149,6 +151,7 @@ class SEIScraper:
                 self.logger.info("Processo %s: clicando Pesquisar no Processo", proc)
                 self._click_pesquisar_no_processo()
                 self.logger.info("Processo %s: filtro aberto (anchor ok)", proc)
+                self._buscar_e_abrir_plano_de_trabalho_mais_recente(proc)
 
                 if stop_at_filter:
                     self.logger.info("Processo %s: fechando aba e voltando", proc)
@@ -359,6 +362,63 @@ class SEIScraper:
             timeout=self.timeout_seconds,
         )
 
+    def _buscar_e_abrir_plano_de_trabalho_mais_recente(self, processo: str) -> None:
+        termo = "PLANO DE TRABALHO"
+        try:
+            hit = self.buscar_documento_mais_recente_no_filtro(
+                termo=termo,
+                timeout_seconds=self.timeout_seconds,
+            )
+            if hit is None:
+                self.logger.info(
+                    "Processo %s: %s nao encontrado; seguindo.",
+                    processo,
+                    termo,
+                )
+                return
+
+            self.abrir_documento_mais_recente_no_filtro(timeout_seconds=self.timeout_seconds)
+            self.logger.info(
+                "Processo %s: documento mais recente de '%s' aberto (%s).",
+                processo,
+                termo,
+                hit.protocolo,
+            )
+        except (TimeoutException, NoSuchElementException) as exc:
+            self.logger.warning(
+                "Processo %s: falha resiliente ao buscar/abrir '%s' (%s); seguindo.",
+                processo,
+                termo,
+                exc,
+            )
+        except WebDriverException as exc:
+            self.logger.warning(
+                "Processo %s: erro WebDriver ao buscar/abrir '%s' (%s); seguindo.",
+                processo,
+                termo,
+                exc,
+            )
+
+    def buscar_documento_mais_recente_no_filtro(
+        self, termo: str, timeout_seconds: int = 20
+    ) -> Optional[document_search.SearchHit]:
+        """Na tela 'Pesquisar no Processo', busca e seleciona o documento mais recente (topo)."""
+        return document_search.buscar_documento_mais_recente(
+            driver=self.driver,
+            selectors=self.selectors,
+            logger=self.logger,
+            termo=termo,
+            timeout_seconds=timeout_seconds,
+        )
+
+    def abrir_documento_mais_recente_no_filtro(self, timeout_seconds: int = 20) -> None:
+        """Na tela de resultados, abre o documento mais recente (primeiro resultado)."""
+        document_search.abrir_documento_mais_recente(
+            driver=self.driver,
+            selectors=self.selectors,
+            logger=self.logger,
+            timeout_seconds=timeout_seconds,
+        )
     # Internos (menu, selecao guiada, paginacao)
     def _open_interno_menu(self) -> None:
         sel = self.selectors.get("tela_inicio", {})

@@ -43,6 +43,13 @@
     "parceiro": "//table[@id='tblProtocolosBlocos']//tr[contains(@class,'infraTr')]//td[last()][contains(.,'PARCEIRO')]",
     "vingencia": "//table[@id='tblProtocolosBlocos']//tr[contains(@class,'infraTr')]//td[last()]//text()[contains(.,'VIGÊNCIA')]",
     "objeto": "//table[@id='tblProtocolosBlocos']//tr[contains(@class,'infraTr')]//td[last()]//text()[contains(.,'OBJETO')]"
+  },
+  "pesquisar_processos": {
+    "caixa_de_texto": "//input[@id='txtPesquisa']",
+    "botao_pesquisar": "//input[@type='submit' and (contains(@value,'Pesquisar') or contains(@value,'PESQUISAR'))]",
+    "botao_pesquisar_fallback": "//button[normalize-space(.)='Pesquisar' or contains(normalize-space(.),'Pesquisar')]",
+    "linha_de_resultado": "//table[contains(@class,'pesquisaResultado')]//tr[contains(@class,'pesquisaTituloRegistro')]",
+    "linha_link": ".//a[contains(@class,'protocoloNormal') or contains(@class,'processoVisitado')]"
   }
 }
 
