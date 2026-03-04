@@ -48,6 +48,14 @@
     "caixa_de_texto": "//input[@id='txtPesquisa']",
     "botao_pesquisar": "//input[@type='submit' and (contains(@value,'Pesquisar') or contains(@value,'PESQUISAR'))]",
     "botao_pesquisar_fallback": "//button[normalize-space(.)='Pesquisar' or contains(normalize-space(.),'Pesquisar')]",
+    "dropdown_tipos": "//button[contains(@class,'ms-choice')]",
+    "dropdown_lista_visivel": "//div[contains(@class,'ms-drop') and contains(@class,'bottom') and not(contains(@style,'display: none'))]",
+    "item_tipo_checkbox_template": "//div[contains(@class,'ms-drop') and contains(@class,'bottom') and not(contains(@style,'display: none'))]//li[.//span[normalize-space(.)='{TIPO_EXATO}']]//input[@type='checkbox']",
+    "item_tipo_label_template": "//div[contains(@class,'ms-drop') and contains(@class,'bottom') and not(contains(@style,'display: none'))]//li[.//span[normalize-space(.)='{TIPO_EXATO}']]//label",
+    "botao_pesquisar_submit": "//input[@type='submit' and @id='sbmPesquisar']",
+    "botao_pesquisar_submit_fallback": "//input[@type='submit' and (contains(@value,'Pesquisar') or contains(@value,'PESQUISAR'))]",
+    "primeiro_resultado_mais_recente": "(//table[contains(@class,'pesquisaResultado')]//tr[contains(@class,'pesquisaTituloRegistro')]//a)[1]",
+    "checkboxes_marcados": "//div[contains(@class,'ms-drop') and contains(@class,'bottom') and not(contains(@style,'display: none'))]//input[@type='checkbox' and @checked]",
     "linha_de_resultado": "//table[contains(@class,'pesquisaResultado')]//tr[contains(@class,'pesquisaTituloRegistro')]",
     "linha_link": ".//a[contains(@class,'protocoloNormal') or contains(@class,'processoVisitado')]"
   }

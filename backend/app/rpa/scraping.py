@@ -82,6 +82,7 @@ class SEIScraper:
         self.wait = WebDriverWait(self.driver, cfg.timeout_seconds)
         self.timeout_seconds = cfg.timeout_seconds
         self.selectors = load_xpath_selectors()
+        self.main_window_handle: Optional[str] = None
         self.found: Set[str] = set()
         self.descricoes_busca = self._parse_descricoes_busca(cfg.descricoes_busca)
         self.descricao_match_mode = (cfg.descricoes_match_mode or "contains").strip().lower()
@@ -112,6 +113,7 @@ class SEIScraper:
             self._wait_for_manual_login()
         else:
             self._login_if_possible()
+        self._remember_main_window_handle(context="pos_login")
 
         self._close_popup_if_exists()
         self._open_interno_menu()
@@ -142,6 +144,7 @@ class SEIScraper:
                 processos = processos[:max_processos_por_interno]
 
             for proc in processos:
+                self._switch_to_main_window_context()
                 self.logger.info("Abrindo processo %s", proc)
                 self._open_processo(proc)
                 self.logger.info("Processo %s: aguardando pagina pronta", proc)
@@ -363,7 +366,7 @@ class SEIScraper:
         )
 
     def _buscar_e_abrir_plano_de_trabalho_mais_recente(self, processo: str) -> None:
-        termo = "PLANO DE TRABALHO"
+        termo = "PLANO DE TRABALHO - PT"
         try:
             hit = self.buscar_documento_mais_recente_no_filtro(
                 termo=termo,
@@ -376,6 +379,12 @@ class SEIScraper:
                     termo,
                 )
                 return
+            self.logger.info(
+                "Processo %s: documento encontrado para '%s' (%s).",
+                processo,
+                termo,
+                hit.protocolo,
+            )
 
             self.abrir_documento_mais_recente_no_filtro(timeout_seconds=self.timeout_seconds)
             self.logger.info(
@@ -1202,12 +1211,56 @@ class SEIScraper:
         return out
 
     def _open_processo(self, processo_text: str) -> None:
+        self._switch_to_main_window_context()
         setattr(self.driver, "_sei_timeout_seconds", self.timeout_seconds)
         process_navigation.open_processo(self.driver, processo_text, self.selectors, self.logger)
 
     # Navegacao de abas / retorno
     def _close_current_tab_and_back(self) -> None:
-        process_navigation.close_current_tab_and_back(self.driver, self.logger)
+        returned_handle = process_navigation.close_current_tab_and_back(
+            self.driver,
+            self.logger,
+            preferred_handle=self.main_window_handle,
+        )
+        if returned_handle:
+            self.main_window_handle = returned_handle
+
+    def _remember_main_window_handle(self, context: str) -> None:
+        try:
+            self.main_window_handle = self.driver.current_window_handle
+            self.logger.info(
+                "Janela principal registrada (%s): handle=%s total_handles=%d",
+                context,
+                self.main_window_handle,
+                len(self.driver.window_handles),
+            )
+        except WebDriverException as exc:
+            self.logger.warning(
+                "Falha ao registrar janela principal (%s): %s",
+                context,
+                exc,
+            )
+
+    def _switch_to_main_window_context(self) -> None:
+        if not self.main_window_handle:
+            self._remember_main_window_handle(context="auto_descoberta")
+            return
+
+        try:
+            handles = list(self.driver.window_handles)
+            if self.main_window_handle in handles:
+                self.driver.switch_to.window(self.main_window_handle)
+                return
+
+            if handles:
+                self.main_window_handle = handles[0]
+                self.driver.switch_to.window(self.main_window_handle)
+                self.logger.warning(
+                    "Janela principal anterior indisponivel; novo handle principal=%s",
+                    self.main_window_handle,
+                )
+        except WebDriverException as exc:
+            self.logger.warning("Falha ao alternar para janela principal: %s", exc)
 
     def _back_to_interno_list(self) -> None:
         try:

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Optional
 
 from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.support.ui import WebDriverWait
@@ -64,11 +64,51 @@ def open_processo(driver: Any, processo_text: str, selectors: Any, logger: Any) 
     raise RuntimeError(f"Nao consegui abrir o processo: {processo_text}")
 
 
-def close_current_tab_and_back(driver: Any, logger: Any) -> None:
+def close_current_tab_and_back(
+    driver: Any,
+    logger: Any,
+    preferred_handle: Optional[str] = None,
+) -> Optional[str]:
     try:
-        if len(driver.window_handles) > 1:
+        before_handles = list(driver.window_handles)
+        current_handle = driver.current_window_handle
+        logger.info(
+            "Fechar aba: handles antes=%d atual=%s preferido=%s",
+            len(before_handles),
+            current_handle,
+            preferred_handle,
+        )
+
+        if len(before_handles) > 1:
             driver.close()
             remaining = list(driver.window_handles)
-            driver.switch_to.window(remaining[-1])
+            target_handle: Optional[str] = None
+
+            if preferred_handle and preferred_handle in remaining:
+                target_handle = preferred_handle
+            elif remaining:
+                target_handle = remaining[0]
+
+            if target_handle:
+                driver.switch_to.window(target_handle)
+                logger.info(
+                    "Fechar aba: retornou para handle=%s (restantes=%d)",
+                    target_handle,
+                    len(remaining),
+                )
+                return target_handle
+
+            return None
+
+        if preferred_handle and current_handle != preferred_handle and preferred_handle in before_handles:
+            driver.switch_to.window(preferred_handle)
+            logger.info(
+                "Fechar aba: contexto corrigido para handle preferido=%s.",
+                preferred_handle,
+            )
+            return preferred_handle
+
+        return current_handle
     except Exception as exc:
         logger.exception("Falha ao fechar aba/voltar: %s", exc)
+        return None
