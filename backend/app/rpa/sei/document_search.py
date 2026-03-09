@@ -434,6 +434,17 @@ def _get_primeiro_resultado(
     return _get_first_by_xpath(driver, primeiro_xpath, timeout_seconds=timeout_seconds)
 
 
+def _contar_resultados(driver: Any, selectors: XPathSelectors) -> int:
+    linhas_xpath = (
+        selectors.get("pesquisar_processos.linha_de_resultado")
+        or "//table[contains(@class,'pesquisaResultado')]//tr[contains(@class,'pesquisaTituloRegistro')]"
+    )
+    try:
+        return len(driver.find_elements(By.XPATH, linhas_xpath))
+    except WebDriverException:
+        return 0
+
+
 def buscar_por_tipo_e_abrir_mais_recente(
     driver: Any,
     selectors: XPathSelectors,
@@ -522,7 +533,13 @@ def buscar_documento_mais_recente(
         except WebDriverException:
             protocolo = ""
 
-    logger.info("Busca por tipo '%s': selecionado mais recente (topo): %s", termo, protocolo)
+    total_resultados = _contar_resultados(driver, selectors)
+    logger.info(
+        "Busca por tipo '%s': total_resultados=%d selecionado_mais_recente=%s",
+        termo,
+        total_resultados,
+        protocolo,
+    )
     return SearchHit(protocolo=protocolo)
 
 
@@ -545,6 +562,8 @@ def abrir_documento_mais_recente(
     if first_link is None:
         raise TimeoutException("Nenhum resultado disponivel para abrir")
 
+    link_preview = _norm(first_link.text)
+    logger.info("Abrir documento mais recente: link_identificado='%s'", link_preview)
     _click_element(driver, first_link)
     logger.info("Documento mais recente aberto (click no primeiro resultado).")
 

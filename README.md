@@ -28,6 +28,16 @@ Exemplo:
 python backend/main.py --debug --manual-login --max-internos 2 --max-processos 3
 ```
 
+## Outputs do backend
+
+- JSON por processo (`plano_trabalho_<processo>_<timestamp>.json`) em `OUTPUT_DIR` (padrao: `backend/output`).
+- CSV consolidado de campos brutos do PT em `OUTPUT_DIR/pt_fields_raw.csv` (modelo long, append por documento).
+
+Para desabilitar a exportacao do CSV raw:
+```bash
+EXPORT_RAW_FIELDS_CSV=0
+```
+
 ## Execucao dashboard
 
 ```bash

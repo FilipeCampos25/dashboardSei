@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 import re
 import time
 import unicodedata
@@ -21,11 +22,14 @@ from selenium.webdriver.support.ui import WebDriverWait
 from app.config import get_settings
 from app.core.driver_factory import create_chrome_driver
 from app.core.logging_config import setup_logger
+from app.core.raw_date_field_collector import collect_raw_fields, export_raw_fields_csv
 from app.output import csv_writer
 from app.rpa.sei import process_navigation
 from app.rpa.sei import toolbar_actions
 from app.rpa.sei import document_search
+from app.rpa.sei import document_text_extractor
 from app.rpa.selenium_utils import (
+    get_iframes_info,
     wait_for_clickable as selenium_wait_for_clickable,
     wait_for_document_ready as selenium_wait_for_document_ready,
     wait_for_elements as selenium_wait_for_elements,
@@ -222,6 +226,8 @@ class SEIScraper:
 
         self.logger.info("Validando se a tela principal do SEI ficou pronta.")
         deadline = time.time() + wait_seconds
+        gateway_timeout_retry_limit = 2
+        gateway_timeout_hits = 0
         login_url_markers = ("/sip/login.php", "sigla_sistema=sei")
         post_login_url_markers = (
             "/sei/controlador.php",
@@ -252,8 +258,23 @@ class SEIScraper:
                 return
 
             if self._is_gateway_timeout_page():
+                gateway_timeout_hits += 1
+                if gateway_timeout_hits <= gateway_timeout_retry_limit:
+                    self.logger.warning(
+                        "Tela 504 detectada apos login (%d/%d). "
+                        "Tentando recarregar a pagina.",
+                        gateway_timeout_hits,
+                        gateway_timeout_retry_limit,
+                    )
+                    try:
+                        self.driver.refresh()
+                    except WebDriverException as exc:
+                        self.logger.warning("Falha ao recarregar pagina apos 504: %s", exc)
+                    time.sleep(3)
+                    continue
+
                 raise RuntimeError(
-                    "Tela de erro 504 detectada apos login. "
+                    "Tela de erro 504 detectada apos login em tentativas consecutivas. "
                     "Interrompendo execucao para evitar loop."
                 )
 
@@ -268,15 +289,31 @@ class SEIScraper:
         try:
             title = (self.driver.title or "").lower()
             url = (self.driver.current_url or "").lower()
-            html = (self.driver.page_source or "")[:4000].lower()
+            html = (self.driver.page_source or "")[:12000].lower()
         except WebDriverException:
             return False
 
         combined = f"{title} {url} {html}"
-        return any(
-            marker in combined
-            for marker in ("gateway timeout", "erro 504", "http error 504")
+        normalized = re.sub(r"[\s\-_]+", " ", combined)
+        markers = (
+            "gateway timeout",
+            "gateway time out",
+            "504 gateway timeout",
+            "504 gateway time out",
+            "erro 504",
+            "error 504",
+            "http error 504",
+            "http 504",
+            "the server didn't respond in time",
+            "server didn't respond in time",
         )
+        if any(marker in normalized for marker in markers):
+            return True
+
+        if "504" in normalized and ("gateway" in normalized or "time out" in normalized or "timeout" in normalized):
+            return True
+
+        return False
 
 
     def _login_if_possible(self) -> None:
@@ -367,7 +404,19 @@ class SEIScraper:
 
     def _buscar_e_abrir_plano_de_trabalho_mais_recente(self, processo: str) -> None:
         termo = "PLANO DE TRABALHO - PT"
+        handles_before_click: Set[str] = set()
+        processo_handle = ""
+        opened_doc_handles: Set[str] = set()
         try:
+            self.logger.info(
+                "Processo %s: iniciando busca do documento '%s'. contexto_pre_busca url=%s title=%s handles=%d",
+                processo,
+                termo,
+                self.driver.current_url,
+                self.driver.title,
+                len(self.driver.window_handles),
+            )
+            processo_handle = self.driver.current_window_handle
             hit = self.buscar_documento_mais_recente_no_filtro(
                 termo=termo,
                 timeout_seconds=self.timeout_seconds,
@@ -385,13 +434,39 @@ class SEIScraper:
                 termo,
                 hit.protocolo,
             )
-
+            handles_before_click = set(self.driver.window_handles)
             self.abrir_documento_mais_recente_no_filtro(timeout_seconds=self.timeout_seconds)
+            handles_after_click = set(self.driver.window_handles)
+            opened_doc_handles = handles_after_click - handles_before_click
+            self.logger.info(
+                "Processo %s: pos_click_resultado handles_antes=%d handles_depois=%d novos_handles=%s",
+                processo,
+                len(handles_before_click),
+                len(handles_after_click),
+                list(opened_doc_handles),
+            )
+            switched_handle = self._switch_to_newly_opened_window(
+                handles_before=handles_before_click,
+                reason=f"PT {processo}",
+            )
+            if switched_handle:
+                opened_doc_handles.add(switched_handle)
+            self.logger.info(
+                "Processo %s: clique no primeiro resultado efetuado. contexto_pos_click url=%s title=%s handles=%d",
+                processo,
+                self.driver.current_url,
+                self.driver.title,
+                len(self.driver.window_handles),
+            )
             self.logger.info(
                 "Processo %s: documento mais recente de '%s' aberto (%s).",
                 processo,
                 termo,
                 hit.protocolo,
+            )
+            self._extract_and_save_plano_trabalho_snapshot(
+                processo=processo,
+                protocolo_documento=hit.protocolo,
             )
         except (TimeoutException, NoSuchElementException) as exc:
             self.logger.warning(
@@ -400,6 +475,109 @@ class SEIScraper:
                 termo,
                 exc,
             )
+        finally:
+            self._close_opened_doc_tabs(
+                processo=processo,
+                opened_doc_handles=opened_doc_handles,
+                preferred_return_handle=processo_handle,
+            )
+
+    def _switch_to_newly_opened_window(
+        self,
+        handles_before: Set[str],
+        reason: str,
+        timeout_seconds: int = 6,
+    ) -> Optional[str]:
+        if not handles_before:
+            return None
+
+        deadline = time.time() + max(1, timeout_seconds)
+        while time.time() < deadline:
+            try:
+                handles_now = set(self.driver.window_handles)
+            except WebDriverException as exc:
+                self.logger.warning("Switch nova janela (%s): falha ao ler handles (%s).", reason, exc)
+                return None
+
+            new_handles = [h for h in handles_now if h not in handles_before]
+            if not new_handles:
+                time.sleep(0.15)
+                continue
+
+            target = new_handles[-1]
+            try:
+                self.driver.switch_to.window(target)
+                self.logger.info(
+                    "Switch nova janela (%s): sucesso. handle=%s url=%s title=%s",
+                    reason,
+                    target,
+                    self.driver.current_url,
+                    self.driver.title,
+                )
+                return target
+            except WebDriverException as exc:
+                self.logger.warning(
+                    "Switch nova janela (%s): falha no switch para handle=%s (%s).",
+                    reason,
+                    target,
+                    exc,
+                )
+                return None
+
+        self.logger.info(
+            "Switch nova janela (%s): nenhum novo handle detectado apos %ss.",
+            reason,
+            timeout_seconds,
+        )
+        return None
+
+    def _close_opened_doc_tabs(
+        self,
+        processo: str,
+        opened_doc_handles: Set[str],
+        preferred_return_handle: str,
+    ) -> None:
+        if not opened_doc_handles:
+            return
+
+        closed = 0
+        failed: List[str] = []
+        for handle in list(opened_doc_handles):
+            try:
+                handles_now = set(self.driver.window_handles)
+                if handle not in handles_now:
+                    continue
+                self.driver.switch_to.window(handle)
+                self.logger.info("Processo %s: fechando aba PT handle=%s", processo, handle)
+                self.driver.close()
+                closed += 1
+            except WebDriverException as exc:
+                failed.append(handle)
+                self.logger.warning(
+                    "Processo %s: falha ao fechar aba PT handle=%s (%s).",
+                    processo,
+                    handle,
+                    exc,
+                )
+
+        try:
+            remaining = list(self.driver.window_handles)
+            if preferred_return_handle and preferred_return_handle in remaining:
+                self.driver.switch_to.window(preferred_return_handle)
+            elif self.main_window_handle and self.main_window_handle in remaining:
+                self.driver.switch_to.window(self.main_window_handle)
+            elif remaining:
+                self.driver.switch_to.window(remaining[0])
+            self.logger.info(
+                "Processo %s: fechamento de abas PT concluido. fechadas=%d falhas=%d handles_restantes=%d atual=%s",
+                processo,
+                closed,
+                len(failed),
+                len(remaining),
+                self.driver.current_window_handle if remaining else "-",
+            )
+        except WebDriverException as exc:
+            self.logger.warning("Processo %s: falha ao restaurar contexto apos fechar abas PT (%s).", processo, exc)
         except WebDriverException as exc:
             self.logger.warning(
                 "Processo %s: erro WebDriver ao buscar/abrir '%s' (%s); seguindo.",
@@ -412,6 +590,13 @@ class SEIScraper:
         self, termo: str, timeout_seconds: int = 20
     ) -> Optional[document_search.SearchHit]:
         """Na tela 'Pesquisar no Processo', busca e seleciona o documento mais recente (topo)."""
+        self.logger.info(
+            "Busca filtro: termo='%s' timeout=%ss url=%s title=%s",
+            termo,
+            timeout_seconds,
+            self.driver.current_url,
+            self.driver.title,
+        )
         return document_search.buscar_documento_mais_recente(
             driver=self.driver,
             selectors=self.selectors,
@@ -422,6 +607,12 @@ class SEIScraper:
 
     def abrir_documento_mais_recente_no_filtro(self, timeout_seconds: int = 20) -> None:
         """Na tela de resultados, abre o documento mais recente (primeiro resultado)."""
+        self.logger.info(
+            "Abertura filtro: tentando abrir primeiro resultado timeout=%ss url=%s title=%s",
+            timeout_seconds,
+            self.driver.current_url,
+            self.driver.title,
+        )
         document_search.abrir_documento_mais_recente(
             driver=self.driver,
             selectors=self.selectors,
@@ -1142,6 +1333,127 @@ class SEIScraper:
         if not output_dir.is_absolute():
             output_dir = backend_root / output_dir
         return output_dir
+
+    def _sanitize_filename_part(self, value: str, fallback: str = "sem_id") -> str:
+        cleaned = re.sub(r"[^\w.-]+", "_", (value or "").strip())
+        cleaned = cleaned.strip("_")
+        if not cleaned:
+            return fallback
+        return cleaned[:80]
+
+    def _save_document_snapshot_json(
+        self,
+        processo: str,
+        protocolo_documento: str,
+        snapshot: Dict[str, Any],
+        prazos: Dict[str, str],
+    ) -> Optional[Path]:
+        output_dir = self._resolve_preview_output_dir()
+        csv_writer.ensure_output_dir(output_dir)
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        processo_id = self._sanitize_filename_part(processo, fallback="sem_processo")
+        filename = f"plano_trabalho_{processo_id}_{timestamp}.json"
+        filepath = output_dir / filename
+
+        payload: Dict[str, Any] = {
+            "captured_at": datetime.now().isoformat(timespec="seconds"),
+            "processo": processo,
+            "documento": protocolo_documento,
+            "snapshot": snapshot,
+            "prazos": prazos,
+        }
+
+        try:
+            filepath.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            return filepath
+        except Exception as exc:
+            self.logger.warning(
+                "Processo %s: falha ao salvar snapshot do documento (%s).",
+                processo,
+                exc,
+            )
+            return None
+
+    def _extract_and_save_plano_trabalho_snapshot(
+        self,
+        processo: str,
+        protocolo_documento: str,
+    ) -> None:
+        try:
+            iframe_info = get_iframes_info(self.driver)
+            self.logger.info(
+                "Processo %s: iniciando snapshot PT. contexto_pre_snapshot url=%s title=%s iframes=%d",
+                processo,
+                self.driver.current_url,
+                self.driver.title,
+                len(iframe_info),
+            )
+            if iframe_info:
+                self.logger.info("Processo %s: iframes pre_snapshot=%s", processo, iframe_info)
+            snapshot = document_text_extractor.extract_document_snapshot(
+                self.driver,
+                logger=self.logger,
+            )
+            prazos = document_text_extractor.parse_prazos(snapshot.get("text", "") or "", logger=self.logger)
+            tables = snapshot.get("tables", [])
+            text = snapshot.get("text", "") or ""
+
+            inicio_found = bool(prazos.get("inicio_data") or prazos.get("inicio_raw"))
+            termino_found = bool(prazos.get("termino_data") or prazos.get("termino_raw"))
+            self.logger.info(
+                "Processo %s: snapshot extraido (texto_chars=%d, tabelas=%d, inicio=%s, termino=%s).",
+                processo,
+                len(text),
+                len(tables) if isinstance(tables, list) else 0,
+                "sim" if inicio_found else "nao",
+                "sim" if termino_found else "nao",
+            )
+
+            if self.settings.export_raw_fields_csv:
+                try:
+                    output_dir = self._resolve_preview_output_dir()
+                    csv_writer.ensure_output_dir(output_dir)
+                    raw_fields = collect_raw_fields(text, tables if isinstance(tables, list) else [])
+                    raw_csv_path = output_dir / "pt_fields_raw.csv"
+                    export_raw_fields_csv(
+                        out_csv_path=str(raw_csv_path),
+                        processo_sei=processo,
+                        doc_title=(snapshot.get("title", "") or ""),
+                        doc_url=(snapshot.get("url", "") or ""),
+                        raw_fields=raw_fields,
+                        captured_at=datetime.now().isoformat(timespec="seconds"),
+                    )
+                    self.logger.info(
+                        "Processo %s: CSV raw atualizado em %s (+%d linha(s)).",
+                        processo,
+                        raw_csv_path,
+                        len(raw_fields),
+                    )
+                except Exception as exc:
+                    self.logger.warning(
+                        "Processo %s: falha ao exportar campos raw para CSV (%s).",
+                        processo,
+                        exc,
+                    )
+
+            output_path = self._save_document_snapshot_json(
+                processo=processo,
+                protocolo_documento=protocolo_documento,
+                snapshot=snapshot,
+                prazos=prazos,
+            )
+            if output_path:
+                self.logger.info("Processo %s: JSON do plano de trabalho salvo em %s", processo, output_path)
+        except Exception as exc:
+            self.logger.warning(
+                "Processo %s: falha resiliente na extracao do documento aberto (%s).",
+                processo,
+                exc,
+            )
 
     def _save_preview_records_csv(self, records: List[Dict[str, str]]) -> Optional[Path]:
         if not records:

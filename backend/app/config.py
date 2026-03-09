@@ -86,6 +86,10 @@ class Settings(BaseSettings):
         default="contains",
         validation_alias=AliasChoices("DESCRICOES_MATCH_MODE", "descricoes_match_mode"),
     )
+    export_raw_fields_csv: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("EXPORT_RAW_FIELDS_CSV", "export_raw_fields_csv"),
+    )
 
 
 settings = Settings()
