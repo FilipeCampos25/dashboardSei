@@ -391,6 +391,7 @@ def _parse_possible_date(value: str) -> str:
     raw = (value or "").strip()
     if not raw:
         return ""
+    raw = re.sub(r"\s+", "", raw).replace(".", "/").replace("-", "/")
 
     dmy_match = re.fullmatch(r"(\d{1,2})/(\d{1,2})/(\d{4})", raw)
     if dmy_match:
@@ -411,6 +412,28 @@ def _parse_possible_date(value: str) -> str:
         except ValueError:
             return ""
 
+    return ""
+
+
+def _extract_first_date_token(value: str) -> str:
+    raw = " ".join((value or "").replace("\r", "\n").split()).strip()
+    if not raw:
+        return ""
+
+    candidates = [raw]
+    fixed = _maybe_fix_mojibake(raw)
+    if fixed != raw:
+        candidates.append(fixed)
+
+    patterns = (
+        r"\b\d{1,2}\s*[\/\-.]\s*\d{1,2}\s*[\/\-.]\s*\d{4}\b",
+        r"\b\d{1,2}\s*[\/\-.]\s*\d{4}\b",
+    )
+    for candidate in candidates:
+        for pattern in patterns:
+            match = re.search(pattern, candidate)
+            if match:
+                return " ".join(match.group(0).split())
     return ""
 
 
@@ -451,14 +474,16 @@ def parse_prazos(text: str, logger: Any = None) -> Dict[str, str]:
             return result
 
         if inicio_value:
-            inicio_iso = _parse_possible_date(inicio_value)
+            inicio_token = _extract_first_date_token(inicio_value)
+            inicio_iso = _parse_possible_date(inicio_token or inicio_value)
             if inicio_iso:
                 result["inicio_data"] = inicio_iso
             else:
                 result["inicio_raw"] = inicio_value
 
         if termino_value:
-            termino_iso = _parse_possible_date(termino_value)
+            termino_token = _extract_first_date_token(termino_value)
+            termino_iso = _parse_possible_date(termino_token or termino_value)
             if termino_iso:
                 result["termino_data"] = termino_iso
             else:
