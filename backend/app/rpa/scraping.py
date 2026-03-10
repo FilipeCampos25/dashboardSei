@@ -98,6 +98,7 @@ class SEIScraper:
                 self.descricao_match_mode,
             )
             self.descricao_match_mode = "contains"
+        self._pt_tracking_records: List[Dict[str, Any]] = []
 
     # Fluxo principal
     def run_full_flow(
@@ -126,6 +127,7 @@ class SEIScraper:
             self.logger.warning(
                 "Modo guiado: nenhum interno selecionado pelas descricoes configuradas."
             )
+            self._save_pt_tracking_reports()
             result = sorted(self.found)
             self.logger.info("Itens unicos encontrados: %d", len(result))
             print(result)
@@ -168,6 +170,7 @@ class SEIScraper:
                         "Processo %s: mantendo aba aberta no filtro (--no-stop-at-filter); interrompendo loop.",
                         proc,
                     )
+                    self._save_pt_tracking_reports()
                     result = sorted(self.found)
                     self.logger.info("Itens unicos encontrados: %d", len(result))
                     print(result)
@@ -175,6 +178,7 @@ class SEIScraper:
 
             self._back_to_interno_list()
 
+        self._save_pt_tracking_reports()
         result = sorted(self.found)
         self.logger.info("Itens unicos encontrados: %d", len(result))
         print(result)
@@ -1378,6 +1382,77 @@ class SEIScraper:
             )
             return None
 
+    def _register_pt_tracking_record(
+        self,
+        processo: str,
+        protocolo_documento: str,
+        snapshot: Dict[str, Any],
+        prazos: Dict[str, str],
+        output_path: Optional[Path],
+    ) -> None:
+        inicio_found = bool(prazos.get("inicio_data") or prazos.get("inicio_raw"))
+        termino_found = bool(prazos.get("termino_data") or prazos.get("termino_raw"))
+        sem_prazo = not (inicio_found and termino_found)
+        record: Dict[str, Any] = {
+            "captured_at": datetime.now().isoformat(timespec="seconds"),
+            "processo": processo,
+            "documento": protocolo_documento,
+            "snapshot_mode": (snapshot.get("extraction_mode", "") or ""),
+            "text_chars": len(snapshot.get("text", "") or ""),
+            "tables_count": len(snapshot.get("tables", []) or []),
+            "prazos_status": (prazos.get("status", "") or ""),
+            "inicio_data": (prazos.get("inicio_data", "") or ""),
+            "inicio_raw": (prazos.get("inicio_raw", "") or ""),
+            "termino_data": (prazos.get("termino_data", "") or ""),
+            "termino_raw": (prazos.get("termino_raw", "") or ""),
+            "tem_inicio": inicio_found,
+            "tem_termino": termino_found,
+            "sem_prazo": sem_prazo,
+            "json_path": str(output_path) if output_path else "",
+        }
+        self._pt_tracking_records.append(record)
+
+    def _save_pt_tracking_reports(self) -> None:
+        if not self._pt_tracking_records:
+            return
+
+        output_dir = self._resolve_preview_output_dir()
+        csv_writer.ensure_output_dir(output_dir)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        all_columns = [
+            "captured_at",
+            "processo",
+            "documento",
+            "snapshot_mode",
+            "text_chars",
+            "tables_count",
+            "prazos_status",
+            "inicio_data",
+            "inicio_raw",
+            "termino_data",
+            "termino_raw",
+            "tem_inicio",
+            "tem_termino",
+            "sem_prazo",
+            "json_path",
+        ]
+        all_path = output_dir / f"pt_status_execucao_{timestamp}.csv"
+        csv_writer.write_csv(self._pt_tracking_records, all_path, columns=all_columns)
+        csv_writer.write_csv(self._pt_tracking_records, output_dir / "pt_status_execucao_latest.csv", columns=all_columns)
+
+        sem_records = [r for r in self._pt_tracking_records if bool(r.get("sem_prazo"))]
+        sem_path = output_dir / f"pt_sem_prazo_{timestamp}.csv"
+        csv_writer.write_csv(sem_records, sem_path, columns=all_columns)
+        csv_writer.write_csv(sem_records, output_dir / "pt_sem_prazo_latest.csv", columns=all_columns)
+
+        self.logger.info(
+            "Relatorio PT gerado: total=%d sem_prazo=%d arquivo=%s",
+            len(self._pt_tracking_records),
+            len(sem_records),
+            sem_path,
+        )
+
     def _extract_and_save_plano_trabalho_snapshot(
         self,
         processo: str,
@@ -1445,6 +1520,13 @@ class SEIScraper:
                 protocolo_documento=protocolo_documento,
                 snapshot=snapshot,
                 prazos=prazos,
+            )
+            self._register_pt_tracking_record(
+                processo=processo,
+                protocolo_documento=protocolo_documento,
+                snapshot=snapshot,
+                prazos=prazos,
+                output_path=output_path,
             )
             if output_path:
                 self.logger.info("Processo %s: JSON do plano de trabalho salvo em %s", processo, output_path)

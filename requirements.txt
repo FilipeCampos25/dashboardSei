@@ -7,3 +7,7 @@ streamlit
 plotly
 pydantic-settings
 python-dotenv
+requests
+pypdf
+pdf2image
+pytesseract
