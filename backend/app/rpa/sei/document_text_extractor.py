@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+import calendar
 import io
 import os
 import re
 import tempfile
 import time
+import unicodedata
 import zipfile
-from urllib.parse import urljoin
 from datetime import datetime
 from typing import Any, Dict, List
+from urllib.parse import urljoin
 
 from selenium.common.exceptions import NoSuchFrameException, WebDriverException
 from selenium.webdriver.common.by import By
@@ -810,13 +812,67 @@ def _extract_label_value(text: str, label_regex: str) -> str:
     return ""
 
 
+def _normalize_date_text(value: str) -> str:
+    text = " ".join((value or "").replace("\r", "\n").split()).strip()
+    if not text:
+        return ""
+    text = _maybe_fix_mojibake(text).replace("º", "").replace("°", "")
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    text = text.lower()
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _last_day_of_month(year: int, month: int) -> int:
+    return calendar.monthrange(year, month)[1]
+
+
+def _coerce_year(year_raw: str) -> int:
+    year = int(year_raw)
+    if year < 100:
+        return 2000 + year
+    return year
+
+
+def _month_from_name(month_raw: str) -> int:
+    month_key = _normalize_date_text(month_raw).replace(".", "")
+    months = {
+        "jan": 1,
+        "janeiro": 1,
+        "fev": 2,
+        "fevereiro": 2,
+        "mar": 3,
+        "marco": 3,
+        "abr": 4,
+        "abril": 4,
+        "mai": 5,
+        "maio": 5,
+        "jun": 6,
+        "junho": 6,
+        "jul": 7,
+        "julho": 7,
+        "ago": 8,
+        "agosto": 8,
+        "set": 9,
+        "setembro": 9,
+        "out": 10,
+        "outubro": 10,
+        "nov": 11,
+        "novembro": 11,
+        "dez": 12,
+        "dezembro": 12,
+    }
+    return months.get(month_key, 0)
+
+
 def _parse_possible_date(value: str) -> str:
     raw = (value or "").strip()
     if not raw:
         return ""
-    raw = re.sub(r"\s+", "", raw).replace(".", "/").replace("-", "/")
+    normalized = _normalize_date_text(raw)
+    compact = re.sub(r"\s+", "", normalized).replace(".", "/").replace("-", "/")
 
-    dmy_match = re.fullmatch(r"(\d{1,2})/(\d{1,2})/(\d{4})", raw)
+    dmy_match = re.fullmatch(r"(\d{1,2})/(\d{1,2})/(\d{4})", compact)
     if dmy_match:
         day = int(dmy_match.group(1))
         month = int(dmy_match.group(2))
@@ -826,7 +882,7 @@ def _parse_possible_date(value: str) -> str:
         except ValueError:
             return ""
 
-    my_match = re.fullmatch(r"(\d{1,2})/(\d{4})", raw)
+    my_match = re.fullmatch(r"(\d{1,2})/(\d{4})", compact)
     if my_match:
         month = int(my_match.group(1))
         year = int(my_match.group(2))
@@ -834,6 +890,27 @@ def _parse_possible_date(value: str) -> str:
             return datetime(year, month, 1).date().isoformat()
         except ValueError:
             return ""
+
+    month_year_match = re.fullmatch(r"([a-z]+)\s*[\/ ]\s*(\d{2,4})", normalized)
+    if month_year_match:
+        month = _month_from_name(month_year_match.group(1))
+        year = _coerce_year(month_year_match.group(2))
+        if month:
+            try:
+                return datetime(year, month, 1).date().isoformat()
+            except ValueError:
+                return ""
+
+    textual_match = re.fullmatch(r"(\d{1,2})\s+de\s+([a-z]+)\s+de\s+(\d{4})", normalized)
+    if textual_match:
+        day = int(textual_match.group(1))
+        month = _month_from_name(textual_match.group(2))
+        year = int(textual_match.group(3))
+        if month:
+            try:
+                return datetime(year, month, day).date().isoformat()
+            except ValueError:
+                return ""
 
     return ""
 
@@ -851,12 +928,42 @@ def _extract_first_date_token(value: str) -> str:
     patterns = (
         r"\b\d{1,2}\s*[\/\-.]\s*\d{1,2}\s*[\/\-.]\s*\d{4}\b",
         r"\b\d{1,2}\s*[\/\-.]\s*\d{4}\b",
+        r"\b(?:jan|fev|mar|abr|mai|jun|jul|ago|set|out|nov|dez|janeiro|fevereiro|marco|abril|maio|junho|julho|agosto|setembro|outubro|novembro|dezembro)\s*[\/ ]\s*\d{2,4}\b",
+        r"\b\d{1,2}\s*(?:o|º|°)?\s+de\s+(?:jan|fev|mar|abr|mai|jun|jul|ago|set|out|nov|dez|janeiro|fevereiro|marco|abril|maio|junho|julho|agosto|setembro|outubro|novembro|dezembro)\s+de\s+\d{4}\b",
     )
     for candidate in candidates:
+        normalized_candidate = _normalize_date_text(candidate)
         for pattern in patterns:
-            match = re.search(pattern, candidate)
+            match = re.search(pattern, normalized_candidate)
             if match:
                 return " ".join(match.group(0).split())
+    return ""
+
+
+def _normalize_boundary_date(value: str, is_end: bool) -> str:
+    token = _extract_first_date_token(value) or value
+    normalized = _normalize_date_text(token)
+    if not normalized:
+        return ""
+
+    mm_yyyy_match = re.fullmatch(r"(\d{1,2})/(\d{4})", re.sub(r"\s+", "", normalized))
+    if mm_yyyy_match:
+        month = int(mm_yyyy_match.group(1))
+        year = int(mm_yyyy_match.group(2))
+        day = _last_day_of_month(year, month) if is_end else 1
+        return datetime(year, month, day).date().isoformat()
+
+    month_year_match = re.fullmatch(r"([a-z]+)\s*[\/ ]\s*(\d{2,4})", normalized)
+    if month_year_match:
+        month = _month_from_name(month_year_match.group(1))
+        year = _coerce_year(month_year_match.group(2))
+        if month:
+            day = _last_day_of_month(year, month) if is_end else 1
+            return datetime(year, month, day).date().isoformat()
+
+    parsed = _parse_possible_date(token)
+    if parsed:
+        return parsed
     return ""
 
 
@@ -870,6 +977,55 @@ def _maybe_fix_mojibake(value: str) -> str:
         return text.encode("latin1").decode("utf-8")
     except UnicodeError:
         return text
+
+
+def _slice_period_value(text: str, label: str) -> str:
+    normalized = _normalize_date_text(text)
+    if not normalized:
+        return ""
+
+    start_match = re.search(rf"\b{label}\b[^:]*:\s*", normalized)
+    if not start_match:
+        return ""
+
+    tail = normalized[start_match.end():]
+    stop_match = re.search(
+        r"\b(?:inicio|termino|objeto|diagnostico|abrangencia|justificativa|objetivo|metodologia|unidade responsavel|resultados esperados|plano de acao)\b",
+        tail,
+    )
+    if stop_match:
+        tail = tail[:stop_match.start()]
+
+    return _clean_spaces(tail).strip(" ;,.")
+
+
+def _extract_period_values(text: str) -> Dict[str, str]:
+    normalized = _normalize_date_text(text or "")
+    if not normalized:
+        return {"inicio_raw": "", "termino_raw": ""}
+
+    inicio_raw = _slice_period_value(normalized, "inicio")
+    termino_raw = _slice_period_value(normalized, "termino")
+
+    date_candidates: List[str] = []
+    patterns = (
+        r"\b\d{1,2}\s*[\/\-.]\s*\d{1,2}\s*[\/\-.]\s*\d{4}\b",
+        r"\b\d{1,2}\s*[\/\-.]\s*\d{4}\b",
+        r"\b(?:jan|fev|mar|abr|mai|jun|jul|ago|set|out|nov|dez|janeiro|fevereiro|marco|abril|maio|junho|julho|agosto|setembro|outubro|novembro|dezembro)\s*[\/ ]\s*\d{2,4}\b",
+        r"\b\d{1,2}\s+de\s+(?:jan|fev|mar|abr|mai|jun|jul|ago|set|out|nov|dez|janeiro|fevereiro|marco|abril|maio|junho|julho|agosto|setembro|outubro|novembro|dezembro)\s+de\s+\d{4}\b",
+    )
+    for pattern in patterns:
+        for match in re.finditer(pattern, normalized, flags=re.IGNORECASE):
+            token = _clean_spaces(match.group(0))
+            if token and token not in date_candidates:
+                date_candidates.append(token)
+
+    if not inicio_raw and date_candidates:
+        inicio_raw = date_candidates[0]
+    if not termino_raw and len(date_candidates) >= 2:
+        termino_raw = date_candidates[1]
+
+    return {"inicio_raw": inicio_raw, "termino_raw": termino_raw}
 
 
 def parse_prazos(text: str, logger: Any = None) -> Dict[str, str]:
@@ -897,16 +1053,105 @@ def parse_prazos(text: str, logger: Any = None) -> Dict[str, str]:
             return result
 
         if inicio_value:
-            inicio_token = _extract_first_date_token(inicio_value)
-            inicio_iso = _parse_possible_date(inicio_token or inicio_value)
+            inicio_iso = _normalize_boundary_date(inicio_value, is_end=False)
             if inicio_iso:
                 result["inicio_data"] = inicio_iso
             else:
                 result["inicio_raw"] = inicio_value
 
         if termino_value:
-            termino_token = _extract_first_date_token(termino_value)
-            termino_iso = _parse_possible_date(termino_token or termino_value)
+            termino_iso = _normalize_boundary_date(termino_value, is_end=True)
+            if termino_iso:
+                result["termino_data"] = termino_iso
+            else:
+                result["termino_raw"] = termino_value
+
+        result["status"] = "encontrado" if (inicio_value and termino_value) else "parcial"
+        _log(logger, "info", "Parse prazos: resultado final=%s", result)
+    except Exception:
+        _log(logger, "exception", "Parse prazos: erro inesperado durante parse.")
+        return result
+    return result
+
+
+def _extract_period_values_v2(text: str) -> Dict[str, str]:
+    normalized = _normalize_date_text(text or "")
+    if not normalized:
+        return {"inicio_raw": "", "termino_raw": ""}
+
+    def _compact(value: str) -> str:
+        return " ".join((value or "").split()).strip()
+
+    def _slice(label: str) -> str:
+        match = re.search(rf"\b{label}\b[^:]*:\s*", normalized)
+        if not match:
+            return ""
+        tail = normalized[match.end():]
+        stop = re.search(
+            r"\b(?:inicio|termino|objeto|diagnostico|abrangencia|justificativa|objetivo|metodologia|unidade responsavel|resultados esperados|plano de acao)\b",
+            tail,
+        )
+        if stop:
+            tail = tail[:stop.start()]
+        return _compact(tail).strip(" ;,.")
+
+    inicio_raw = _slice("inicio")
+    termino_raw = _slice("termino")
+
+    if not inicio_raw or not termino_raw:
+        candidates: List[str] = []
+        for pattern in (
+            r"\b\d{1,2}\s*[\/\-.]\s*\d{1,2}\s*[\/\-.]\s*\d{4}\b",
+            r"\b\d{1,2}\s*[\/\-.]\s*\d{4}\b",
+            r"\b(?:jan|fev|mar|abr|mai|jun|jul|ago|set|out|nov|dez|janeiro|fevereiro|marco|abril|maio|junho|julho|agosto|setembro|outubro|novembro|dezembro)\s*[\/ ]\s*\d{2,4}\b",
+            r"\b\d{1,2}\s+de\s+(?:jan|fev|mar|abr|mai|jun|jul|ago|set|out|nov|dez|janeiro|fevereiro|marco|abril|maio|junho|julho|agosto|setembro|outubro|novembro|dezembro)\s+de\s+\d{4}\b",
+        ):
+            for found in re.finditer(pattern, normalized, flags=re.IGNORECASE):
+                token = _compact(found.group(0))
+                if token and token not in candidates:
+                    candidates.append(token)
+        if not inicio_raw and candidates:
+            inicio_raw = candidates[0]
+        if not termino_raw and len(candidates) >= 2:
+            termino_raw = candidates[1]
+
+    return {"inicio_raw": inicio_raw, "termino_raw": termino_raw}
+
+
+def parse_prazos(text: str, logger: Any = None) -> Dict[str, str]:
+    result = {
+        "status": "nao_encontrado",
+        "inicio_data": "",
+        "inicio_raw": "",
+        "termino_data": "",
+        "termino_raw": "",
+    }
+    try:
+        base_text = text or ""
+        _log(logger, "info", "Parse prazos: iniciando com text_chars=%d", len(base_text))
+        extracted = _extract_period_values_v2(base_text)
+        inicio_value = extracted.get("inicio_raw", "")
+        termino_value = extracted.get("termino_raw", "")
+        _log(
+            logger,
+            "info",
+            "Parse prazos: valores brutos extraidos inicio='%s' termino='%s'",
+            _truncate(inicio_value, 120),
+            _truncate(termino_value, 120),
+        )
+        if not inicio_value and not termino_value:
+            _log(logger, "warning", "Parse prazos: nenhum marcador de inicio/termino encontrado.")
+            return result
+
+        if inicio_value:
+            inicio_iso = _normalize_boundary_date(inicio_value, is_end=False)
+            if inicio_iso:
+                result["inicio_data"] = inicio_iso
+            else:
+                result["inicio_raw"] = inicio_value
+
+        if termino_value:
+            termino_iso = _normalize_boundary_date(termino_value, is_end=True)
             if termino_iso:
                 result["termino_data"] = termino_iso
             else:

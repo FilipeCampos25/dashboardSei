@@ -28,6 +28,7 @@ from app.rpa.sei import process_navigation
 from app.rpa.sei import toolbar_actions
 from app.rpa.sei import document_search
 from app.rpa.sei import document_text_extractor
+from app.services.pt_normalizer import export_normalized_csv
 from app.rpa.selenium_utils import (
     get_iframes_info,
     wait_for_clickable as selenium_wait_for_clickable,
@@ -100,6 +101,31 @@ class SEIScraper:
             self.descricao_match_mode = "contains"
         self._pt_tracking_records: List[Dict[str, Any]] = []
 
+    def _prepare_output_dir_for_run(self) -> None:
+        output_dir = self._resolve_preview_output_dir()
+        csv_writer.ensure_output_dir(output_dir)
+
+        cleanup_patterns = [
+            "plano_trabalho_*.json",
+            "pt_fields_raw.csv",
+            "pt_status_execucao_latest.csv",
+            "pt_sem_prazo_latest.csv",
+            "pt_normalizado_latest.csv",
+            "pt_normalizado_completo_latest.csv",
+            "parcerias_vigentes_latest.csv",
+        ]
+        removed = 0
+        for pattern in cleanup_patterns:
+            for path in output_dir.glob(pattern):
+                try:
+                    path.unlink()
+                    removed += 1
+                except FileNotFoundError:
+                    continue
+                except Exception as exc:
+                    self.logger.warning("Falha ao remover artefato antigo %s (%s).", path, exc)
+        self.logger.info("Output preparado para nova rodada em %s; artefatos removidos=%d", output_dir, removed)
+
     # Fluxo principal
     def run_full_flow(
         self,
@@ -110,6 +136,8 @@ class SEIScraper:
     ) -> List[str]:
         if not self.base_url:
             raise RuntimeError("Config ausente: sei_url / URL / SEI_URL")
+
+        self._prepare_output_dir_for_run()
 
         self.logger.info("Abrindo SEI em: %s", self.base_url)
         self.driver.get(self.base_url)
@@ -406,6 +434,92 @@ class SEIScraper:
             timeout=self.timeout_seconds,
         )
 
+    def _find_plano_trabalho_link_in_tree(self) -> Optional[Any]:
+        xpaths = self.selectors.get_many("processo.documentos_do_processo_links")
+        preferred_terms = (
+            "PLANO DE TRABALHO - PT",
+            "PLANO DE TRABALHO PT",
+            "PLANO DE TRABALHO",
+        )
+
+        try:
+            self.driver.switch_to.default_content()
+            iframe = self.driver.find_element(By.XPATH, "//iframe[@id='ifrArvore' or @name='ifrArvore']")
+            self.driver.switch_to.frame(iframe)
+        except WebDriverException as exc:
+            self.logger.info("Fallback arvore PT: nao foi possivel entrar no ifrArvore (%s).", exc)
+            return None
+
+        candidates: List[Tuple[int, Any, str]] = []
+        for xpath in xpaths:
+            try:
+                elems = self.driver.find_elements(By.XPATH, xpath)
+            except WebDriverException:
+                continue
+            for elem in elems:
+                try:
+                    raw_text = (elem.text or "").strip()
+                except WebDriverException:
+                    continue
+                normalized = self._normalize_text(raw_text)
+                if not normalized:
+                    continue
+                score = -1
+                for idx, term in enumerate(preferred_terms):
+                    if term in normalized:
+                        score = len(preferred_terms) - idx
+                        break
+                if score <= 0:
+                    continue
+                candidates.append((score, elem, raw_text))
+            if candidates:
+                break
+
+        if not candidates:
+            self.logger.info("Fallback arvore PT: nenhum documento com 'PLANO DE TRABALHO' encontrado na arvore.")
+            return None
+
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        chosen = candidates[0]
+        self.logger.info(
+            "Fallback arvore PT: candidato selecionado texto='%s' score=%d.",
+            chosen[2],
+            chosen[0],
+        )
+        return chosen[1]
+
+    def _abrir_plano_trabalho_pela_arvore(self, processo: str) -> bool:
+        link = self._find_plano_trabalho_link_in_tree()
+        if link is None:
+            return False
+
+        try:
+            self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", link)
+        except WebDriverException:
+            pass
+
+        try:
+            link.click()
+        except WebDriverException:
+            try:
+                self.driver.execute_script("arguments[0].click();", link)
+            except WebDriverException as exc:
+                self.logger.warning("Processo %s: falha ao clicar no PT pela arvore (%s).", processo, exc)
+                return False
+
+        try:
+            self.driver.switch_to.default_content()
+        except WebDriverException:
+            pass
+
+        time.sleep(1.2)
+        self.logger.info("Processo %s: documento aberto via arvore do processo.", processo)
+        self._extract_and_save_plano_trabalho_snapshot(
+            processo=processo,
+            protocolo_documento=processo,
+        )
+        return True
+
     def _buscar_e_abrir_plano_de_trabalho_mais_recente(self, processo: str) -> None:
         termo = "PLANO DE TRABALHO - PT"
         handles_before_click: Set[str] = set()
@@ -426,11 +540,10 @@ class SEIScraper:
                 timeout_seconds=self.timeout_seconds,
             )
             if hit is None:
-                self.logger.info(
-                    "Processo %s: %s nao encontrado; seguindo.",
-                    processo,
-                    termo,
-                )
+                self.logger.info("Processo %s: %s nao encontrado no filtro; tentando fallback pela arvore.", processo, termo)
+                if self._abrir_plano_trabalho_pela_arvore(processo):
+                    return
+                self.logger.info("Processo %s: nenhum PT localizado nem no filtro nem na arvore; seguindo.", processo)
                 return
             self.logger.info(
                 "Processo %s: documento encontrado para '%s' (%s).",
@@ -1355,9 +1468,8 @@ class SEIScraper:
         output_dir = self._resolve_preview_output_dir()
         csv_writer.ensure_output_dir(output_dir)
 
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         processo_id = self._sanitize_filename_part(processo, fallback="sem_processo")
-        filename = f"plano_trabalho_{processo_id}_{timestamp}.json"
+        filename = f"plano_trabalho_{processo_id}.json"
         filepath = output_dir / filename
 
         payload: Dict[str, Any] = {
@@ -1418,7 +1530,6 @@ class SEIScraper:
 
         output_dir = self._resolve_preview_output_dir()
         csv_writer.ensure_output_dir(output_dir)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
         all_columns = [
             "captured_at",
@@ -1437,14 +1548,12 @@ class SEIScraper:
             "sem_prazo",
             "json_path",
         ]
-        all_path = output_dir / f"pt_status_execucao_{timestamp}.csv"
+        all_path = output_dir / "pt_status_execucao_latest.csv"
         csv_writer.write_csv(self._pt_tracking_records, all_path, columns=all_columns)
-        csv_writer.write_csv(self._pt_tracking_records, output_dir / "pt_status_execucao_latest.csv", columns=all_columns)
 
         sem_records = [r for r in self._pt_tracking_records if bool(r.get("sem_prazo"))]
-        sem_path = output_dir / f"pt_sem_prazo_{timestamp}.csv"
+        sem_path = output_dir / "pt_sem_prazo_latest.csv"
         csv_writer.write_csv(sem_records, sem_path, columns=all_columns)
-        csv_writer.write_csv(sem_records, output_dir / "pt_sem_prazo_latest.csv", columns=all_columns)
 
         self.logger.info(
             "Relatorio PT gerado: total=%d sem_prazo=%d arquivo=%s",
@@ -1452,6 +1561,16 @@ class SEIScraper:
             len(sem_records),
             sem_path,
         )
+        try:
+            export_result = export_normalized_csv(output_dir, logger=self.logger)
+            if export_result.get("latest_path"):
+                self.logger.info(
+                    "Relatorio PT normalizado gerado: registros=%d latest=%s",
+                    int(export_result.get("records", 0) or 0),
+                    export_result["latest_path"],
+                )
+        except Exception as exc:
+            self.logger.warning("Falha ao gerar CSV PT normalizado (%s).", exc)
 
     def _extract_and_save_plano_trabalho_snapshot(
         self,
@@ -1543,8 +1662,7 @@ class SEIScraper:
 
         output_dir = self._resolve_preview_output_dir()
         csv_writer.ensure_output_dir(output_dir)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        csv_path = output_dir / f"parcerias_vigentes_{timestamp}.csv"
+        csv_path = output_dir / "parcerias_vigentes_latest.csv"
         ordered_columns = [
             "interno_descricao",
             "seq",
@@ -1559,7 +1677,7 @@ class SEIScraper:
             sanitized_records.append(
                 {col: self._clean_text_value(str(record.get(col, "") or "")) for col in ordered_columns}
             )
-        csv_writer.write_csv(sanitized_records, csv_path)
+        csv_writer.write_csv(sanitized_records, csv_path, columns=ordered_columns)
         return csv_path
 
     def _collect_preview_if_parcerias_vigencias(self) -> None:

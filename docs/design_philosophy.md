@@ -1,51 +1,80 @@
 # Filosofia de Design
 
-## Objetivo do projeto
-Automatizar a navegacao no SEI para apoiar a coleta de dados de parcerias e documentos correlatos, com uma trilha de evolucao para analise operacional em dashboard.
+## Objetivo
 
-O desenho atual prioriza:
+Automatizar a coleta assistida de dados no SEI com foco em documentos de parceria e Plano de Trabalho, preservando rastreabilidade suficiente para depuracao e evolucao incremental do parser.
 
-- robustez de navegacao (iframes, timeouts, paginação, pop-up);
-- coleta incremental (preview estruturado + varredura de documentos);
-- documentacao clara do que ja esta implementado vs. o que ainda e etapa de integracao.
+## Principios aplicados no codigo atual
 
-## Principios adotados
-- Separacao de responsabilidades: config, driver, logging, seletores, scraping e reporting em modulos separados.
-- Tolerancia a variacoes de UI: o scraper tenta seletores alternativos e varre iframes quando necessario.
-- Coleta guiada por descricao: os internos sao filtrados por `DESCRICOES_BUSCA`, reduzindo escopo e ruido.
-- Incrementalismo pragmatico: primeiro garantir acesso + navegacao + preview de "PARCERIAS VIGENTES", depois expandir estruturacao completa.
-- Observabilidade: logs detalhados em pontos criticos (timeouts, iframes, paginação, documentos encontrados).
+### 1. Navegacao resiliente antes de analise sofisticada
 
-## Decisoes praticas atuais
-- Login manual e o padrao (`MANUAL_LOGIN=true`), com opcao de login automatico via CLI/env.
-- Selenium Manager e usado por padrao para resolver o ChromeDriver; `CHROMEDRIVER_PATH` e fallback.
-- `xpath_selector.json` centraliza os seletores do fluxo SEI.
-- `ReportBuilder` e usado na exportacao do preview de `PARCERIAS VIGENTES` para CSV.
-- O dashboard continua desacoplado do backend em tempo real e consome CSV local.
+O projeto prioriza chegar ao documento correto de forma repetivel:
 
-## Escopo de coletagem destacado (negocio)
-O projeto foi direcionado para a coletagem de:
+- login manual como padrao;
+- centralizacao de seletores em JSON;
+- tolerancia a `iframes`, pop-ups e mudancas de contexto;
+- fallbacks para busca do PT pela arvore do processo.
 
-- parcerias vigentes
-- Memorando de Entendimento
-- TED
-- ACT
-- Plano de Trabalho (metas, acoes e prazos)
+### 2. Persistencia em camadas
 
-Cobertura atual no codigo:
-- Estruturado: preview de `PARCERIAS VIGENTES` com `processo`, `parceiro`, `vigencia`, `objeto` e `numero_act`.
-- Semi-estruturado: nomes de documentos coletados por processo (onde aparecem Memorando/TED/ACT/Plano de Trabalho).
-- Analitico (dashboard): schema preparado para `documento`, `atribuicao`, `meta`, `acao`, `prazo`, `status`, `fonte`.
+A coleta nao depende de um unico formato final. O sistema salva:
+
+- previa operacional de `PARCERIAS VIGENTES`;
+- snapshots JSON do PT;
+- CSV raw para investigacao;
+- relatorios de status da rodada;
+- CSV normalizado para consumo tecnico posterior.
+
+Isso reduz perda de informacao quando a normalizacao ainda nao captura todo o documento.
+
+### 3. Extracao progressiva
+
+A extracao segue uma escada de custo crescente:
+
+1. DOM HTML do `iframe` de visualizacao
+2. espera por renderizacao final
+3. download do anexo
+4. leitura nativa de PDF
+5. OCR
+
+O desenho privilegia a melhor fonte disponivel sem bloquear a rodada inteira por um unico formato de documento.
+
+### 4. Normalizacao heuristica com rastreio
+
+O parser de PT e necessariamente heuristico. Em vez de esconder essa limitacao, o sistema:
+
+- preserva texto bruto;
+- preserva tabelas;
+- guarda caminhos dos JSONs;
+- classifica o nivel de completude do registro normalizado.
+
+### 5. Separacao entre coleta e visualizacao
+
+O dashboard nao depende do backend em tempo real. Isso simplifica a operacao e evita acoplamento prematuro, mas cria uma lacuna de publicacao que ainda precisa ser resolvida.
 
 ## Trade-offs assumidos
-- XPaths absolutos aceleram manutencao inicial, mas aumentam sensibilidade a mudancas do SEI.
-- Login manual como padrao reduz falhas de autenticacao complexa, mas exige intervencao do operador.
-- Preview de `PARCERIAS VIGENTES` gera valor rapido, mas nao substitui ainda o pipeline canonico `output/sei_dashboard.csv`.
-- Parser textual de anotacoes e heuristico; pode exigir ajustes conforme variacao de preenchimento.
 
-## Diretrizes de evolucao
-- Transformar a varredura de documentos em extracao estruturada de Memorando/TED/ACT/Plano de Trabalho.
-- Popular `output/sei_dashboard.csv` na raiz com o schema canonico do dashboard.
-- Padronizar campos de vigencia (`vigencia_inicio` / `vigencia_fim`) a partir do texto de `vigencia`.
-- Adicionar testes para parsing de anotacoes (`parceiro`, `vigencia`, `objeto`, `numero_act`) e normalizacao de textos.
-- Revisar e endurecer seletores para reduzir fragilidade a mudancas de layout do SEI.
+- `xpath_selector.json` acelera manutencao, mas continua sensivel a mudancas de UI do SEI.
+- Login manual reduz problemas de autenticacao complexa, mas exige operador.
+- Limpeza do diretório de saida no inicio da rodada simplifica leitura dos `latest`, mas remove historico local.
+- Normalizacao baseada em texto e tabelas aumenta cobertura, mas pode gerar classificacao parcial quando o documento nao segue padrao.
+- O dashboard consumir um contrato diferente do backend protege a interface analitica, mas introduz um passo de integracao ainda ausente.
+
+## Consequencias praticas
+
+O valor do sistema hoje esta em:
+
+- localizar o PT mais recente por processo;
+- capturar evidencia reutilizavel do documento;
+- gerar uma base normalizada inicial para evolucao do parser.
+
+O valor ainda nao entregue de forma automatica e:
+
+- publicar diretamente um `output/sei_dashboard.csv` pronto para o Streamlit.
+
+## Direcao de evolucao
+
+- Consolidar um publisher do backend para o contrato do dashboard.
+- Adicionar testes unitarios para parsing de periodo, parceiro e objeto.
+- Reduzir duplicidade de heuristicas de datas entre extrator e normalizador.
+- Padronizar melhor campos com texto mojibake quando o SEI retornar conteudo com encoding inconsistente.

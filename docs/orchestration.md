@@ -1,77 +1,115 @@
 # Orquestracao
 
-## Panorama atual
-A orquestracao ainda e operacional/manual, mas o backend ja executa um fluxo assistido completo (nao apenas login).
+## Estado atual
 
-Comandos separados:
-1. Backend (`python backend/main.py`) para navegacao/coleta no SEI.
-2. Dashboard (`streamlit run dashboard_streamlit.py`) para analise.
+A orquestracao ainda e baseada em execucao manual de dois comandos separados:
 
-## Fluxo operacional atual (real)
+1. `python backend/main.py`
+2. `streamlit run dashboard_streamlit.py`
+
+O backend ja executa um fluxo assistido completo dentro do SEI, mas nao publica automaticamente um dataset no contrato do dashboard.
+
+## Fluxo operacional real
+
+### Etapa 1. Backend
+
 1. Operador executa `python backend/main.py`.
-2. Backend carrega `.env`, configura logs e sobe o Chrome WebDriver.
-3. `SEIScraper.run_full_flow(...)`:
-   - login manual/automatico;
-   - fechamento de pop-up;
-   - menu `Bloco > Interno`;
-   - selecao guiada de internos por `DESCRICOES_BUSCA`;
-   - coleta preview de `PARCERIAS VIGENTES` (quando aplicavel);
-   - abertura de processos e coleta de documentos na arvore.
-4. Backend encerra o driver.
-5. Operador executa `streamlit run dashboard_streamlit.py`.
-6. Dashboard tenta ler `output/sei_dashboard.csv`; se nao existir, usa dataset de exemplo.
+2. O backend carrega `.env`, configura logs e sobe o Chrome WebDriver.
+3. O scraper limpa os artefatos anteriores em `backend/output/`.
+4. O scraper abre o SEI e conclui login manual ou automatico.
+5. O scraper navega para `Bloco > Interno`.
+6. O scraper filtra os internos por `DESCRICOES_BUSCA`.
+7. Para cada interno selecionado:
+   - entra no interno;
+   - gera a previa de `PARCERIAS VIGENTES`, quando aplicavel;
+   - lista os processos;
+   - abre cada processo;
+   - abre `Pesquisar no Processo`;
+   - busca `PLANO DE TRABALHO - PT`;
+   - abre o resultado mais recente;
+   - extrai o snapshot do documento;
+   - salva JSON e CSVs auxiliares.
+8. Ao final da rodada, o backend gera os CSVs normalizados de PT.
+9. O backend fecha o navegador.
 
-## Destaque de coletagem no fluxo
-O fluxo de orquestracao foi desenhado para suportar coletagem de:
+### Etapa 2. Dashboard
 
-- parcerias vigentes
-- Memorando de Entendimento
-- TED
-- ACT
-- Plano de Trabalho (metas, acoes e prazos)
+1. Operador executa `streamlit run dashboard_streamlit.py`.
+2. O dashboard tenta ler `output/sei_dashboard.csv`.
+3. Se nao encontrar esse arquivo, usa um dataset de exemplo.
 
-Estado atual por etapa:
-- Backend (preview estruturado): `PARCERIAS VIGENTES` com `processo`, `parceiro`, `vigencia`, `objeto`, `numero_act` (ACT).
-- Backend (varredura de documentos): captura nomes dos documentos dos processos, incluindo documentos como Memorando/TED/ACT/Plano de Trabalho.
-- Dashboard (consumo): schema pronto para armazenar `documento`, `atribuicao`, `meta`, `acao`, `prazo`, `status`, `fonte`.
+## Comportamento de depuracao
 
-## Contratos entre etapas (atual vs alvo)
-### Contrato atual efetivamente produzido
-- Arquivo preview: `backend/output/parcerias_vigentes_*.csv`
-- Colunas: `interno_descricao`, `seq`, `processo`, `parceiro`, `vigencia`, `numero_act`, `objeto`
+O backend possui um desvio util para investigacao manual:
 
-### Contrato alvo para o dashboard
-- Arquivo: `output/sei_dashboard.csv` (raiz)
-- Colunas canonicas:
-  - `processo`
-  - `documento`
-  - `parceiro`
-  - `vigencia_inicio`
-  - `vigencia_fim`
-  - `objeto`
-  - `atribuicao`
-  - `meta`
-  - `acao`
-  - `prazo`
-  - `status`
-  - `fonte`
-  - `collected_at`
+- `--no-stop-at-filter`
 
-## Dependencias operacionais
-- `.env` valido (especialmente `SEI_URL`, login e `DESCRICOES_BUSCA`)
-- `xpath_selector.json` atualizado conforme a UI do SEI
-- Google Chrome instalado
-- Permissao de escrita em `backend/output/` (preview) e/ou `output/` (pipeline dashboard)
+Com essa flag, depois de abrir o filtro do processo e localizar o contexto de pesquisa, o scraper mantem a aba aberta e interrompe o loop, em vez de fechar e seguir para o proximo processo.
 
-## Proposta minima de orquestracao (proximo passo)
-1. Criar etapa de transformacao do preview `parcerias_vigentes_*.csv` para o schema canonico do dashboard.
-2. Persistir em `output/sei_dashboard.csv` na raiz.
-3. Padronizar `documento`/`fonte` para distinguir Memorando de Entendimento, TED, ACT e Plano de Trabalho.
-4. Extrair `vigencia_inicio` e `vigencia_fim` a partir de `vigencia`.
-5. Evoluir parser dos documentos para preencher `atribuicao`, `meta`, `acao` e `prazo`.
+## Contratos entre etapas
 
-## Validacoes recomendadas
-- Falha rapida se `DESCRICOES_BUSCA` estiver vazio.
-- Logar internos selecionados e quantidade de processos percorridos.
-- Logar caminho do CSV preview gerado em `backend/output/`.
-- Validar schema antes de gravar `output/sei_dashboard.csv`.
+### Contrato efetivamente produzido hoje
+
+Diretorio:
+
+- `backend/output/`
+
+Arquivos principais:
+
+- `parcerias_vigentes_latest.csv`
+- `plano_trabalho_<processo>.json`
+- `pt_fields_raw.csv`
+- `pt_status_execucao_latest.csv`
+- `pt_sem_prazo_latest.csv`
+- `pt_normalizado_latest.csv`
+- `pt_normalizado_completo_latest.csv`
+
+### Contrato esperado pelo dashboard
+
+Arquivo:
+
+- `output/sei_dashboard.csv`
+
+Schema canonico:
+
+- `processo`
+- `documento`
+- `parceiro`
+- `vigencia_inicio`
+- `vigencia_fim`
+- `objeto`
+- `atribuicao`
+- `meta`
+- `acao`
+- `prazo`
+- `status`
+- `fonte`
+- `collected_at`
+
+## Gargalo atual
+
+O gargalo de orquestracao nao esta na navegacao do SEI. Ele esta na ausencia de uma etapa que publique um dataset final no contrato do dashboard.
+
+Hoje a sequencia correta e:
+
+- coleta assistida e normalizacao no backend;
+- analise manual dos artefatos em `backend/output/`;
+- opcionalmente, transformacao externa para `output/sei_dashboard.csv`.
+
+## Proxima etapa recomendada
+
+Criar um passo de publicacao pos-coleta com as seguintes responsabilidades:
+
+1. Ler `backend/output/pt_normalizado_latest.csv`.
+2. Mapear para o schema canonico do dashboard.
+3. Popular `documento`, `fonte`, `status` e `collected_at`.
+4. Gerar `output/sei_dashboard.csv` na raiz.
+5. Validar colunas e tipos antes de publicar.
+
+## Validacoes operacionais recomendadas
+
+- Falhar rapido se `SEI_URL` estiver ausente.
+- Avisar explicitamente quando `DESCRICOES_BUSCA` estiver vazio ou nao selecionar nenhum interno.
+- Logar o caminho final dos artefatos gerados.
+- Logar quando o PT foi encontrado via busca e quando foi necessario fallback pela arvore.
+- Distinguir no log o modo de extracao: `html_dom`, `pdf_native`, `pdf_ocr` ou equivalente.

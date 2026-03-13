@@ -25,6 +25,10 @@
   "processo": {
     "iframe_arvore": "//iframe[@id='ifrArvore' or @name='ifrArvore']",
     "iframe_visualizacao": "//iframe[@id='ifrVisualizacao' or @name='ifrVisualizacao']",
+    "documentos_do_processo_links": [
+      "//div[contains(@class,'infraArvore')]//a[contains(@class,'infraArvoreNo')]",
+      "//a[contains(@class,'infraArvoreNo')]"
+    ],
     "abrir_todas_as_pastas": [
       "//img[starts-with(@id,'iconAP') and (contains(@title,'Abrir') or contains(@alt,'Abrir'))]",
       "//img[contains(@title,'Abrir todas as Pastas') or contains(@alt,'Abrir todas as Pastas')]"

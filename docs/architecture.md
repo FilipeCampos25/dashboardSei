@@ -1,85 +1,191 @@
 # Arquitetura
 
 ## Visao geral
-O projeto possui dois blocos principais:
 
-1. Backend de automacao (Selenium) para navegar no SEI e coletar dados/documentos.
-2. Dashboard Streamlit para analise de registros estruturados em CSV.
+O repositorio esta organizado em dois executaveis desacoplados:
 
-O entrypoint `backend/main.py` ja executa o fluxo assistido completo (`SEIScraper.run_full_flow`), com login manual ou automatico, selecao guiada de internos por descricao, coleta direcional de "PARCERIAS VIGENTES" e varredura de documentos dos processos.
+1. Backend Selenium
+Responsavel por autenticar no SEI, navegar nos internos, abrir processos, localizar o Plano de Trabalho e persistir artefatos tecnicos em disco.
 
-## Modulos principais
-- `backend/main.py`: CLI do backend (`--manual-login`, `--auto-login`, limites de internos/processos) e ciclo de vida do driver.
-- `backend/app/config.py`: carrega `.env` via `dotenv` + `pydantic-settings`.
-- `backend/app/core/driver_factory.py`: cria Chrome WebDriver (Selenium Manager por padrao, `CHROMEDRIVER_PATH` opcional).
-- `backend/app/core/logging_config.py`: configura logging global e reduz ruido de libs de terceiros.
-- `backend/app/services/selectors.py`: carrega `backend/app/rpa/xpath_selector.json`.
-- `backend/app/services/reporting.py`: exporta colecoes para CSV/XLSX com pandas.
-- `backend/app/rpa/scraping.py`: fluxo principal de navegacao/coleta no SEI (`SEIScraper`).
-- `dashboard_streamlit.py`: dashboard que le `output/sei_dashboard.csv` (raiz do repositorio) e gera KPIs/graficos/tabela.
+2. Dashboard Streamlit
+Responsavel por ler um CSV canonico local e exibir filtros, KPIs, graficos e tabela analitica.
 
-## Fluxo real do backend (`SEIScraper.run_full_flow`)
-1. Carrega URL/credenciais/config e abre o SEI.
-2. Executa login manual (padrao) ou tenta login automatico pelos seletores de `xpath_selector.json`.
-3. Fecha pop-up inicial (se existir).
-4. Navega no menu `Bloco > Interno`.
-5. Lista internos com paginacao e extrai `numero_interno` + `descricao`.
-6. Filtra internos por `DESCRICOES_BUSCA` (match `contains` ou `equals`).
-7. Para cada interno selecionado:
-   - reabre a lista e navega ate a pagina correta;
-   - clica no interno;
-   - se a descricao do interno for exatamente `PARCERIAS VIGENTES`, executa coleta preview estruturada e salva CSV;
-   - lista processos do interno;
-   - abre cada processo em nova aba/janela;
-   - expande pastas da arvore de documentos (`ifrArvore`) e coleta nomes dos documentos;
-   - fecha aba do processo e retorna.
-8. Retorna a lista unica de documentos encontrados (`self.found`).
+O backend hoje produz dados em `backend/output/`. O dashboard hoje consome `output/sei_dashboard.csv` na raiz. Esse desacoplamento ainda nao foi resolvido por pipeline interno.
 
-## Coleta de dados (implementado hoje)
-### 1) Coleta direcional de "PARCERIAS VIGENTES"
-Quando o interno atual tem descricao `PARCERIAS VIGENTES`, o scraper:
+## Entrypoints
 
-- percorre a tabela `tblProtocolosBlocos` com paginacao;
-- identifica a linha do processo;
-- faz parse da coluna de anotacoes;
-- extrai campos estruturados:
-  - `processo`
-  - `parceiro`
-  - `vigencia`
-  - `objeto`
-  - `numero_act` (ACT)
-  - `seq`
-- salva em `backend/output/parcerias_vigentes_YYYYMMDD_HHMMSS.csv` (por padrao).
+- `backend/main.py`
+CLI principal do backend. Resolve flags, configura logging e chama `SEIScraper.run_full_flow(...)`.
 
-### 2) Coleta de documentos por processo
-Para cada processo do interno selecionado, o scraper abre a arvore de documentos e coleta os nomes dos documentos. Isso permite localizar/registrar itens como:
+- `dashboard_streamlit.py`
+Aplicacao Streamlit que tenta carregar `output/sei_dashboard.csv`.
 
-- Memorando de Entendimento
-- TED
-- ACT
-- Plano de Trabalho
+## Modulos principais do backend
 
-Os nomes coletados ficam no conjunto `self.found` (saida em memoria + log).
+- `backend/app/config.py`
+Carrega `.env` com `dotenv` e expoe `Settings` via `pydantic-settings`.
 
-## Destaque de escopo de coletagem (negocio)
-O fluxo foi estruturado para suportar a coletagem de:
+- `backend/app/core/driver_factory.py`
+Cria o Chrome WebDriver. Usa Selenium Manager por padrao e `CHROMEDRIVER_PATH` como fallback.
 
-- `parcerias vigentes`
-- `Memorando de Entendimento`
-- `TED`
-- `ACT`
-- `Plano de Trabalho` (incluindo desdobramento em metas, acoes e prazos no dataset analitico)
+- `backend/app/core/logging_config.py`
+Configura logging global.
 
-Destaque solicitado (termo de negocio):
-- Coletagem de "parcerias vigentes" / Memorando de Entendimento (`processo`, `documento`, `parceiro`, `vigencia`, `objeto`, `atribuicoes`, Plano de Trabalho -> `metas`, `acoes` e `prazos`), incluindo `TED` e `ACT`.
+- `backend/app/rpa/selectors.py`
+Carrega e valida `backend/app/rpa/xpath_selector.json`.
 
-Estado atual:
-- Ja implementado de forma estruturada no backend: preview de `PARCERIAS VIGENTES` (`processo`, `parceiro`, `vigencia`, `objeto`, `numero_act`).
-- Ja implementado como varredura de documentos: nomes dos documentos dos processos (onde aparecem Memorando/TED/ACT/Plano de Trabalho).
-- Esperado no dashboard (contrato): `documento`, `atribuicao`, `meta`, `acao`, `prazo` etc., dependendo da etapa de estruturacao da coleta.
+- `backend/app/rpa/scraping.py`
+Orquestrador principal do fluxo SEI.
 
-## Dashboard e contrato de dados
-O dashboard trabalha com colunas canonicas:
+- `backend/app/rpa/sei/process_navigation.py`
+Abre processos e gerencia troca de abas/janelas.
+
+- `backend/app/rpa/sei/toolbar_actions.py`
+Opera a toolbar do processo ate abrir o filtro `Pesquisar no Processo`.
+
+- `backend/app/rpa/sei/document_search.py`
+Seleciona o tipo exato no filtro e abre o resultado mais recente.
+
+- `backend/app/rpa/sei/document_text_extractor.py`
+Extrai texto e tabelas do documento aberto. Faz fallback para download/PDF/OCR quando necessario.
+
+- `backend/app/core/raw_date_field_collector.py`
+Extrai campos brutos relacionados a data e periodo a partir do snapshot do documento.
+
+- `backend/app/services/pt_normalizer.py`
+Cruza JSONs de PT com a previa de `PARCERIAS VIGENTES` e gera CSVs normalizados.
+
+- `backend/app/output/csv_writer.py`
+Escrita padronizada de CSV.
+
+## Fluxo real do backend
+
+### 1. Preparacao da rodada
+
+Antes de iniciar a navegacao, `SEIScraper._prepare_output_dir_for_run()` limpa os artefatos anteriores no diretório de saida:
+
+- `plano_trabalho_*.json`
+- `pt_fields_raw.csv`
+- `pt_status_execucao_latest.csv`
+- `pt_sem_prazo_latest.csv`
+- `pt_normalizado_latest.csv`
+- `pt_normalizado_completo_latest.csv`
+- `parcerias_vigentes_latest.csv`
+
+### 2. Entrada no SEI
+
+`run_full_flow()`:
+
+1. valida `SEI_URL`;
+2. abre a URL;
+3. confirma login manual ou tenta login automatico;
+4. registra a janela principal;
+5. fecha pop-up inicial, se houver.
+
+### 3. Navegacao de internos
+
+O scraper:
+
+1. abre `Bloco > Interno`;
+2. pagina a listagem;
+3. coleta `numero_interno` e `descricao`;
+4. filtra pelos termos de `DESCRICOES_BUSCA`, em modo `contains` ou `equals`;
+5. retorna aos internos selecionados e entra um a um.
+
+### 4. Coleta de previa de `PARCERIAS VIGENTES`
+
+Se o interno atual tiver descricao equivalente a `PARCERIAS VIGENTES`, o scraper percorre `tblProtocolosBlocos`, pagina a grade e gera:
+
+- `interno_descricao`
+- `seq`
+- `processo`
+- `parceiro`
+- `vigencia`
+- `numero_act`
+- `objeto`
+
+Saida:
+
+- `backend/output/parcerias_vigentes_latest.csv`
+
+### 5. Navegacao por processo
+
+Para cada processo do interno:
+
+1. abre o processo em nova aba/janela;
+2. aguarda pagina pronta;
+3. aciona `Abrir todas as Pastas`;
+4. abre `Pesquisar no Processo`;
+5. busca o tipo exato `PLANO DE TRABALHO - PT`;
+6. tenta abrir o documento mais recente;
+7. se a busca falhar, usa fallback pela arvore do processo.
+
+### 6. Extracao do Plano de Trabalho
+
+Quando o documento esta aberto, o sistema:
+
+1. entra no `iframe` de visualizacao;
+2. extrai `body.innerText` e tabelas HTML;
+3. se o conteudo estiver vazio ou intermediario, aguarda renderizacao;
+4. se ainda assim falhar, tenta localizar o link de download;
+5. se o anexo for PDF, tenta extracao nativa e depois OCR;
+6. monta um snapshot com:
+   - `text`
+   - `tables`
+   - `url`
+   - `title`
+   - `extraction_mode`
+
+### 7. Persistencia de artefatos
+
+Para cada PT encontrado:
+
+- salva `plano_trabalho_<processo>.json`
+- atualiza `pt_fields_raw.csv`
+- adiciona linha a um relatorio interno de status de execucao
+
+Ao final da rodada:
+
+- grava `pt_status_execucao_latest.csv`
+- grava `pt_sem_prazo_latest.csv`
+- roda `export_normalized_csv(...)`
+- grava `pt_normalizado_latest.csv`
+- grava `pt_normalizado_completo_latest.csv`
+
+## Contratos de dados atuais
+
+### Contrato produzido pelo backend
+
+Arquivos em `backend/output/`:
+
+- `parcerias_vigentes_latest.csv`
+Previa estruturada por processo.
+
+- `plano_trabalho_<processo>.json`
+Snapshot bruto do documento PT.
+
+- `pt_fields_raw.csv`
+Modelo long com campos brutos e evidencias textuais.
+
+- `pt_status_execucao_latest.csv`
+Status de execucao da rodada.
+
+- `pt_sem_prazo_latest.csv`
+Subset dos PTs sem periodo completo detectado.
+
+- `pt_normalizado_latest.csv`
+Normalizacao consolidada dos snapshots de PT.
+
+- `pt_normalizado_completo_latest.csv`
+Subset classificado como `completo_padronizado`.
+
+### Contrato esperado pelo dashboard
+
+Arquivo na raiz:
+
+- `output/sei_dashboard.csv`
+
+Colunas canonicas:
 
 - `processo`
 - `documento`
@@ -95,9 +201,19 @@ O dashboard trabalha com colunas canonicas:
 - `fonte`
 - `collected_at`
 
-Ele aceita aliases de colunas, tenta extracao textual a partir de `linha` e calcula `vigencia_status`.
+## Dashboard
 
-## Observacoes arquiteturais importantes
-- O backend gera hoje preview em `backend/output/parcerias_vigentes_*.csv` (relativo ao backend).
-- O dashboard le `output/sei_dashboard.csv` na raiz do repositorio.
-- Portanto, ainda existe um gap de integracao/orquestracao entre a coleta atual e o arquivo consumido pelo dashboard.
+O dashboard:
+
+1. tenta ler `output/sei_dashboard.csv`;
+2. aplica aliases de colunas;
+3. tenta completar campos a partir de uma coluna `linha`;
+4. faz parse de datas;
+5. calcula `vigencia_status`;
+6. renderiza filtros, KPIs, graficos e tabela.
+
+Se o CSV nao existir, usa um dataset de exemplo embutido.
+
+## Lacuna arquitetural atual
+
+Ainda falta uma etapa que converta os artefatos do backend, especialmente `pt_normalizado_latest.csv`, para o contrato `output/sei_dashboard.csv`.
