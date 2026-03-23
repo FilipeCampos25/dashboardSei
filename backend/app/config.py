@@ -86,6 +86,10 @@ class Settings(BaseSettings):
         default="contains",
         validation_alias=AliasChoices("DESCRICOES_MATCH_MODE", "descricoes_match_mode"),
     )
+    document_types: str = Field(
+        default="pt",
+        validation_alias=AliasChoices("DOCUMENT_TYPES", "document_types"),
+    )
     export_raw_fields_csv: bool = Field(
         default=True,
         validation_alias=AliasChoices("EXPORT_RAW_FIELDS_CSV", "export_raw_fields_csv"),

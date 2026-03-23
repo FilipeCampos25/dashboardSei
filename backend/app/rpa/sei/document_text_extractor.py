@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import calendar
+import hashlib
 import io
 import os
 import re
@@ -14,6 +15,9 @@ from urllib.parse import urljoin
 
 from selenium.common.exceptions import NoSuchFrameException, WebDriverException
 from selenium.webdriver.common.by import By
+
+SNAPSHOT_STAGNANT_READS_FOR_EARLY_FALLBACK = 3
+SNAPSHOT_EARLY_FALLBACK_TEXT_THRESHOLD = 120
 
 
 def _log(logger: Any, level: str, msg: str, *args: Any) -> None:
@@ -109,7 +113,33 @@ def _log_iframe_inventory(driver: Any, logger: Any, context: str) -> None:
     _log(logger, "info", "%s: iframes detectados=%d %s", context, len(descriptions), descriptions)
 
 
-def get_visualizacao_iframe(driver: Any, logger: Any = None) -> Any:
+def _log_transition(
+    logger: Any,
+    log_state: Dict[str, Any] | None,
+    key: str,
+    signature: Any,
+    level: str,
+    msg: str,
+    *args: Any,
+) -> None:
+    if log_state is None:
+        _log(logger, level, msg, *args)
+        return
+
+    if log_state.get(key) == signature:
+        return
+
+    log_state[key] = signature
+    _log(logger, level, msg, *args)
+
+
+def get_visualizacao_iframe(
+    driver: Any,
+    logger: Any = None,
+    *,
+    missing_level: str = "warning",
+    log_state: Dict[str, Any] | None = None,
+) -> Any:
     """Retorna o iframe de visualizacao do documento (ifrVisualizacao)."""
     tried: List[str] = []
     try:
@@ -131,8 +161,11 @@ def get_visualizacao_iframe(driver: Any, logger: Any = None) -> Any:
 
         iframes = driver.find_elements(By.TAG_NAME, "iframe")
         if len(iframes) > 1:
-            _log(
+            _log_transition(
                 logger,
+                log_state,
+                "visualizacao_iframe_count",
+                len(iframes),
                 "info",
                 "Visualizacao: %d iframes detectados; iniciando tentativa por src.",
                 len(iframes),
@@ -149,15 +182,32 @@ def get_visualizacao_iframe(driver: Any, logger: Any = None) -> Any:
         _log(logger, "warning", "Visualizacao: falha ao localizar iframe (%s).", exc)
         return None
 
-    _log_iframe_inventory(driver, logger, "Visualizacao: inventario de iframes antes de falha")
-    _log(logger, "warning", "Visualizacao: iframe nao encontrado. Tentativas=%s", tried)
+    if missing_level in {"warning", "error"}:
+        _log_iframe_inventory(driver, logger, "Visualizacao: inventario de iframes antes de falha")
+    _log(logger, missing_level, "Visualizacao: iframe nao encontrado. Tentativas=%s", tried)
     return None
 
 
-def _switch_to_visualizacao_iframe_once(driver: Any, logger: Any = None) -> bool:
-    iframe = get_visualizacao_iframe(driver, logger=logger)
+def _switch_to_visualizacao_iframe_once(
+    driver: Any,
+    logger: Any = None,
+    log_state: Dict[str, Any] | None = None,
+) -> bool:
+    iframe = get_visualizacao_iframe(
+        driver,
+        logger=logger,
+        missing_level="debug",
+        log_state=log_state,
+    )
     if iframe is None:
-        _log(logger, "info", "Visualizacao: iniciando fallback de busca em iframes aninhados.")
+        _log_transition(
+            logger,
+            log_state,
+            "visualizacao_fallback_started",
+            True,
+            "info",
+            "Visualizacao: iniciando fallback de busca em iframes aninhados.",
+        )
         try:
             driver.switch_to.default_content()
             parent_candidates = driver.find_elements(
@@ -183,11 +233,15 @@ def _switch_to_visualizacao_iframe_once(driver: Any, logger: Any = None) -> bool
                     continue
 
                 parent = parents_now[pidx]
-                _log(
+                parent_description = _describe_iframe(parent, pidx)
+                _log_transition(
                     logger,
+                    log_state,
+                    "visualizacao_fallback_parent",
+                    parent_description,
                     "info",
                     "Visualizacao fallback: testando parent iframe %s",
-                    _describe_iframe(parent, pidx),
+                    parent_description,
                 )
                 driver.switch_to.frame(parent)
                 deadline_inner = time.time() + 2.5
@@ -204,11 +258,15 @@ def _switch_to_visualizacao_iframe_once(driver: Any, logger: Any = None) -> bool
                     time.sleep(0.15)
                 if inner_candidates:
                     driver.switch_to.frame(inner_candidates[0])
-                    _log(
+                    inner_description = _describe_iframe(inner_candidates[0], 0)
+                    _log_transition(
                         logger,
+                        log_state,
+                        "visualizacao_fallback_success",
+                        inner_description,
                         "info",
                         "Visualizacao fallback: switch OK para iframe interno %s",
-                        _describe_iframe(inner_candidates[0], 0),
+                        inner_description,
                     )
                     return True
             except (NoSuchFrameException, WebDriverException) as exc:
@@ -219,7 +277,14 @@ def _switch_to_visualizacao_iframe_once(driver: Any, logger: Any = None) -> bool
     try:
         driver.switch_to.default_content()
         driver.switch_to.frame(iframe)
-        _log(logger, "info", "Visualizacao: contexto alterado para iframe de visualizacao com sucesso.")
+        _log_transition(
+            logger,
+            log_state,
+            "visualizacao_switch_success",
+            "direct",
+            "info",
+            "Visualizacao: contexto alterado para iframe de visualizacao com sucesso.",
+        )
         return True
     except (NoSuchFrameException, WebDriverException) as exc:
         _log(logger, "warning", "Visualizacao: erro no switch_to.frame (%s).", exc)
@@ -230,12 +295,13 @@ def _switch_to_visualizacao_iframe(
     driver: Any,
     logger: Any = None,
     timeout_seconds: float = 10.0,
+    log_state: Dict[str, Any] | None = None,
 ) -> bool:
     deadline = time.time() + max(1.0, timeout_seconds)
     attempt = 0
     while time.time() < deadline:
         attempt += 1
-        if _switch_to_visualizacao_iframe_once(driver, logger=logger):
+        if _switch_to_visualizacao_iframe_once(driver, logger=logger, log_state=log_state):
             if attempt > 1:
                 _log(logger, "info", "Visualizacao: switch concluido apos %d tentativa(s).", attempt)
             return True
@@ -245,10 +311,41 @@ def _switch_to_visualizacao_iframe(
     return False
 
 
+def _snapshot_text_is_ready(text: str) -> bool:
+    return bool((text or "").strip()) and not _looks_like_placeholder_text(text)
+
+
+def _snapshot_progress_signature(text: str) -> tuple[int, bool, str]:
+    normalized = re.sub(r"\s+", " ", (text or "").strip())
+    digest = hashlib.sha1(normalized.encode("utf-8", errors="ignore")).hexdigest() if normalized else ""
+    return (len(normalized), _looks_like_placeholder_text(text), digest)
+
+
+def _should_trigger_early_file_fallback(text: str, stable_reads: int) -> bool:
+    normalized = re.sub(r"\s+", " ", (text or "").strip())
+    return stable_reads >= SNAPSHOT_STAGNANT_READS_FOR_EARLY_FALLBACK and (
+        len(normalized) <= SNAPSHOT_EARLY_FALLBACK_TEXT_THRESHOLD
+        or _looks_like_placeholder_text(text)
+    )
+
+
+def _read_visualizacao_state(driver: Any) -> Dict[str, str]:
+    return {
+        "url": str(driver.execute_script("return window.location.href || '';") or ""),
+        "title": str(driver.execute_script("return document.title || '';") or ""),
+        "text": str(
+            driver.execute_script(
+                "return (document && document.body) ? (document.body.innerText || '') : '';"
+            )
+            or ""
+        ),
+    }
+
+
 def extract_body_text_from_visualizacao(driver: Any, logger: Any = None) -> str:
     text = ""
     try:
-        if not _switch_to_visualizacao_iframe(driver, logger=logger):
+        if not _switch_to_visualizacao_iframe(driver, logger=logger, log_state={}):
             return text
         body_text = driver.execute_script(
             "return (document && document.body) ? (document.body.innerText || '') : '';"
@@ -271,7 +368,7 @@ def extract_tables_from_visualizacao(
 ) -> List[Dict[str, List[List[str]]]]:
     tables: List[Dict[str, List[List[str]]]] = []
     try:
-        if not _switch_to_visualizacao_iframe(driver, logger=logger):
+        if not _switch_to_visualizacao_iframe(driver, logger=logger, log_state={}):
             return tables
         raw_tables = driver.execute_script(
             """
@@ -708,19 +805,14 @@ def extract_document_snapshot(driver: Any, logger: Any = None) -> Dict[str, Any]
             getattr(driver, "current_url", ""),
             getattr(driver, "title", ""),
         )
-        if not _switch_to_visualizacao_iframe(driver, logger=logger):
+        visualizacao_log_state: Dict[str, Any] = {}
+        if not _switch_to_visualizacao_iframe(driver, logger=logger, log_state=visualizacao_log_state):
             _log(logger, "warning", "Snapshot PT: extracao abortada; iframe de visualizacao indisponivel.")
             return snapshot
 
-        snapshot["url"] = str(driver.execute_script("return window.location.href || '';") or "")
-        snapshot["title"] = str(driver.execute_script("return document.title || '';") or "")
-        snapshot["text"] = str(
-            driver.execute_script(
-                "return (document && document.body) ? (document.body.innerText || '') : '';"
-            )
-            or ""
-        )
-        if not snapshot["text"].strip() or _looks_like_placeholder_text(snapshot["text"]):
+        snapshot.update(_read_visualizacao_state(driver))
+        should_force_file_fallback = False
+        if not _snapshot_text_is_ready(snapshot["text"]):
             _log(
                 logger,
                 "info",
@@ -728,19 +820,23 @@ def extract_document_snapshot(driver: Any, logger: Any = None) -> Dict[str, Any]
                 len(snapshot["text"]),
             )
             refresh_deadline = time.time() + 8.0
+            last_progress_signature = _snapshot_progress_signature(snapshot["text"])
+            stable_reads = 1
             while time.time() < refresh_deadline:
-                time.sleep(0.4)
-                if not _switch_to_visualizacao_iframe(driver, logger=logger, timeout_seconds=2.5):
+                if not _switch_to_visualizacao_iframe(
+                    driver,
+                    logger=logger,
+                    timeout_seconds=2.5,
+                    log_state=visualizacao_log_state,
+                ):
+                    remaining = refresh_deadline - time.time()
+                    if remaining <= 0:
+                        break
+                    time.sleep(min(0.2, remaining))
                     continue
-                snapshot["url"] = str(driver.execute_script("return window.location.href || '';") or "")
-                snapshot["title"] = str(driver.execute_script("return document.title || '';") or "")
-                snapshot["text"] = str(
-                    driver.execute_script(
-                        "return (document && document.body) ? (document.body.innerText || '') : '';"
-                    )
-                    or ""
-                )
-                if snapshot["text"].strip() and not _looks_like_placeholder_text(snapshot["text"]):
+
+                snapshot.update(_read_visualizacao_state(driver))
+                if _snapshot_text_is_ready(snapshot["text"]):
                     _log(
                         logger,
                         "info",
@@ -749,7 +845,34 @@ def extract_document_snapshot(driver: Any, logger: Any = None) -> Dict[str, Any]
                     )
                     break
 
-        if not snapshot["text"].strip() or _looks_like_placeholder_text(snapshot["text"]):
+                current_progress_signature = _snapshot_progress_signature(snapshot["text"])
+                if current_progress_signature == last_progress_signature:
+                    stable_reads += 1
+                else:
+                    last_progress_signature = current_progress_signature
+                    stable_reads = 1
+
+                if _should_trigger_early_file_fallback(snapshot["text"], stable_reads):
+                    should_force_file_fallback = True
+                    _log(
+                        logger,
+                        "info",
+                        "Snapshot PT: conteudo HTML estagnado (chars=%d leituras_estaveis=%d); antecipando fallback de arquivo.",
+                        len(snapshot["text"]),
+                        stable_reads,
+                    )
+                    break
+
+                remaining = refresh_deadline - time.time()
+                if remaining <= 0:
+                    break
+                time.sleep(min(0.2, remaining))
+
+        if (
+            should_force_file_fallback
+            or not snapshot["text"].strip()
+            or _looks_like_placeholder_text(snapshot["text"])
+        ):
             fallback = _extract_pdf_text_via_anchor_fallback(driver, logger=logger, ocr_dpi=200)
             if fallback:
                 snapshot["text"] = str(fallback.get("text") or "")

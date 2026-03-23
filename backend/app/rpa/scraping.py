@@ -1,19 +1,20 @@
 from __future__ import annotations
 
 import os
-import json
 import re
 import time
 import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from selenium.common.exceptions import (
+    ElementClickInterceptedException,
     NoSuchElementException,
     StaleElementReferenceException,
     TimeoutException,
+    UnexpectedAlertPresentException,
     WebDriverException,
 )
 from selenium.webdriver.common.by import By
@@ -22,13 +23,13 @@ from selenium.webdriver.support.ui import WebDriverWait
 from app.config import get_settings
 from app.core.driver_factory import create_chrome_driver
 from app.core.logging_config import setup_logger
-from app.core.raw_date_field_collector import collect_raw_fields, export_raw_fields_csv
+from app.documents import resolve_document_types
+from app.documents.types import DocumentTypeSpec
 from app.output import csv_writer
 from app.rpa.sei import process_navigation
 from app.rpa.sei import toolbar_actions
 from app.rpa.sei import document_search
 from app.rpa.sei import document_text_extractor
-from app.services.pt_normalizer import export_normalized_csv
 from app.rpa.selenium_utils import (
     get_iframes_info,
     wait_for_clickable as selenium_wait_for_clickable,
@@ -36,6 +37,10 @@ from app.rpa.selenium_utils import (
     wait_for_elements as selenium_wait_for_elements,
 )
 from app.rpa.selectors import load_xpath_selectors
+
+POST_LOGIN_REFRESH_SLEEP_SECONDS = 1.0
+UI_SETTLE_SLEEP_SECONDS = 0.35
+PAGINATION_SETTLE_SLEEP_SECONDS = 0.25
 
 
 @dataclass
@@ -51,6 +56,131 @@ class InternoRow:
     link: Any
     page: int
     row_index: int
+
+
+def _compact_text(value: str) -> str:
+    return " ".join((value or "").split()).strip()
+
+
+def _click_optional_popup(
+    driver: Any,
+    xpath: str,
+    *,
+    probe_timeout_seconds: float = 0.5,
+    poll_interval_seconds: float = 0.1,
+) -> bool:
+    try:
+        candidates = driver.find_elements(By.XPATH, xpath)
+    except WebDriverException:
+        return False
+
+    if not candidates:
+        return False
+
+    deadline = time.time() + max(0.0, float(probe_timeout_seconds))
+    while True:
+        for candidate in candidates:
+            try:
+                if hasattr(candidate, "is_displayed") and not candidate.is_displayed():
+                    continue
+            except WebDriverException:
+                continue
+
+            try:
+                if hasattr(candidate, "is_enabled") and not candidate.is_enabled():
+                    continue
+            except WebDriverException:
+                continue
+
+            try:
+                candidate.click()
+                return True
+            except WebDriverException:
+                continue
+
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            return False
+
+        time.sleep(min(poll_interval_seconds, remaining))
+        try:
+            candidates = driver.find_elements(By.XPATH, xpath)
+        except WebDriverException:
+            return False
+
+    return False
+
+
+def _is_overlay_displayed(driver: Any, xpath: str) -> bool:
+    try:
+        overlays = driver.find_elements(By.XPATH, xpath)
+    except WebDriverException:
+        return False
+
+    for overlay in overlays:
+        try:
+            if overlay.is_displayed():
+                return True
+        except WebDriverException:
+            continue
+    return False
+
+
+def _build_rows_signature(rows: List[Any]) -> tuple[str, int] | None:
+    if not rows:
+        return None
+
+    first_non_empty = ""
+    for row in rows[:5]:
+        try:
+            text = _compact_text(getattr(row, "text", "") or "")
+        except WebDriverException:
+            continue
+        if text:
+            first_non_empty = text
+            break
+
+    return (first_non_empty, len(rows))
+
+
+def _clicked_element_became_stale(element: Any) -> bool:
+    try:
+        if hasattr(element, "is_enabled"):
+            element.is_enabled()
+    except StaleElementReferenceException:
+        return True
+    except WebDriverException:
+        return False
+    return False
+
+
+def _wait_for_page_signature_change(
+    read_rows: Callable[[], tuple[str, int] | None],
+    previous_signature: tuple[str, int] | None,
+    clicked_element: Any,
+    *,
+    timeout_seconds: float = 1.0,
+    poll_interval_seconds: float = 0.1,
+) -> bool:
+    deadline = time.time() + max(0.1, float(timeout_seconds))
+    while time.time() < deadline:
+        if _clicked_element_became_stale(clicked_element):
+            return True
+
+        current_signature = read_rows()
+        if (
+            previous_signature is not None
+            and current_signature is not None
+            and current_signature != previous_signature
+        ):
+            return True
+
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        time.sleep(min(poll_interval_seconds, remaining))
+
+    return False
 
 
 class SEIScraper:
@@ -89,6 +219,14 @@ class SEIScraper:
         self.selectors = load_xpath_selectors()
         self.main_window_handle: Optional[str] = None
         self.found: Set[str] = set()
+        self.document_types = resolve_document_types(cfg.document_types, logger=self.logger)
+        self.document_types_by_key = {spec.key: spec for spec in self.document_types}
+        self._process_filter_degraded: Dict[str, bool] = {}
+        self._process_filter_recovery_attempts: Dict[Tuple[str, str], int] = {}
+        self.logger.info(
+            "Tipos documentais ativos: %s",
+            ", ".join(spec.key for spec in self.document_types),
+        )
         self.descricoes_busca = self._parse_descricoes_busca(cfg.descricoes_busca)
         self.descricao_match_mode = (cfg.descricoes_match_mode or "contains").strip().lower()
         if self.descricao_match_mode == "exact":
@@ -99,23 +237,17 @@ class SEIScraper:
                 self.descricao_match_mode,
             )
             self.descricao_match_mode = "contains"
-        self._pt_tracking_records: List[Dict[str, Any]] = []
 
     def _prepare_output_dir_for_run(self) -> None:
         output_dir = self._resolve_preview_output_dir()
         csv_writer.ensure_output_dir(output_dir)
 
-        cleanup_patterns = [
-            "plano_trabalho_*.json",
-            "pt_fields_raw.csv",
-            "pt_status_execucao_latest.csv",
-            "pt_sem_prazo_latest.csv",
-            "pt_normalizado_latest.csv",
-            "pt_normalizado_completo_latest.csv",
-            "parcerias_vigentes_latest.csv",
-        ]
+        cleanup_patterns = {"parcerias_vigentes_latest.csv"}
+        for document_type in self.document_types:
+            document_type.handler.reset_run()
+            cleanup_patterns.update(document_type.cleanup_patterns)
         removed = 0
-        for pattern in cleanup_patterns:
+        for pattern in sorted(cleanup_patterns):
             for path in output_dir.glob(pattern):
                 try:
                     path.unlink()
@@ -155,7 +287,7 @@ class SEIScraper:
             self.logger.warning(
                 "Modo guiado: nenhum interno selecionado pelas descricoes configuradas."
             )
-            self._save_pt_tracking_reports()
+            self._finalize_document_runs()
             result = sorted(self.found)
             self.logger.info("Itens unicos encontrados: %d", len(result))
             print(result)
@@ -178,6 +310,7 @@ class SEIScraper:
                 processos = processos[:max_processos_por_interno]
 
             for proc in processos:
+                self._clear_process_filter_state(proc)
                 self._switch_to_main_window_context()
                 self.logger.info("Abrindo processo %s", proc)
                 self._open_processo(proc)
@@ -185,10 +318,9 @@ class SEIScraper:
                 self._wait_page_ready_in_processo()
                 self.logger.info("Processo %s: clicando Abrir todas as Pastas", proc)
                 self._click_abrir_todas_as_pastas()
-                self.logger.info("Processo %s: clicando Pesquisar no Processo", proc)
-                self._click_pesquisar_no_processo()
-                self.logger.info("Processo %s: filtro aberto (anchor ok)", proc)
-                self._buscar_e_abrir_plano_de_trabalho_mais_recente(proc)
+                for document_type in self.document_types:
+                    self._ensure_document_search_open(proc, document_type)
+                    self._buscar_e_abrir_documento_mais_recente(proc, document_type)
 
                 if stop_at_filter:
                     self.logger.info("Processo %s: fechando aba e voltando", proc)
@@ -198,15 +330,13 @@ class SEIScraper:
                         "Processo %s: mantendo aba aberta no filtro (--no-stop-at-filter); interrompendo loop.",
                         proc,
                     )
-                    self._save_pt_tracking_reports()
+                    self._finalize_document_runs()
                     result = sorted(self.found)
                     self.logger.info("Itens unicos encontrados: %d", len(result))
                     print(result)
                     return result
 
-            self._back_to_interno_list()
-
-        self._save_pt_tracking_reports()
+        self._finalize_document_runs()
         result = sorted(self.found)
         self.logger.info("Itens unicos encontrados: %d", len(result))
         print(result)
@@ -247,10 +377,47 @@ class SEIScraper:
     # Login / tela inicial
     def _wait_for_manual_login(self) -> None:
         cfg = self.settings
-        self.logger.info("Aguardando conclusao do login/autenticacao no SEI (modo automatico).")
+        self.logger.info("Aguardando conclusao do login/autenticacao no SEI (modo manual).")
 
         wait_seconds = max(5, cfg.manual_login_wait_seconds)
         self._wait_for_post_login_ready(wait_seconds)
+
+    def _consume_login_alert_if_present(self, exc: Exception | None = None) -> str:
+        alert_text = ""
+        if isinstance(exc, UnexpectedAlertPresentException):
+            alert_text = (getattr(exc, "alert_text", "") or "").strip()
+
+        try:
+            alert = self.driver.switch_to.alert
+            if not alert_text:
+                alert_text = (alert.text or "").strip()
+            try:
+                alert.accept()
+            except WebDriverException:
+                try:
+                    alert.dismiss()
+                except WebDriverException:
+                    pass
+        except WebDriverException:
+            pass
+
+        return " ".join(alert_text.split()).strip()
+
+    def _handle_login_alert(self, exc: Exception | None = None) -> bool:
+        alert_text = self._consume_login_alert_if_present(exc)
+        if not alert_text:
+            return False
+
+        alert_norm = self._normalize_text(alert_text)
+        self.logger.warning("Alerta detectado durante login: %s", alert_text)
+
+        if "USUARIO OU SENHA INVALIDA" in alert_norm:
+            raise RuntimeError(
+                "O SEI retornou 'Usuário ou Senha Inválida.' durante o login. "
+                "Verifique as credenciais usadas antes de prosseguir para o validador."
+            )
+
+        return True
 
     def _wait_for_post_login_ready(self, wait_seconds: int) -> None:
         sel = self.selectors.get("tela_inicio", {})
@@ -268,7 +435,17 @@ class SEIScraper:
         )
 
         while time.time() < deadline:
-            current_url = (self.driver.current_url or "").lower()
+            if self._handle_login_alert():
+                time.sleep(UI_SETTLE_SLEEP_SECONDS)
+                continue
+
+            try:
+                current_url = (self.driver.current_url or "").lower()
+            except UnexpectedAlertPresentException as exc:
+                if self._handle_login_alert(exc):
+                    time.sleep(UI_SETTLE_SLEEP_SECONDS)
+                    continue
+                raise
 
             # Sinal 1: URL de destino conhecida apos login.
             if all(marker in current_url for marker in post_login_url_markers):
@@ -302,7 +479,7 @@ class SEIScraper:
                         self.driver.refresh()
                     except WebDriverException as exc:
                         self.logger.warning("Falha ao recarregar pagina apos 504: %s", exc)
-                    time.sleep(3)
+                    time.sleep(POST_LOGIN_REFRESH_SLEEP_SECONDS)
                     continue
 
                 raise RuntimeError(
@@ -310,7 +487,7 @@ class SEIScraper:
                     "Interrompendo execucao para evitar loop."
                 )
 
-            time.sleep(1)
+            time.sleep(UI_SETTLE_SLEEP_SECONDS)
 
         raise RuntimeError(
             "Login/autenticacao nao confirmado dentro do tempo limite. "
@@ -377,11 +554,23 @@ class SEIScraper:
         if not x:
             return
         try:
-            time.sleep(1)
-            self.driver.find_element(By.XPATH, x).click()
-            self.logger.info("Pop-up fechado.")
+            if _click_optional_popup(self.driver, x):
+                self.logger.info("Pop-up fechado.")
         except Exception:
             return
+
+    def _wait_for_overlay_to_clear(
+        self,
+        *,
+        timeout_seconds: float = 6.0,
+        overlay_xpath: str = "//*[contains(@class,'sparkling-modal-overlay') or contains(@id,'InfraSparklingModalOverlay')]",
+    ) -> bool:
+        deadline = time.time() + max(0.5, float(timeout_seconds))
+        while time.time() < deadline:
+            if not _is_overlay_displayed(self.driver, overlay_xpath):
+                return True
+            time.sleep(0.2)
+        return not _is_overlay_displayed(self.driver, overlay_xpath)
 
     # Helpers de seletores / clique
     def _click_first_clickable(self, xpaths: List[str], label: str) -> None:
@@ -392,11 +581,34 @@ class SEIScraper:
                 continue
             checked.append(xpath)
             try:
-                self.wait_for_clickable(
+                elem = self.wait_for_clickable(
                     xpath,
                     tag=f"{label}_candidate_{idx}",
                     timeout=candidate_timeout,
-                ).click()
+                )
+                try:
+                    elem.click()
+                except ElementClickInterceptedException as exc:
+                    self.logger.info(
+                        "Clique interceptado em '%s' (xpath #%d). Aguardando overlay/modal do SEI desaparecer.",
+                        label,
+                        idx,
+                    )
+                    if not self._wait_for_overlay_to_clear(timeout_seconds=min(6.0, float(self.timeout_seconds))):
+                        self.logger.warning(
+                            "Overlay/modal do SEI permaneceu visivel ao clicar em '%s' (%s). Tentando fallback JS.",
+                            label,
+                            exc,
+                        )
+                    try:
+                        elem = self.wait_for_clickable(
+                            xpath,
+                            tag=f"{label}_candidate_{idx}_retry",
+                            timeout=candidate_timeout,
+                        )
+                        elem.click()
+                    except (ElementClickInterceptedException, WebDriverException):
+                        self.driver.execute_script("arguments[0].click();", elem)
                 return
             except TimeoutException:
                 continue
@@ -434,23 +646,482 @@ class SEIScraper:
             timeout=self.timeout_seconds,
         )
 
-    def _find_plano_trabalho_link_in_tree(self) -> Optional[Any]:
-        xpaths = self.selectors.get_many("processo.documentos_do_processo_links")
-        preferred_terms = (
-            "PLANO DE TRABALHO - PT",
-            "PLANO DE TRABALHO PT",
-            "PLANO DE TRABALHO",
+    def _restore_process_base_context(
+        self,
+        processo: str,
+        *,
+        process_url: Optional[str] = None,
+        reason: str = "",
+    ) -> None:
+        target_url = (process_url or self.driver.current_url or "").strip()
+        if not target_url:
+            self.logger.warning(
+                "Processo %s: nao foi possivel restaurar contexto base%s porque a URL do processo esta vazia.",
+                processo,
+                f" ({reason})" if reason else "",
+            )
+            return
+
+        try:
+            self.driver.switch_to.default_content()
+        except WebDriverException:
+            pass
+
+        self.logger.info(
+            "Processo %s: restaurando contexto base do processo%s via reload da URL.",
+            processo,
+            f" ({reason})" if reason else "",
         )
+        self.driver.get(target_url)
+        self._wait_page_ready_in_processo()
+        self._click_abrir_todas_as_pastas()
+
+    def _clear_process_filter_state(self, processo: str) -> None:
+        self._process_filter_degraded.pop(processo, None)
+        stale_keys = [
+            key for key in self._process_filter_recovery_attempts if key[0] == processo
+        ]
+        for key in stale_keys:
+            self._process_filter_recovery_attempts.pop(key, None)
+
+    def _is_search_context_stagnation_timeout(self, exc: Exception) -> bool:
+        return isinstance(exc, TimeoutException) and "motivo=estagnacao_do_contexto" in str(exc)
+
+    def _can_retry_filter_recovery(self, processo: str, document_key: str) -> bool:
+        return self._process_filter_recovery_attempts.get((processo, document_key), 0) < 1
+
+    def _consume_filter_recovery_attempt(self, processo: str, document_key: str) -> bool:
+        if not self._can_retry_filter_recovery(processo, document_key):
+            return False
+        key = (processo, document_key)
+        self._process_filter_recovery_attempts[key] = self._process_filter_recovery_attempts.get(key, 0) + 1
+        return True
+
+    def _ensure_document_search_open(self, processo: str, document_type: DocumentTypeSpec) -> None:
+        anchor_timeout = min(3, max(1, self.timeout_seconds))
+        force_restore = bool(self._process_filter_degraded.get(processo))
+        if force_restore:
+            self.logger.info(
+                "Processo %s: filtro marcado como degradado; restaurando contexto antes de %s.",
+                processo,
+                document_type.display_name,
+            )
+        else:
+            try:
+                toolbar_actions.wait_pesquisa_anchor(
+                    self.driver,
+                    self.selectors,
+                    self.logger,
+                    timeout=anchor_timeout,
+                )
+                self.logger.info(
+                    "Processo %s: filtro ja estava aberto para %s.",
+                    processo,
+                    document_type.display_name,
+                )
+                return
+            except (TimeoutException, RuntimeError):
+                pass
+
+        last_exc: Optional[Exception] = None
+        while True:
+            if force_restore:
+                if not self._consume_filter_recovery_attempt(processo, document_type.key):
+                    if last_exc is not None:
+                        raise last_exc
+                    break
+                try:
+                    self._restore_process_base_context(
+                        processo,
+                        reason=f"recovery abrir filtro para {document_type.log_label}",
+                    )
+                except Exception as exc:
+                    self.logger.warning(
+                        "Processo %s: falha ao restaurar contexto antes da reabertura do filtro para %s (%s).",
+                        processo,
+                        document_type.display_name,
+                        exc,
+                    )
+                    last_exc = exc
+                force_restore = False
+
+            self.logger.info(
+                "Processo %s: clicando Pesquisar no Processo para %s.",
+                processo,
+                document_type.display_name,
+            )
+            try:
+                self._click_pesquisar_no_processo()
+                self._process_filter_degraded.pop(processo, None)
+                self.logger.info(
+                    "Processo %s: filtro aberto (anchor ok) para %s.",
+                    processo,
+                    document_type.display_name,
+                )
+                return
+            except (TimeoutException, RuntimeError) as exc:
+                last_exc = exc
+                if self._is_search_context_stagnation_timeout(exc):
+                    self._process_filter_degraded[processo] = True
+                    self.logger.warning(
+                        "Processo %s: filtro entrou em estagnacao para %s; contexto sera restaurado antes da proxima tentativa.",
+                        processo,
+                        document_type.display_name,
+                    )
+                if self._can_retry_filter_recovery(processo, document_type.key):
+                    self.logger.warning(
+                        "Processo %s: falha ao abrir filtro para %s; tentando uma restauracao controlada da tela base.",
+                        processo,
+                        document_type.display_name,
+                    )
+                    force_restore = True
+                    continue
+                raise
+
+        if last_exc is not None:
+            raise last_exc
+
+    def _get_document_type(self, key: str) -> Optional[DocumentTypeSpec]:
+        return self.document_types_by_key.get(key)
+
+    def _iter_unique_search_terms(self, document_type: DocumentTypeSpec) -> List[str]:
+        unique_terms: List[str] = []
+        seen: Set[str] = set()
+        for term in document_type.search_terms:
+            normalized = self._normalize_text(term)
+            collapsed = re.sub(r"\s+", " ", normalized).strip()
+            if not collapsed or collapsed in seen:
+                continue
+            seen.add(collapsed)
+            unique_terms.append(term)
+        return unique_terms
+
+    def _build_collection_context(
+        self,
+        *,
+        found: bool,
+        found_in: str,
+        search_term: str = "",
+        results_count: int = 0,
+        chosen_documento: str = "",
+        selection_reason: str = "",
+        selection_detail: str = "",
+        extraction_error: str = "",
+    ) -> Dict[str, Any]:
+        return {
+            "captured_at": datetime.now().isoformat(timespec="seconds"),
+            "found": found,
+            "found_in": found_in,
+            "search_term": search_term,
+            "results_count": int(results_count or 0),
+            "chosen_documento": chosen_documento,
+            "selection_reason": selection_reason,
+            "selection_detail": selection_detail,
+            "extraction_error": extraction_error,
+        }
+
+    def _collect_pesquisa_diagnostics(self) -> Dict[str, Any]:
+        try:
+            return document_search.describe_pesquisa_context(self.driver, self.selectors)
+        except Exception as exc:
+            self.logger.warning("Falha ao coletar diagnostico do filtro de pesquisa (%s).", exc)
+            return {
+                "state": "inactive",
+                "current_url": "",
+                "current_title": "",
+                "ifrConteudoVisualizacao_src": "",
+                "ifrVisualizacao_src": "",
+                "primary_result_count": 0,
+                "fallback_result_count": 0,
+            }
+
+    def _format_pesquisa_diagnostics(self, diagnostics: Dict[str, Any]) -> str:
+        return (
+            "state={state} url={url} title={title} "
+            "ifrConteudoVisualizacao_src={conteudo_src} "
+            "ifrVisualizacao_src={visualizacao_src} "
+            "primary_result_count={primary_count} "
+            "fallback_result_count={fallback_count}"
+        ).format(
+            state=diagnostics.get("state", "inactive") or "inactive",
+            url=diagnostics.get("current_url", "") or "-",
+            title=diagnostics.get("current_title", "") or "-",
+            conteudo_src=diagnostics.get("ifrConteudoVisualizacao_src", "") or "-",
+            visualizacao_src=diagnostics.get("ifrVisualizacao_src", "") or "-",
+            primary_count=int(diagnostics.get("primary_result_count", 0) or 0),
+            fallback_count=int(diagnostics.get("fallback_result_count", 0) or 0),
+        )
+
+    def _log_filter_diagnostics(
+        self,
+        processo: str,
+        document_type: DocumentTypeSpec,
+        termo: str,
+        *,
+        outcome: str,
+        exc: Exception | None = None,
+    ) -> str:
+        diagnostics = self._collect_pesquisa_diagnostics()
+        detail = self._format_pesquisa_diagnostics(diagnostics)
+        log_label = document_type.log_label
+        if outcome == "zero_results":
+            self.logger.info(
+                "Processo %s: %s termo '%s' sem resultado no filtro. %s",
+                processo,
+                log_label,
+                termo,
+                detail,
+            )
+        elif outcome == "stagnation":
+            self.logger.warning(
+                "Processo %s: %s termo '%s' entrou em estagnacao no filtro. %s erro=%s",
+                processo,
+                log_label,
+                termo,
+                detail,
+                exc,
+            )
+        else:
+            self.logger.warning(
+                "Processo %s: %s termo '%s' falhou no filtro (%s). %s erro=%s",
+                processo,
+                log_label,
+                termo,
+                outcome,
+                detail,
+                exc,
+            )
+        return f"outcome={outcome}; {detail}"
+
+    def _log_pt_filter_diagnostics(
+        self,
+        processo: str,
+        termo: str,
+        *,
+        outcome: str,
+        exc: Exception | None = None,
+    ) -> str:
+        document_type = self._get_document_type("pt")
+        if document_type is None:
+            diagnostics = self._collect_pesquisa_diagnostics()
+            return f"outcome={outcome}; {self._format_pesquisa_diagnostics(diagnostics)}"
+        return self._log_filter_diagnostics(
+            processo,
+            document_type,
+            termo,
+            outcome=outcome,
+            exc=exc,
+        )
+
+    def _record_document_search_outcome(
+        self,
+        processo: str,
+        document_type: DocumentTypeSpec,
+        collection_context: Dict[str, Any],
+    ) -> None:
+        recorder = getattr(document_type.handler, "record_search_outcome", None)
+        if callable(recorder):
+            recorder(
+                spec=document_type,
+                processo=processo,
+                collection_context=collection_context,
+            )
+
+    def _record_document_extraction_failure(
+        self,
+        processo: str,
+        protocolo_documento: str,
+        document_type: DocumentTypeSpec,
+        collection_context: Dict[str, Any],
+    ) -> None:
+        recorder = getattr(document_type.handler, "record_extraction_failure", None)
+        if callable(recorder):
+            recorder(
+                spec=document_type,
+                processo=processo,
+                protocolo_documento=protocolo_documento,
+                collection_context=collection_context,
+            )
+
+    def _search_document_in_filter(
+        self,
+        processo: str,
+        document_type: DocumentTypeSpec,
+    ) -> Tuple[Optional[document_search.SearchHit], str, Dict[str, Any]]:
+        process_url = (self.driver.current_url or "").strip()
+        search_terms = self._iter_unique_search_terms(document_type)
+        termo_encontrado = ""
+        collection_context = self._build_collection_context(
+            found=False,
+            found_in="filter",
+            search_term="|".join(search_terms),
+            results_count=0,
+            selection_reason="no_results_in_filter",
+            selection_detail=f"nenhum termo de {document_type.log_label} retornou resultado no filtro",
+        )
+
+        for index, termo in enumerate(search_terms):
+            if index > 0:
+                self.logger.info(
+                    "Processo %s: reabrindo filtro em sessao limpa para %s com termo '%s'.",
+                    processo,
+                    document_type.display_name,
+                    termo,
+                )
+                try:
+                    self._restore_process_base_context(
+                        processo,
+                        process_url=process_url,
+                        reason=f"nova sessao de filtro {document_type.log_label} ({termo})",
+                    )
+                    self._ensure_document_search_open(processo, document_type)
+                except (TimeoutException, RuntimeError, NoSuchElementException, WebDriverException) as exc:
+                    stagnated = self._is_search_context_stagnation_timeout(exc)
+                    if stagnated:
+                        self._process_filter_degraded[processo] = True
+                    detail = self._log_filter_diagnostics(
+                        processo,
+                        document_type,
+                        termo,
+                        outcome="stagnation" if stagnated else "filter_reopen_error",
+                        exc=exc,
+                    )
+                    collection_context = self._build_collection_context(
+                        found=False,
+                        found_in="filter",
+                        search_term=termo,
+                        results_count=0,
+                        selection_reason=(
+                            "search_context_stagnation" if stagnated else "filter_reopen_error"
+                        ),
+                        selection_detail=detail,
+                        extraction_error=str(exc),
+                    )
+                    if stagnated:
+                        return (None, "", collection_context)
+                    continue
+
+            try:
+                hit = self.buscar_documento_mais_recente_no_filtro(
+                    termo=termo,
+                    timeout_seconds=self.timeout_seconds,
+                )
+            except (TimeoutException, NoSuchElementException) as exc:
+                stagnated = self._is_search_context_stagnation_timeout(exc)
+                if stagnated:
+                    self._process_filter_degraded[processo] = True
+                detail = self._log_filter_diagnostics(
+                    processo,
+                    document_type,
+                    termo,
+                    outcome="stagnation" if stagnated else "filter_error",
+                    exc=exc,
+                )
+                collection_context = self._build_collection_context(
+                    found=False,
+                    found_in="filter",
+                    search_term=termo,
+                    results_count=0,
+                    selection_reason="search_context_stagnation" if stagnated else "search_open_error",
+                    selection_detail=detail,
+                    extraction_error=str(exc),
+                )
+                if stagnated:
+                    return (None, "", collection_context)
+                continue
+
+            if hit is None:
+                detail = self._log_filter_diagnostics(
+                    processo,
+                    document_type,
+                    termo,
+                    outcome="zero_results",
+                )
+                collection_context = self._build_collection_context(
+                    found=False,
+                    found_in="filter",
+                    search_term=termo,
+                    results_count=0,
+                    selection_reason="no_results_in_filter",
+                    selection_detail=detail,
+                )
+                continue
+
+            termo_encontrado = termo
+            collection_context = self._build_collection_context(
+                found=True,
+                found_in="filter",
+                search_term=termo,
+                results_count=hit.total_resultados,
+                chosen_documento=hit.protocolo,
+                selection_reason=hit.selection_reason,
+                selection_detail=f"position={hit.selected_position} total={hit.total_resultados}",
+            )
+            return (hit, termo_encontrado, collection_context)
+
+        return (None, termo_encontrado, collection_context)
+
+    def _search_pt_document_in_filter(
+        self,
+        processo: str,
+        document_type: DocumentTypeSpec,
+    ) -> Tuple[Optional[document_search.SearchHit], str, Dict[str, Any]]:
+        return self._search_document_in_filter(processo, document_type)
+
+    def _score_tree_candidate(
+        self,
+        document_type: DocumentTypeSpec,
+        raw_text: str,
+    ) -> Tuple[int, List[str]]:
+        normalized = self._normalize_text(raw_text)
+        if not normalized:
+            return (0, [])
+
+        matched_terms: List[str] = []
+        score = 0
+        for idx, term in enumerate(document_type.tree_match_terms):
+            normalized_term = self._normalize_text(term)
+            if not normalized_term or normalized_term not in normalized:
+                continue
+            matched_terms.append(term)
+            score += max(5, len(normalized_term)) + max(0, 40 - idx)
+
+        if not matched_terms:
+            return (0, [])
+
+        penalty_markers = (
+            "E-MAIL",
+            "EMAIL",
+            "CORREIO ELETRONICO",
+            "PLANILHA",
+            "XLS",
+            "XLSX",
+            "CSV",
+        )
+        if any(marker in normalized for marker in penalty_markers):
+            score -= 200
+
+        return (score, matched_terms)
+
+    def _find_document_candidates_in_tree(
+        self,
+        document_type: DocumentTypeSpec,
+    ) -> List[Dict[str, Any]]:
+        xpaths = self.selectors.get_many("processo.documentos_do_processo_links")
 
         try:
             self.driver.switch_to.default_content()
             iframe = self.driver.find_element(By.XPATH, "//iframe[@id='ifrArvore' or @name='ifrArvore']")
             self.driver.switch_to.frame(iframe)
         except WebDriverException as exc:
-            self.logger.info("Fallback arvore PT: nao foi possivel entrar no ifrArvore (%s).", exc)
-            return None
+            self.logger.info(
+                "Fallback arvore %s: nao foi possivel entrar no ifrArvore (%s).",
+                document_type.log_label,
+                exc,
+            )
+            return []
 
-        candidates: List[Tuple[int, Any, str]] = []
+        candidates_by_text: Dict[str, Dict[str, Any]] = {}
         for xpath in xpaths:
             try:
                 elems = self.driver.find_elements(By.XPATH, xpath)
@@ -462,94 +1133,306 @@ class SEIScraper:
                 except WebDriverException:
                     continue
                 normalized = self._normalize_text(raw_text)
-                if not normalized:
-                    continue
-                score = -1
-                for idx, term in enumerate(preferred_terms):
-                    if term in normalized:
-                        score = len(preferred_terms) - idx
-                        break
+                score, matched_terms = self._score_tree_candidate(document_type, raw_text)
                 if score <= 0:
                     continue
-                candidates.append((score, elem, raw_text))
-            if candidates:
+                detail = {
+                    "text": raw_text,
+                    "normalized_text": normalized,
+                    "score": score,
+                    "matched_terms": matched_terms,
+                }
+                current = candidates_by_text.get(normalized)
+                if current is None or int(current.get("score", 0)) < score:
+                    candidates_by_text[normalized] = detail
+            if candidates_by_text:
                 break
-
-        if not candidates:
-            self.logger.info("Fallback arvore PT: nenhum documento com 'PLANO DE TRABALHO' encontrado na arvore.")
-            return None
-
-        candidates.sort(key=lambda item: item[0], reverse=True)
-        chosen = candidates[0]
-        self.logger.info(
-            "Fallback arvore PT: candidato selecionado texto='%s' score=%d.",
-            chosen[2],
-            chosen[0],
-        )
-        return chosen[1]
-
-    def _abrir_plano_trabalho_pela_arvore(self, processo: str) -> bool:
-        link = self._find_plano_trabalho_link_in_tree()
-        if link is None:
-            return False
-
-        try:
-            self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", link)
-        except WebDriverException:
-            pass
-
-        try:
-            link.click()
-        except WebDriverException:
-            try:
-                self.driver.execute_script("arguments[0].click();", link)
-            except WebDriverException as exc:
-                self.logger.warning("Processo %s: falha ao clicar no PT pela arvore (%s).", processo, exc)
-                return False
 
         try:
             self.driver.switch_to.default_content()
         except WebDriverException:
             pass
 
-        time.sleep(1.2)
-        self.logger.info("Processo %s: documento aberto via arvore do processo.", processo)
-        self._extract_and_save_plano_trabalho_snapshot(
-            processo=processo,
-            protocolo_documento=processo,
+        candidates = sorted(
+            candidates_by_text.values(),
+            key=lambda item: (-int(item.get("score", 0)), str(item.get("text", ""))),
         )
-        return True
+        if not candidates:
+            self.logger.info(
+                "Fallback arvore %s: nenhum documento correspondente encontrado na arvore.",
+                document_type.log_label,
+            )
+            return []
 
-    def _buscar_e_abrir_plano_de_trabalho_mais_recente(self, processo: str) -> None:
-        termo = "PLANO DE TRABALHO - PT"
+        self.logger.info(
+            "Fallback arvore %s: %d candidato(s) ranqueado(s); melhor candidato texto='%s' score=%d termos=%s.",
+            document_type.log_label,
+            len(candidates),
+            candidates[0]["text"],
+            candidates[0]["score"],
+            "|".join(candidates[0]["matched_terms"]),
+        )
+        return candidates
+
+    def _find_document_link_in_tree(self, document_type: DocumentTypeSpec) -> Optional[Tuple[Any, Dict[str, Any]]]:
+        candidates = self._find_document_candidates_in_tree(document_type)
+        if not candidates:
+            return None
+        link = self._locate_tree_link_by_text(candidates[0]["text"])
+        if link is None:
+            return None
+        context = self._build_collection_context(
+            found=True,
+            found_in="tree",
+            search_term="|".join(document_type.tree_match_terms),
+            results_count=len(candidates),
+            chosen_documento=candidates[0]["text"],
+            selection_reason="highest_tree_match_score",
+            selection_detail=(
+                f"score={candidates[0]['score']} termos={'|'.join(candidates[0]['matched_terms'])}"
+            ),
+        )
+        return (link, context)
+
+    def _locate_tree_link_by_text(self, target_text: str) -> Optional[Any]:
+        target_normalized = self._normalize_text(target_text)
+        if not target_normalized:
+            return None
+
+        xpaths = self.selectors.get_many("processo.documentos_do_processo_links")
+        try:
+            self.driver.switch_to.default_content()
+            iframe = self.driver.find_element(By.XPATH, "//iframe[@id='ifrArvore' or @name='ifrArvore']")
+            self.driver.switch_to.frame(iframe)
+        except WebDriverException:
+            return None
+
+        for xpath in xpaths:
+            try:
+                elems = self.driver.find_elements(By.XPATH, xpath)
+            except WebDriverException:
+                continue
+            for elem in elems:
+                try:
+                    raw_text = (elem.text or "").strip()
+                except WebDriverException:
+                    continue
+                if self._normalize_text(raw_text) == target_normalized:
+                    return elem
+
+        try:
+            self.driver.switch_to.default_content()
+        except WebDriverException:
+            pass
+        return None
+
+    def _open_document_via_tree(
+        self,
+        processo: str,
+        document_type: DocumentTypeSpec,
+        *,
+        process_url: Optional[str] = None,
+    ) -> bool:
+        candidates = self._find_document_candidates_in_tree(document_type)
+        if not candidates:
+            return False
+
+        base_process_url = (process_url or self.driver.current_url or "").strip()
+        for attempt_index, candidate in enumerate(candidates, start=1):
+            if attempt_index > 1:
+                try:
+                    self._restore_process_base_context(
+                        processo,
+                        process_url=base_process_url,
+                        reason=f"novo candidato da arvore para {document_type.log_label}",
+                    )
+                except Exception as exc:
+                    self.logger.warning(
+                        "Processo %s: falha ao restaurar contexto antes do candidato #%d da arvore para %s (%s).",
+                        processo,
+                        attempt_index,
+                        document_type.log_label,
+                        exc,
+                    )
+                    return False
+
+            link = self._locate_tree_link_by_text(str(candidate.get("text", "")))
+            if link is None:
+                self.logger.warning(
+                    "Processo %s: candidato #%d da arvore para %s nao foi reencontrado (texto='%s').",
+                    processo,
+                    attempt_index,
+                    document_type.log_label,
+                    candidate.get("text", ""),
+                )
+                continue
+
+            try:
+                self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", link)
+            except WebDriverException:
+                pass
+
+            try:
+                link.click()
+            except WebDriverException:
+                try:
+                    self.driver.execute_script("arguments[0].click();", link)
+                except WebDriverException as exc:
+                    self.logger.warning(
+                        "Processo %s: falha ao clicar no candidato #%d da arvore para %s (%s).",
+                        processo,
+                        attempt_index,
+                        document_type.log_label,
+                        exc,
+                    )
+                    continue
+
+            try:
+                self.driver.switch_to.default_content()
+            except WebDriverException:
+                pass
+
+            self.logger.info(
+                "Processo %s: documento aberto via arvore do processo. candidato=%d/%d texto='%s' score=%s",
+                processo,
+                attempt_index,
+                len(candidates),
+                candidate.get("text", ""),
+                candidate.get("score", 0),
+            )
+            collection_context = self._build_collection_context(
+                found=True,
+                found_in="tree",
+                search_term="|".join(document_type.tree_match_terms),
+                results_count=len(candidates),
+                chosen_documento=str(candidate.get("text", "") or ""),
+                selection_reason="highest_tree_match_score",
+                selection_detail=(
+                    f"rank={attempt_index}/{len(candidates)} "
+                    f"score={candidate.get('score', 0)} "
+                    f"termos={'|'.join(candidate.get('matched_terms', []))}"
+                ),
+            )
+            snapshot_saved = self._extract_and_process_document_snapshot(
+                processo=processo,
+                protocolo_documento=processo,
+                document_type=document_type,
+                collection_context=collection_context,
+            )
+            if snapshot_saved:
+                try:
+                    self._restore_process_base_context(
+                        processo,
+                        process_url=base_process_url,
+                        reason=f"apos fallback pela arvore ({document_type.log_label})",
+                    )
+                except Exception as exc:
+                    self.logger.warning(
+                        "Processo %s: falha ao restaurar contexto apos fallback pela arvore de %s (%s).",
+                        processo,
+                        document_type.display_name,
+                        exc,
+                    )
+                return True
+
+            self.logger.warning(
+                "Processo %s: candidato da arvore rejeitado apos validar snapshot para %s. texto='%s'",
+                processo,
+                document_type.log_label,
+                candidate.get("text", ""),
+            )
+
+        try:
+            self._restore_process_base_context(
+                processo,
+                process_url=base_process_url,
+                reason=f"apos esgotar candidatos da arvore ({document_type.log_label})",
+            )
+        except Exception as exc:
+            self.logger.warning(
+                "Processo %s: falha ao restaurar contexto apos esgotar candidatos da arvore de %s (%s).",
+                processo,
+                document_type.display_name,
+                exc,
+            )
+        return False
+
+    def _buscar_e_abrir_documento_mais_recente(
+        self,
+        processo: str,
+        document_type: DocumentTypeSpec,
+    ) -> None:
+        termo_encontrado = ""
+        collection_context = self._build_collection_context(found=False, found_in="filter")
         handles_before_click: Set[str] = set()
         processo_handle = ""
         opened_doc_handles: Set[str] = set()
+        process_url = (self.driver.current_url or "").strip()
         try:
             self.logger.info(
                 "Processo %s: iniciando busca do documento '%s'. contexto_pre_busca url=%s title=%s handles=%d",
                 processo,
-                termo,
+                document_type.display_name,
                 self.driver.current_url,
                 self.driver.title,
                 len(self.driver.window_handles),
             )
             processo_handle = self.driver.current_window_handle
-            hit = self.buscar_documento_mais_recente_no_filtro(
-                termo=termo,
-                timeout_seconds=self.timeout_seconds,
+            hit: Optional[document_search.SearchHit] = None
+            search_terms = self._iter_unique_search_terms(document_type)
+            if len(search_terms) != len(document_type.search_terms):
+                self.logger.info(
+                    "Processo %s: termos de busca %s deduplicados de %d para %d.",
+                    processo,
+                    document_type.log_label,
+                    len(document_type.search_terms),
+                    len(search_terms),
+                )
+
+            hit, termo_encontrado, collection_context = self._search_document_in_filter(
+                processo,
+                document_type,
             )
             if hit is None:
-                self.logger.info("Processo %s: %s nao encontrado no filtro; tentando fallback pela arvore.", processo, termo)
-                if self._abrir_plano_trabalho_pela_arvore(processo):
+                self.logger.info(
+                    "Processo %s: %s nao encontrado no filtro; tentando fallback pela arvore.",
+                    processo,
+                    document_type.display_name,
+                )
+                if self._open_document_via_tree(processo, document_type, process_url=process_url):
+                    self.logger.info(
+                        "Processo %s: %s recuperado via arvore apos filtro (%s).",
+                        processo,
+                        document_type.log_label,
+                        collection_context.get("selection_reason", "no_results_in_filter"),
+                    )
                     return
-                self.logger.info("Processo %s: nenhum PT localizado nem no filtro nem na arvore; seguindo.", processo)
+                collection_context = self._build_collection_context(
+                    found=False,
+                    found_in="none",
+                    search_term="|".join(document_type.search_terms),
+                    results_count=0,
+                    selection_reason="not_found_after_filter_and_tree",
+                    selection_detail=(
+                        "nao encontrado no filtro nem na arvore; "
+                        f"motivo_filtro={collection_context.get('selection_reason', 'no_results_in_filter')}"
+                    ),
+                    extraction_error=collection_context.get("extraction_error", ""),
+                )
+                self._record_document_search_outcome(processo, document_type, collection_context)
+                self.logger.info(
+                    "Processo %s: nenhum %s localizado nem no filtro nem na arvore; seguindo.",
+                    processo,
+                    document_type.log_label,
+                )
                 return
             self.logger.info(
-                "Processo %s: documento encontrado para '%s' (%s).",
+                "Processo %s: documento encontrado para '%s' (%s). resultados=%d motivo=%s",
                 processo,
-                termo,
+                termo_encontrado or document_type.display_name,
                 hit.protocolo,
+                hit.total_resultados,
+                hit.selection_reason,
             )
             handles_before_click = set(self.driver.window_handles)
             self.abrir_documento_mais_recente_no_filtro(timeout_seconds=self.timeout_seconds)
@@ -564,7 +1447,7 @@ class SEIScraper:
             )
             switched_handle = self._switch_to_newly_opened_window(
                 handles_before=handles_before_click,
-                reason=f"PT {processo}",
+                reason=f"{document_type.log_label} {processo}",
             )
             if switched_handle:
                 opened_doc_handles.add(switched_handle)
@@ -578,18 +1461,90 @@ class SEIScraper:
             self.logger.info(
                 "Processo %s: documento mais recente de '%s' aberto (%s).",
                 processo,
-                termo,
+                termo_encontrado or document_type.display_name,
                 hit.protocolo,
             )
-            self._extract_and_save_plano_trabalho_snapshot(
+            snapshot_saved = self._extract_and_process_document_snapshot(
                 processo=processo,
                 protocolo_documento=hit.protocolo,
+                document_type=document_type,
+                collection_context=collection_context,
             )
+            if snapshot_saved:
+                return
+
+            self.logger.warning(
+                "Processo %s: snapshot do primeiro resultado do filtro foi rejeitado para %s; tentando fallback pela arvore.",
+                processo,
+                document_type.log_label,
+            )
+            collection_context = self._build_collection_context(
+                found=False,
+                found_in="filter",
+                search_term=collection_context.get("search_term", termo_encontrado or document_type.display_name),
+                results_count=collection_context.get("results_count", 0),
+                chosen_documento=collection_context.get("chosen_documento", hit.protocolo),
+                selection_reason="invalid_snapshot_after_filter",
+                selection_detail="resultado abriu conteudo invalido; fallback arvore",
+            )
+            try:
+                self._restore_process_base_context(
+                    processo,
+                    process_url=process_url,
+                    reason=f"snapshot invalido apos filtro ({document_type.log_label})",
+                )
+                self._ensure_document_search_open(processo, document_type)
+            except Exception as exc:
+                self.logger.warning(
+                    "Processo %s: falha ao restaurar contexto apos snapshot invalido no filtro para %s (%s).",
+                    processo,
+                    document_type.log_label,
+                    exc,
+                )
+            if self._open_document_via_tree(processo, document_type, process_url=process_url):
+                self.logger.info(
+                    "Processo %s: %s recuperado via arvore apos filtro invalido.",
+                    processo,
+                    document_type.log_label,
+                )
+                return
+            collection_context = self._build_collection_context(
+                found=False,
+                found_in="none",
+                search_term="|".join(document_type.search_terms),
+                results_count=0,
+                chosen_documento=hit.protocolo,
+                selection_reason="invalid_snapshot_after_filter_and_tree",
+                selection_detail="resultado do filtro invalido e nenhum candidato valido na arvore",
+            )
+            self._record_document_search_outcome(processo, document_type, collection_context)
         except (TimeoutException, NoSuchElementException) as exc:
+            if self._is_search_context_stagnation_timeout(exc):
+                self._process_filter_degraded[processo] = True
+                self.logger.warning(
+                    "Processo %s: busca do filtro para %s entrou em estagnacao; o contexto do processo foi marcado como degradado.",
+                    processo,
+                    document_type.display_name,
+                )
+            collection_context = self._build_collection_context(
+                found=bool(collection_context.get("found")),
+                found_in=collection_context.get("found_in", "filter"),
+                search_term=collection_context.get("search_term", termo_encontrado or document_type.display_name),
+                results_count=collection_context.get("results_count", 0),
+                chosen_documento=collection_context.get("chosen_documento", ""),
+                selection_reason=(
+                    "search_context_stagnation"
+                    if self._is_search_context_stagnation_timeout(exc)
+                    else collection_context.get("selection_reason", "search_open_error")
+                ),
+                selection_detail=collection_context.get("selection_detail", ""),
+                extraction_error=str(exc),
+            )
+            self._record_document_search_outcome(processo, document_type, collection_context)
             self.logger.warning(
                 "Processo %s: falha resiliente ao buscar/abrir '%s' (%s); seguindo.",
                 processo,
-                termo,
+                termo_encontrado or document_type.display_name,
                 exc,
             )
         finally:
@@ -598,6 +1553,27 @@ class SEIScraper:
                 opened_doc_handles=opened_doc_handles,
                 preferred_return_handle=processo_handle,
             )
+
+    def _find_plano_trabalho_link_in_tree(self) -> Optional[Any]:
+        document_type = self._get_document_type("pt")
+        if document_type is None:
+            return None
+        tree_result = self._find_document_link_in_tree(document_type)
+        if tree_result is None:
+            return None
+        return tree_result[0]
+
+    def _abrir_plano_trabalho_pela_arvore(self, processo: str) -> bool:
+        document_type = self._get_document_type("pt")
+        if document_type is None:
+            return False
+        return self._open_document_via_tree(processo, document_type)
+
+    def _buscar_e_abrir_plano_de_trabalho_mais_recente(self, processo: str) -> None:
+        document_type = self._get_document_type("pt")
+        if document_type is None:
+            return
+        self._buscar_e_abrir_documento_mais_recente(processo, document_type)
 
     def _switch_to_newly_opened_window(
         self,
@@ -856,6 +1832,12 @@ class SEIScraper:
                 pass
         return []
 
+    def _get_current_interno_page_signature(self) -> tuple[str, int] | None:
+        sel = self.selectors.get("interno", {})
+        x_rows = sel.get("tabela_blocos_rows") or "//tr[td]"
+        rows = self._find_elements_any_context(x_rows)
+        return _build_rows_signature(rows)
+
     def _collect_interno_rows_current_page(self, page: int) -> List[InternoRow]:
         sel = self.selectors.get("interno", {})
         x_rows = sel.get("tabela_blocos_rows") or "//tr[td]"
@@ -929,6 +1911,7 @@ class SEIScraper:
 
     def _click_next_page_if_available(self, page: int) -> bool:
         sel = self.selectors.get("interno", {})
+        previous_signature = self._get_current_interno_page_signature()
         candidates = [
             sel.get("paginacao_proxima"),
             "//a[@title='Proxima' or @title='Próxima']",
@@ -952,7 +1935,13 @@ class SEIScraper:
                         continue
                     elem.click()
                     self.logger.info("Paginacao: avancando para pagina %d", page + 1)
-                    time.sleep(0.8)
+                    if _wait_for_page_signature_change(
+                        self._get_current_interno_page_signature,
+                        previous_signature,
+                        elem,
+                    ):
+                        return True
+                    time.sleep(PAGINATION_SETTLE_SLEEP_SECONDS)
                     return True
                 except (StaleElementReferenceException, WebDriverException):
                     continue
@@ -1451,137 +2440,118 @@ class SEIScraper:
             output_dir = backend_root / output_dir
         return output_dir
 
-    def _sanitize_filename_part(self, value: str, fallback: str = "sem_id") -> str:
-        cleaned = re.sub(r"[^\w.-]+", "_", (value or "").strip())
-        cleaned = cleaned.strip("_")
-        if not cleaned:
-            return fallback
-        return cleaned[:80]
-
-    def _save_document_snapshot_json(
-        self,
-        processo: str,
-        protocolo_documento: str,
-        snapshot: Dict[str, Any],
-        prazos: Dict[str, str],
-    ) -> Optional[Path]:
+    def _finalize_document_runs(self) -> None:
         output_dir = self._resolve_preview_output_dir()
-        csv_writer.ensure_output_dir(output_dir)
-
-        processo_id = self._sanitize_filename_part(processo, fallback="sem_processo")
-        filename = f"plano_trabalho_{processo_id}.json"
-        filepath = output_dir / filename
-
-        payload: Dict[str, Any] = {
-            "captured_at": datetime.now().isoformat(timespec="seconds"),
-            "processo": processo,
-            "documento": protocolo_documento,
-            "snapshot": snapshot,
-            "prazos": prazos,
-        }
-
-        try:
-            filepath.write_text(
-                json.dumps(payload, ensure_ascii=False, indent=2),
-                encoding="utf-8",
+        for document_type in self.document_types:
+            document_type.handler.finalize_run(
+                spec=document_type,
+                output_dir=output_dir,
+                logger=self.logger,
+                settings=self.settings,
             )
-            return filepath
-        except Exception as exc:
-            self.logger.warning(
-                "Processo %s: falha ao salvar snapshot do documento (%s).",
-                processo,
-                exc,
-            )
-            return None
-
-    def _register_pt_tracking_record(
-        self,
-        processo: str,
-        protocolo_documento: str,
-        snapshot: Dict[str, Any],
-        prazos: Dict[str, str],
-        output_path: Optional[Path],
-    ) -> None:
-        inicio_found = bool(prazos.get("inicio_data") or prazos.get("inicio_raw"))
-        termino_found = bool(prazos.get("termino_data") or prazos.get("termino_raw"))
-        sem_prazo = not (inicio_found and termino_found)
-        record: Dict[str, Any] = {
-            "captured_at": datetime.now().isoformat(timespec="seconds"),
-            "processo": processo,
-            "documento": protocolo_documento,
-            "snapshot_mode": (snapshot.get("extraction_mode", "") or ""),
-            "text_chars": len(snapshot.get("text", "") or ""),
-            "tables_count": len(snapshot.get("tables", []) or []),
-            "prazos_status": (prazos.get("status", "") or ""),
-            "inicio_data": (prazos.get("inicio_data", "") or ""),
-            "inicio_raw": (prazos.get("inicio_raw", "") or ""),
-            "termino_data": (prazos.get("termino_data", "") or ""),
-            "termino_raw": (prazos.get("termino_raw", "") or ""),
-            "tem_inicio": inicio_found,
-            "tem_termino": termino_found,
-            "sem_prazo": sem_prazo,
-            "json_path": str(output_path) if output_path else "",
-        }
-        self._pt_tracking_records.append(record)
 
     def _save_pt_tracking_reports(self) -> None:
-        if not self._pt_tracking_records:
+        document_type = self._get_document_type("pt")
+        if document_type is None:
             return
-
-        output_dir = self._resolve_preview_output_dir()
-        csv_writer.ensure_output_dir(output_dir)
-
-        all_columns = [
-            "captured_at",
-            "processo",
-            "documento",
-            "snapshot_mode",
-            "text_chars",
-            "tables_count",
-            "prazos_status",
-            "inicio_data",
-            "inicio_raw",
-            "termino_data",
-            "termino_raw",
-            "tem_inicio",
-            "tem_termino",
-            "sem_prazo",
-            "json_path",
-        ]
-        all_path = output_dir / "pt_status_execucao_latest.csv"
-        csv_writer.write_csv(self._pt_tracking_records, all_path, columns=all_columns)
-
-        sem_records = [r for r in self._pt_tracking_records if bool(r.get("sem_prazo"))]
-        sem_path = output_dir / "pt_sem_prazo_latest.csv"
-        csv_writer.write_csv(sem_records, sem_path, columns=all_columns)
-
-        self.logger.info(
-            "Relatorio PT gerado: total=%d sem_prazo=%d arquivo=%s",
-            len(self._pt_tracking_records),
-            len(sem_records),
-            sem_path,
+        document_type.handler.finalize_run(
+            spec=document_type,
+            output_dir=self._resolve_preview_output_dir(),
+            logger=self.logger,
+            settings=self.settings,
         )
-        try:
-            export_result = export_normalized_csv(output_dir, logger=self.logger)
-            if export_result.get("latest_path"):
-                self.logger.info(
-                    "Relatorio PT normalizado gerado: registros=%d latest=%s",
-                    int(export_result.get("records", 0) or 0),
-                    export_result["latest_path"],
-                )
-        except Exception as exc:
-            self.logger.warning("Falha ao gerar CSV PT normalizado (%s).", exc)
 
-    def _extract_and_save_plano_trabalho_snapshot(
+    def _snapshot_contains_any_marker(self, value: str, markers: Tuple[str, ...]) -> bool:
+        normalized = self._normalize_text(value)
+        return any(self._normalize_text(marker) in normalized for marker in markers if marker)
+
+    def _snapshot_text_blob(
+        self,
+        snapshot: Dict[str, Any],
+        collection_context: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        parts = [
+            str((collection_context or {}).get("chosen_documento", "") or ""),
+            str(snapshot.get("title", "") or ""),
+            str(snapshot.get("url", "") or ""),
+            str(snapshot.get("text", "") or "")[:8000],
+        ]
+        return self._normalize_text(" ".join(part for part in parts if part))
+
+    def _looks_like_email_snapshot(
+        self,
+        snapshot: Dict[str, Any],
+        collection_context: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        blob = self._snapshot_text_blob(snapshot, collection_context)
+        selected_doc = self._normalize_text(str((collection_context or {}).get("chosen_documento", "") or ""))
+        title_blob = self._normalize_text(str(snapshot.get("title", "") or ""))
+        if any(marker in selected_doc or marker in title_blob for marker in ("E-MAIL", "EMAIL")):
+            return True
+
+        email_markers = ("ASSUNTO:", "PARA:", "DE:", "ENVIADO:", "ENVIADA:", "CC:", "CCO:")
+        hits = sum(1 for marker in email_markers if marker in blob)
+        return hits >= 3
+
+    def _validate_snapshot_for_document_type(
+        self,
+        document_type: DocumentTypeSpec,
+        snapshot: Dict[str, Any],
+        collection_context: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[bool, str]:
+        blob = self._snapshot_text_blob(snapshot, collection_context)
+        if not blob:
+            return (False, "snapshot_vazio")
+
+        invalid_search_markers = (
+            "PESQUISAR NO PROCESSO",
+            "TIPOS DE DOCUMENTOS DISPONIVEIS NESTE PROCESSO",
+            "VER CRITERIOS DE PESQUISA",
+        )
+        if any(marker in blob for marker in invalid_search_markers):
+            return (False, "pagina_de_pesquisa")
+
+        if "CLIQUE AQUI PARA VISUALIZAR O CONTEUDO DESTE DOCUMENTO EM UMA NOVA JANELA" in blob:
+            return (False, "stub_visualizacao")
+
+        if document_type.key == "act":
+            if self._looks_like_email_snapshot(snapshot, collection_context):
+                return (False, "email")
+
+            spreadsheet_markers = ("PLANILHA", ".XLS", ".XLSX", "MICROSOFT EXCEL")
+            if any(marker in blob for marker in spreadsheet_markers):
+                return (False, "planilha")
+
+            expected_markers = (
+                "ACORDO DE COOPERACAO TECNICA",
+                "MEMORANDO DE ENTENDIMENTOS",
+                "TERMO DE EXECUCAO DESCENTRALIZADA",
+                " TED ",
+            )
+            if not any(marker in blob for marker in expected_markers):
+                return (False, "conteudo_nao_compativel_com_act")
+            return (True, "ok")
+
+        if document_type.key == "pt":
+            if "PLANO DE TRABALHO" not in blob:
+                return (False, "conteudo_nao_compativel_com_pt")
+            return (True, "ok")
+
+        return (True, "ok")
+
+    def _extract_and_process_document_snapshot(
         self,
         processo: str,
         protocolo_documento: str,
-    ) -> None:
+        document_type: DocumentTypeSpec,
+        collection_context: Optional[Dict[str, Any]] = None,
+    ) -> bool:
         try:
             iframe_info = get_iframes_info(self.driver)
             self.logger.info(
-                "Processo %s: iniciando snapshot PT. contexto_pre_snapshot url=%s title=%s iframes=%d",
+                "Processo %s: iniciando snapshot %s. contexto_pre_snapshot url=%s title=%s iframes=%d",
                 processo,
+                document_type.log_label,
                 self.driver.current_url,
                 self.driver.title,
                 len(iframe_info),
@@ -1592,69 +2562,70 @@ class SEIScraper:
                 self.driver,
                 logger=self.logger,
             )
-            prazos = document_text_extractor.parse_prazos(snapshot.get("text", "") or "", logger=self.logger)
-            tables = snapshot.get("tables", [])
-            text = snapshot.get("text", "") or ""
-
-            inicio_found = bool(prazos.get("inicio_data") or prazos.get("inicio_raw"))
-            termino_found = bool(prazos.get("termino_data") or prazos.get("termino_raw"))
-            self.logger.info(
-                "Processo %s: snapshot extraido (texto_chars=%d, tabelas=%d, inicio=%s, termino=%s).",
-                processo,
-                len(text),
-                len(tables) if isinstance(tables, list) else 0,
-                "sim" if inicio_found else "nao",
-                "sim" if termino_found else "nao",
+            is_valid, invalid_reason = self._validate_snapshot_for_document_type(
+                document_type,
+                snapshot,
+                collection_context,
             )
-
-            if self.settings.export_raw_fields_csv:
-                try:
-                    output_dir = self._resolve_preview_output_dir()
-                    csv_writer.ensure_output_dir(output_dir)
-                    raw_fields = collect_raw_fields(text, tables if isinstance(tables, list) else [])
-                    raw_csv_path = output_dir / "pt_fields_raw.csv"
-                    export_raw_fields_csv(
-                        out_csv_path=str(raw_csv_path),
-                        processo_sei=processo,
-                        doc_title=(snapshot.get("title", "") or ""),
-                        doc_url=(snapshot.get("url", "") or ""),
-                        raw_fields=raw_fields,
-                        captured_at=datetime.now().isoformat(timespec="seconds"),
-                    )
-                    self.logger.info(
-                        "Processo %s: CSV raw atualizado em %s (+%d linha(s)).",
-                        processo,
-                        raw_csv_path,
-                        len(raw_fields),
-                    )
-                except Exception as exc:
-                    self.logger.warning(
-                        "Processo %s: falha ao exportar campos raw para CSV (%s).",
-                        processo,
-                        exc,
-                    )
-
-            output_path = self._save_document_snapshot_json(
+            if not is_valid:
+                self.logger.warning(
+                    "Processo %s: snapshot rejeitado para %s. motivo=%s titulo=%s url=%s texto_preview=%s",
+                    processo,
+                    document_type.log_label,
+                    invalid_reason,
+                    snapshot.get("title", ""),
+                    snapshot.get("url", ""),
+                    _compact_text(str(snapshot.get("text", "") or ""))[:280],
+                )
+                return False
+            output_path = document_type.handler.process_snapshot(
+                spec=document_type,
                 processo=processo,
                 protocolo_documento=protocolo_documento,
                 snapshot=snapshot,
-                prazos=prazos,
-            )
-            self._register_pt_tracking_record(
-                processo=processo,
-                protocolo_documento=protocolo_documento,
-                snapshot=snapshot,
-                prazos=prazos,
-                output_path=output_path,
+                collection_context=collection_context,
+                output_dir=self._resolve_preview_output_dir(),
+                logger=self.logger,
+                settings=self.settings,
             )
             if output_path:
-                self.logger.info("Processo %s: JSON do plano de trabalho salvo em %s", processo, output_path)
+                self.logger.info(
+                    "Processo %s: JSON do documento %s salvo em %s",
+                    processo,
+                    document_type.log_label,
+                    output_path,
+                )
+            return True
         except Exception as exc:
+            failure_context = dict(collection_context or {})
+            failure_context["captured_at"] = datetime.now().isoformat(timespec="seconds")
+            failure_context["extraction_error"] = str(exc)
+            self._record_document_extraction_failure(
+                processo=processo,
+                protocolo_documento=protocolo_documento,
+                document_type=document_type,
+                collection_context=failure_context,
+            )
             self.logger.warning(
                 "Processo %s: falha resiliente na extracao do documento aberto (%s).",
                 processo,
                 exc,
             )
+            return False
+
+    def _extract_and_save_plano_trabalho_snapshot(
+        self,
+        processo: str,
+        protocolo_documento: str,
+    ) -> None:
+        document_type = self._get_document_type("pt")
+        if document_type is None:
+            return
+        self._extract_and_process_document_snapshot(
+            processo=processo,
+            protocolo_documento=protocolo_documento,
+            document_type=document_type,
+        )
 
     def _save_preview_records_csv(self, records: List[Dict[str, str]]) -> Optional[Path]:
         if not records:
@@ -1773,10 +2744,3 @@ class SEIScraper:
                 )
         except WebDriverException as exc:
             self.logger.warning("Falha ao alternar para janela principal: %s", exc)
-
-    def _back_to_interno_list(self) -> None:
-        try:
-            self.driver.back()
-            time.sleep(1)
-        except Exception:
-            return
