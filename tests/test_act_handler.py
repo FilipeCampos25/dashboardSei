@@ -12,6 +12,7 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 
 from app.documents.act import build_act_document_type
+from app.documents.memorando import build_memorando_document_type
 
 
 class ACTHandlerTests(unittest.TestCase):
@@ -20,10 +21,14 @@ class ACTHandlerTests(unittest.TestCase):
         handler = spec.handler
         handler.reset_run()
         snapshot = {
-            "text": "Acordo de Cooperacao Tecnica entre orgaos.",
+            "text": (
+                "ACORDO DE COOPERACAO TECNICA No 1/2026 QUE ENTRE SI CELEBRAM A UNIAO, "
+                "REPRESENTADA PELO MINISTERIO DA DEFESA, POR INTERMEDIO DO CENSIPAM, E A VISIONA. "
+                "CLAUSULA PRIMEIRA - DO OBJETO. O objeto do presente Acordo de Cooperacao Tecnica e a cooperacao."
+            ),
             "tables": [{"rows": [["Clausula", "Valor"], ["Objeto", "Cooperacao tecnica"]]}],
             "extraction_mode": "html_dom",
-            "title": "ACT teste",
+            "title": "Acordo de Cooperacao Tecnica No 1/2026",
             "url": "https://sei.exemplo/documento",
         }
         settings = SimpleNamespace(export_raw_fields_csv=False)
@@ -59,6 +64,8 @@ class ACTHandlerTests(unittest.TestCase):
 
             payload = json.loads(output_path.read_text(encoding="utf-8"))
             self.assertEqual(payload["document_type"], "act")
+            self.assertEqual(payload["document_family"], "cooperacao")
+            self.assertEqual(payload["resolved_document_type"], "act")
             self.assertEqual(payload["processo"], "60090.000001/2026-00")
             self.assertEqual(payload["documento"], "123456")
             self.assertEqual(payload["collection"]["results_count"], 3)
@@ -83,6 +90,66 @@ class ACTHandlerTests(unittest.TestCase):
             self.assertEqual(rows[0]["chosen_documento"], "123456")
             self.assertEqual(rows[0]["selection_reason"], "primeiro_resultado_mais_recente")
             self.assertEqual(rows[0]["text_chars"], str(len(snapshot["text"])))
+            self.assertEqual(rows[0]["doc_class"], "act_final")
+            self.assertEqual(rows[0]["resolved_document_type"], "act")
+            self.assertEqual(rows[0]["snapshot_prefix"], "acordo_cooperacao_tecnica")
+            self.assertEqual(rows[0]["is_canonical_candidate"], "True")
+
+            normalized_path = output_dir / "act_normalizado_latest.csv"
+            audit_path = output_dir / "act_classificacao_latest.csv"
+            self.assertTrue(normalized_path.exists())
+            self.assertTrue(audit_path.exists())
+        finally:
+            shutil.rmtree(output_dir, ignore_errors=True)
+
+    def test_act_handler_saves_memorando_with_separate_prefix(self) -> None:
+        spec = build_memorando_document_type()
+        handler = spec.handler
+        handler.reset_run()
+        snapshot = {
+            "text": "Memorando de Entendimentos nº 1 que entre si celebram a União e o Estado de Roraima.",
+            "tables": [],
+            "extraction_mode": "html_dom",
+            "title": "Memorando de Entendimentos",
+            "url": "https://sei.exemplo/documento",
+        }
+        settings = SimpleNamespace(export_raw_fields_csv=False)
+        logger = logging.getLogger("act-handler-test")
+
+        output_dir = Path.cwd() / "tests" / "_tmp_act_handler_memorando"
+        if output_dir.exists():
+            shutil.rmtree(output_dir, ignore_errors=True)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            output_path = handler.process_snapshot(
+                spec=spec,
+                processo="60091.000060/2023-87",
+                protocolo_documento="6256843",
+                snapshot=snapshot,
+                collection_context={
+                    "captured_at": "2026-03-25T10:00:00",
+                    "found": True,
+                    "found_in": "filter",
+                    "search_term": "MEMORANDO DE ENTENDIMENTOS",
+                    "results_count": 6,
+                    "chosen_documento": "6256843",
+                    "selection_reason": "primeiro_resultado_mais_recente",
+                    "selection_detail": "position=1 total=6",
+                    "extraction_error": "",
+                },
+                output_dir=output_dir,
+                logger=logger,
+                settings=settings,
+            )
+            self.assertIsNotNone(output_path)
+            self.assertTrue(output_path.exists())
+            self.assertTrue(output_path.name.startswith("memorando_entendimentos_"))
+
+            payload = json.loads(output_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["document_type"], "memorando")
+            self.assertEqual(payload["document_family"], "cooperacao")
+            self.assertEqual(payload["resolved_document_type"], "memorando_entendimentos")
+            self.assertEqual(payload["analysis"]["doc_class"], "memorando")
         finally:
             shutil.rmtree(output_dir, ignore_errors=True)
 
@@ -127,6 +194,8 @@ class ACTHandlerTests(unittest.TestCase):
             self.assertEqual(rows[0]["found"], "False")
             self.assertEqual(rows[0]["selection_reason"], "not_found")
             self.assertEqual(rows[0]["results_count"], "0")
+            self.assertEqual(rows[0]["normalization_status"], "not_found")
+            self.assertEqual(rows[0]["discard_reason"], "not_found")
         finally:
             shutil.rmtree(output_dir, ignore_errors=True)
 

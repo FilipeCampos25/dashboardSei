@@ -30,6 +30,15 @@ from app.rpa.sei import process_navigation
 from app.rpa.sei import toolbar_actions
 from app.rpa.sei import document_search
 from app.rpa.sei import document_text_extractor
+from app.services.act_normalizer import (
+    DOC_CLASS_ACT_FINAL,
+    DOC_CLASS_EMAIL_OUTRO,
+    DOC_CLASS_MEMORANDO,
+    DOC_CLASS_STUB,
+    DOC_CLASS_TED,
+    TREE_PENALTY_MARKERS,
+    classify_act_snapshot,
+)
 from app.rpa.selenium_utils import (
     get_iframes_info,
     wait_for_clickable as selenium_wait_for_clickable,
@@ -1089,17 +1098,35 @@ class SEIScraper:
         if not matched_terms:
             return (0, [])
 
-        penalty_markers = (
-            "E-MAIL",
-            "EMAIL",
-            "CORREIO ELETRONICO",
-            "PLANILHA",
-            "XLS",
-            "XLSX",
-            "CSV",
-        )
-        if any(marker in normalized for marker in penalty_markers):
+        rejection_penalties = {
+            "e-mail": 220,
+            "email": 220,
+            "correio eletronico": 220,
+            "planilha": 220,
+            "xls": 220,
+            "xlsx": 220,
+            "csv": 220,
+        }
+        if any(marker in normalized for marker in rejection_penalties):
             score -= 200
+
+        if document_type.key == "act":
+            for marker in TREE_PENALTY_MARKERS:
+                if marker not in normalized:
+                    continue
+                score -= 40 if marker == "anexo" else 120
+            for marker in (
+                "portaria",
+                "publicacao",
+                "reuniao",
+                "termo aditivo",
+                "termo de adesao",
+                "plano de trabalho",
+                "memorando",
+                "termo de execucao descentralizada",
+            ):
+                if marker in normalized:
+                    score -= 180
 
         return (score, matched_terms)
 
@@ -2514,7 +2541,7 @@ class SEIScraper:
         if "CLIQUE AQUI PARA VISUALIZAR O CONTEUDO DESTE DOCUMENTO EM UMA NOVA JANELA" in blob:
             return (False, "stub_visualizacao")
 
-        if document_type.key == "act":
+        if document_type.key in {"act", "memorando", "ted"}:
             if self._looks_like_email_snapshot(snapshot, collection_context):
                 return (False, "email")
 
@@ -2522,14 +2549,16 @@ class SEIScraper:
             if any(marker in blob for marker in spreadsheet_markers):
                 return (False, "planilha")
 
-            expected_markers = (
-                "ACORDO DE COOPERACAO TECNICA",
-                "MEMORANDO DE ENTENDIMENTOS",
-                "TERMO DE EXECUCAO DESCENTRALIZADA",
-                " TED ",
-            )
-            if not any(marker in blob for marker in expected_markers):
+            analysis = classify_act_snapshot(snapshot, collection_context)
+            doc_class = analysis.get("doc_class", "")
+            if doc_class in {DOC_CLASS_STUB, DOC_CLASS_EMAIL_OUTRO}:
+                return (False, doc_class)
+            if document_type.key == "act" and doc_class != DOC_CLASS_ACT_FINAL:
                 return (False, "conteudo_nao_compativel_com_act")
+            if document_type.key == "memorando" and doc_class != DOC_CLASS_MEMORANDO:
+                return (False, "conteudo_nao_compativel_com_memorando")
+            if document_type.key == "ted" and doc_class != DOC_CLASS_TED:
+                return (False, "conteudo_nao_compativel_com_ted")
             return (True, "ok")
 
         if document_type.key == "pt":

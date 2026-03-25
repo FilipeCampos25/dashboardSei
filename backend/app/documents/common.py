@@ -26,9 +26,11 @@ def save_snapshot_json(
     output_dir: Path,
     logger: Any,
     extra_payload: Optional[dict[str, Any]] = None,
+    snapshot_prefix_override: Optional[str] = None,
 ) -> Optional[Path]:
     processo_id = sanitize_filename_part(processo, fallback="sem_processo")
-    filename = f"{spec.snapshot_prefix}_{processo_id}.json"
+    snapshot_prefix = snapshot_prefix_override or spec.snapshot_prefix
+    filename = f"{snapshot_prefix}_{processo_id}.json"
     filepath = output_dir / filename
     payload: Dict[str, Any] = {
         "captured_at": datetime.now().isoformat(timespec="seconds"),
