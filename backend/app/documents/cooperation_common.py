@@ -6,7 +6,12 @@ from typing import Any, Dict, List, Optional
 from app.documents.common import build_basic_tracking_record, save_snapshot_json
 from app.documents.types import DocumentTypeSpec
 from app.output import csv_writer
-from app.services.act_normalizer import classify_act_snapshot, export_normalized_csv
+from app.services.act_normalizer import (
+    PUBLICATION_STATUS_GOLD,
+    PUBLICATION_STATUS_SILVER,
+    classify_cooperation_snapshot,
+    export_normalized_csv,
+)
 
 
 class CooperationDocumentHandler:
@@ -26,12 +31,13 @@ class CooperationDocumentHandler:
         protocolo_documento: str,
         snapshot: dict[str, Any],
         collection_context: Optional[dict[str, Any]] = None,
+        analysis: Optional[dict[str, Any]] = None,
         output_dir: Path,
         logger: Any,
         settings: Any,
     ) -> Optional[Path]:
         csv_writer.ensure_output_dir(output_dir)
-        analysis = classify_act_snapshot(snapshot, collection_context)
+        analysis = analysis or classify_cooperation_snapshot(snapshot, spec.key, collection_context)
         resolved_document_type = analysis.get("resolved_document_type", "")
         snapshot_prefix = analysis.get("snapshot_prefix", spec.snapshot_prefix)
         output_path = save_snapshot_json(
@@ -46,6 +52,7 @@ class CooperationDocumentHandler:
                 "document_family": "cooperacao",
                 "resolved_document_type": resolved_document_type,
                 "snapshot_prefix": snapshot_prefix,
+                "requested_type": spec.key,
                 "collection": collection_context or {},
                 "analysis": analysis,
             },
@@ -60,10 +67,13 @@ class CooperationDocumentHandler:
         )
         record.update(
             {
+                "requested_type": spec.key,
                 "doc_class": analysis.get("doc_class", ""),
                 "resolved_document_type": resolved_document_type,
                 "snapshot_prefix": snapshot_prefix,
                 "is_canonical_candidate": bool(analysis.get("is_canonical_candidate")),
+                "validation_status": analysis.get("validation_status", ""),
+                "publication_status": analysis.get("publication_status", ""),
                 "normalization_status": analysis.get("normalization_status", ""),
                 "discard_reason": analysis.get("discard_reason", ""),
                 "classification_reason": analysis.get("classification_reason", ""),
@@ -91,6 +101,7 @@ class CooperationDocumentHandler:
             {
                 "captured_at": collection_context.get("captured_at", ""),
                 "document_type": spec.key,
+                "requested_type": spec.key,
                 "processo": processo,
                 "documento": collection_context.get("chosen_documento", ""),
                 "found": bool(collection_context.get("found")),
@@ -109,6 +120,8 @@ class CooperationDocumentHandler:
                 "resolved_document_type": "",
                 "snapshot_prefix": "",
                 "is_canonical_candidate": False,
+                "validation_status": "not_found",
+                "publication_status": PUBLICATION_STATUS_SILVER,
                 "normalization_status": "not_found",
                 "discard_reason": "not_found",
                 "classification_reason": "",
@@ -127,6 +140,7 @@ class CooperationDocumentHandler:
             {
                 "captured_at": collection_context.get("captured_at", ""),
                 "document_type": spec.key,
+                "requested_type": spec.key,
                 "processo": processo,
                 "documento": protocolo_documento,
                 "found": bool(collection_context.get("found")),
@@ -145,6 +159,8 @@ class CooperationDocumentHandler:
                 "resolved_document_type": "",
                 "snapshot_prefix": "",
                 "is_canonical_candidate": False,
+                "validation_status": "extraction_failure",
+                "publication_status": PUBLICATION_STATUS_SILVER,
                 "normalization_status": "extraction_failure",
                 "discard_reason": "extraction_failure",
                 "classification_reason": "",
@@ -166,6 +182,7 @@ class CooperationDocumentHandler:
         columns = [
             "captured_at",
             "document_type",
+            "requested_type",
             "processo",
             "documento",
             "found",
@@ -183,6 +200,8 @@ class CooperationDocumentHandler:
             "resolved_document_type",
             "snapshot_prefix",
             "is_canonical_candidate",
+            "validation_status",
+            "publication_status",
             "normalization_status",
             "discard_reason",
             "classification_reason",
@@ -197,6 +216,7 @@ class CooperationDocumentHandler:
             status_path,
         )
         if not self._export_act_normalized:
+            self._export_published_manifest(spec=spec, output_dir=output_dir)
             return
         try:
             export_result = export_normalized_csv(output_dir, logger=logger)
@@ -210,3 +230,40 @@ class CooperationDocumentHandler:
                 )
         except Exception as exc:
             logger.warning("Falha ao gerar CSV %s normalizado (%s).", spec.log_label, exc)
+
+    def _export_published_manifest(self, *, spec: DocumentTypeSpec, output_dir: Path) -> None:
+        published_rows = [
+            {
+                "captured_at": record.get("captured_at", ""),
+                "requested_type": record.get("requested_type", spec.key),
+                "processo": record.get("processo", ""),
+                "documento": record.get("documento", ""),
+                "resolved_document_type": record.get("resolved_document_type", ""),
+                "selection_reason": record.get("selection_reason", ""),
+                "classification_reason": record.get("classification_reason", ""),
+                "validation_status": record.get("validation_status", ""),
+                "publication_status": record.get("publication_status", ""),
+                "snapshot_mode": record.get("snapshot_mode", ""),
+                "json_path": record.get("json_path", ""),
+            }
+            for record in self._tracking_records
+            if record.get("publication_status") == PUBLICATION_STATUS_GOLD and record.get("json_path")
+        ]
+        filename = f"{spec.key}_normalizado_latest.csv"
+        csv_writer.write_csv(
+            published_rows,
+            output_dir / filename,
+            columns=[
+                "captured_at",
+                "requested_type",
+                "processo",
+                "documento",
+                "resolved_document_type",
+                "selection_reason",
+                "classification_reason",
+                "validation_status",
+                "publication_status",
+                "snapshot_mode",
+                "json_path",
+            ],
+        )

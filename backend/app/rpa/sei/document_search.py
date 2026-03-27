@@ -826,20 +826,107 @@ def _get_primeiro_resultado(
     selectors: XPathSelectors,
     timeout_seconds: int,
 ) -> Optional[Any]:
-    primary_xpath = _get_primary_result_xpath(selectors)
-    fallback_xpaths = _get_fallback_result_xpaths(selectors)
-    deadline = time.time() + max(1, int(timeout_seconds))
-    while time.time() < deadline:
-        primary = _find_elements_immediate_in_current_context(driver, primary_xpath)
-        if primary:
-            return primary[0]
+    return _get_resultado_por_posicao(
+        driver=driver,
+        selectors=selectors,
+        timeout_seconds=timeout_seconds,
+        position=1,
+    )
 
-        for xp in fallback_xpaths:
-            elems = _find_elements_immediate_in_current_context(driver, xp)
-            if elems:
-                return elems[0]
+
+def _dedupe_links(links: list[Any]) -> list[Any]:
+    deduped: list[Any] = []
+    seen: set[tuple[str, str]] = set()
+    for link in links:
+        try:
+            text = _norm(link.text)
+        except WebDriverException:
+            text = ""
+        href = _safe_get_attribute(link, "href")
+        key = (text, href)
+        if not text and not href:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(link)
+    return deduped
+
+
+def _collect_result_links(
+    driver: Any,
+    selectors: XPathSelectors,
+    timeout_seconds: int,
+) -> list[Any]:
+    deadline = time.time() + max(1, int(timeout_seconds))
+    primary_rows_xpath = _get_primary_result_rows_xpath(selectors)
+    fallback_row_xpaths = _get_fallback_result_rows_xpaths(selectors)
+    generic_link_xpaths = [
+        "//table[contains(@class,'pesquisaResultado')]//tr[.//a[normalize-space(.)!='']]//a[normalize-space(.)!=''][1]",
+        "//table[contains(@class,'pesquisaResultado')]//a[normalize-space(.)!='']",
+    ]
+
+    while time.time() < deadline:
+        rows = _find_elements_immediate_in_current_context(driver, primary_rows_xpath)
+        if not rows:
+            for xpath in fallback_row_xpaths:
+                rows = _find_elements_immediate_in_current_context(driver, xpath)
+                if rows:
+                    break
+        if rows:
+            row_links: list[Any] = []
+            for row in rows:
+                try:
+                    links = row.find_elements(By.XPATH, ".//a[normalize-space(.)!='']")
+                except WebDriverException:
+                    links = []
+                if links:
+                    row_links.append(links[0])
+            deduped = _dedupe_links(row_links)
+            if deduped:
+                return deduped
+
+        for xpath in generic_link_xpaths:
+            deduped = _dedupe_links(_find_elements_immediate_in_current_context(driver, xpath))
+            if deduped:
+                return deduped
+
         time.sleep(0.2)
-    return None
+    return []
+
+
+def _get_resultado_por_posicao(
+    driver: Any,
+    selectors: XPathSelectors,
+    timeout_seconds: int,
+    position: int,
+) -> Optional[Any]:
+    if position < 1:
+        return None
+    links = _collect_result_links(
+        driver=driver,
+        selectors=selectors,
+        timeout_seconds=timeout_seconds,
+    )
+    if position > len(links):
+        return None
+    return links[position - 1]
+
+
+def _build_search_hit(link: Any, position: int, total_resultados: int) -> SearchHit:
+    protocolo = _norm(getattr(link, "text", "") or "")
+    if not protocolo:
+        try:
+            row = link.find_element(By.XPATH, "./ancestor::tr[1]")
+            protocolo = _norm(row.text)
+        except WebDriverException:
+            protocolo = ""
+    return SearchHit(
+        protocolo=protocolo,
+        total_resultados=total_resultados,
+        selected_position=position,
+        selection_reason="resultado_ranqueado_por_data",
+    )
 
 
 def _contar_resultados(driver: Any, selectors: XPathSelectors) -> int:
@@ -878,11 +965,7 @@ def buscar_por_tipo_e_abrir_mais_recente(
         if not pesquisou:
             return False
 
-        first_link = _get_primeiro_resultado(
-            driver=driver,
-            selectors=selectors,
-            timeout_seconds=timeout_seconds,
-        )
+        first_link = _get_primeiro_resultado(driver=driver, selectors=selectors, timeout_seconds=timeout_seconds)
         if first_link is None:
             logger.info("Nenhum resultado encontrado para tipo: %s", tipo_exato)
             return False
@@ -924,36 +1007,55 @@ def buscar_documento_mais_recente(
     if not pesquisou:
         return None
 
-    first_link = _get_primeiro_resultado(
+    hits = listar_resultados_pesquisa(
+        driver=driver,
+        selectors=selectors,
+        logger=logger,
+        termo=termo,
+        timeout_seconds=timeout_seconds,
+    )
+    if not hits:
+        logger.info("Nenhum resultado encontrado para tipo: %s", termo)
+        return None
+    return hits[0]
+
+
+def listar_resultados_pesquisa(
+    driver: Any,
+    selectors: XPathSelectors,
+    logger: Any,
+    termo: str,
+    timeout_seconds: int = 20,
+) -> list[SearchHit]:
+    pesquisou = _executar_pesquisa_por_tipo_exato(
+        driver=driver,
+        selectors=selectors,
+        logger=logger,
+        tipo_exato=termo,
+        timeout_seconds=timeout_seconds,
+    )
+    if not pesquisou:
+        return []
+
+    links = _collect_result_links(
         driver=driver,
         selectors=selectors,
         timeout_seconds=timeout_seconds,
     )
-    if first_link is None:
+    if not links:
         logger.info("Nenhum resultado encontrado para tipo: %s", termo)
-        return None
+        return []
 
-    protocolo = _norm(first_link.text)
-    if not protocolo:
-        try:
-            row = first_link.find_element(By.XPATH, "./ancestor::tr[1]")
-            protocolo = _norm(row.text)
-        except WebDriverException:
-            protocolo = ""
-
-    total_resultados = _contar_resultados(driver, selectors)
+    total_resultados = max(_contar_resultados(driver, selectors), len(links))
+    hits = [_build_search_hit(link, index, total_resultados) for index, link in enumerate(links, start=1)]
     logger.info(
-        "Busca por tipo '%s': total_resultados=%d selecionado_mais_recente=%s",
+        "Busca por tipo '%s': total_resultados=%d candidatos=%d primeiro=%s",
         termo,
         total_resultados,
-        protocolo,
+        len(hits),
+        hits[0].protocolo,
     )
-    return SearchHit(
-        protocolo=protocolo,
-        total_resultados=total_resultados,
-        selected_position=1,
-        selection_reason="primeiro_resultado_mais_recente",
-    )
+    return hits
 
 
 def abrir_documento_mais_recente(
@@ -967,16 +1069,32 @@ def abrir_documento_mais_recente(
 
     Util quando voce ja chamou buscar_documento_mais_recente() e quer abrir imediatamente.
     """
-    first_link = _get_primeiro_resultado(
+    abrir_resultado_pesquisa_por_posicao(
+        driver=driver,
+        selectors=selectors,
+        logger=logger,
+        position=1,
+        timeout_seconds=timeout_seconds,
+    )
+
+
+def abrir_resultado_pesquisa_por_posicao(
+    driver: Any,
+    selectors: XPathSelectors,
+    logger: Any,
+    position: int,
+    timeout_seconds: int = 20,
+) -> None:
+    target_link = _get_resultado_por_posicao(
         driver=driver,
         selectors=selectors,
         timeout_seconds=timeout_seconds,
+        position=position,
     )
-    if first_link is None:
+    if target_link is None:
         raise TimeoutException("Nenhum resultado disponivel para abrir")
-
-    link_preview = _norm(first_link.text)
-    logger.info("Abrir documento mais recente: link_identificado='%s'", link_preview)
-    _click_element(driver, first_link)
-    logger.info("Documento mais recente aberto (click no primeiro resultado).")
+    link_preview = _norm(target_link.text)
+    logger.info("Abrir documento do filtro: posicao=%d link_identificado='%s'", position, link_preview)
+    _click_element(driver, target_link)
+    logger.info("Documento do filtro aberto (click na posicao %d).", position)
 

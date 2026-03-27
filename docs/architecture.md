@@ -2,15 +2,15 @@
 
 ## Visao geral
 
-O repositorio esta organizado em dois executaveis desacoplados:
+O repositorio continua organizado em dois executaveis desacoplados:
 
 1. Backend Selenium
-Responsavel por autenticar no SEI, navegar nos internos, abrir processos, localizar o Plano de Trabalho e persistir artefatos tecnicos em disco.
+Responsavel por autenticar no SEI, navegar nos internos, abrir processos, localizar documentos de parceria e persistir artefatos tecnicos em disco.
 
 2. Dashboard Streamlit
 Responsavel por ler um CSV canonico local e exibir filtros, KPIs, graficos e tabela analitica.
 
-O backend hoje produz dados em `backend/output/`. O dashboard hoje consome `output/sei_dashboard.csv` na raiz. Esse desacoplamento ainda nao foi resolvido por pipeline interno.
+O backend produz dados em `backend/output/`. O dashboard consome `output/sei_dashboard.csv` na raiz. Esse desacoplamento ainda nao foi resolvido por um publisher interno.
 
 ## Entrypoints
 
@@ -44,16 +44,33 @@ Abre processos e gerencia troca de abas/janelas.
 Opera a toolbar do processo ate abrir o filtro `Pesquisar no Processo`.
 
 - `backend/app/rpa/sei/document_search.py`
-Seleciona o tipo exato no filtro e abre o resultado mais recente.
+Lista resultados do filtro e ajuda a abrir candidatos por alias e recencia.
 
 - `backend/app/rpa/sei/document_text_extractor.py`
-Extrai texto e tabelas do documento aberto. Faz fallback para download/PDF/OCR quando necessario.
+Extrai texto e tabelas do documento aberto. Faz fallback para download, PDF, OCR e DOCX quando necessario.
+
+- `backend/app/documents/types.py`
+Define `DocumentTypeSpec`, inclusive `accepted_doc_classes` e `filter_type_aliases`.
+
+- `backend/app/documents/pt.py`
+Define a familia documental de PT, seus artefatos e a persistencia de tracking.
+
+- `backend/app/documents/cooperation_common.py`
+Implementa o handler compartilhado das familias de cooperacao, inclusive silver e gold.
+
+- `backend/app/documents/act.py`
+- `backend/app/documents/memorando.py`
+- `backend/app/documents/ted.py`
+Registram as especificacoes de cada familia documental.
+
+- `backend/app/services/act_normalizer.py`
+Classifica snapshots da familia de cooperacao com `classify_cooperation_snapshot(...)` e exporta a gold de ACT.
 
 - `backend/app/core/raw_date_field_collector.py`
 Extrai campos brutos relacionados a data e periodo a partir do snapshot do documento.
 
 - `backend/app/services/pt_normalizer.py`
-Cruza JSONs de PT com a previa de `PARCERIAS VIGENTES` e gera CSVs normalizados.
+Cruza JSONs de PT com a previa de `PARCERIAS VIGENTES`, endurece o parse de periodo e gera silver e gold de PT.
 
 - `backend/app/output/csv_writer.py`
 Escrita padronizada de CSV.
@@ -62,14 +79,22 @@ Escrita padronizada de CSV.
 
 ### 1. Preparacao da rodada
 
-Antes de iniciar a navegacao, `SEIScraper._prepare_output_dir_for_run()` limpa os artefatos anteriores no diretório de saida:
+Antes de iniciar a navegacao, `SEIScraper._prepare_output_dir_for_run()` limpa os artefatos `latest` anteriores no diretorio de saida.
+
+Entre os arquivos reciclados pela rodada estao:
 
 - `plano_trabalho_*.json`
+- `acordo_cooperacao_tecnica_*.json`
+- `memorando_*.json`
 - `pt_fields_raw.csv`
-- `pt_status_execucao_latest.csv`
-- `pt_sem_prazo_latest.csv`
+- `pt_auditoria_latest.csv`
 - `pt_normalizado_latest.csv`
 - `pt_normalizado_completo_latest.csv`
+- `act_status_execucao_latest.csv`
+- `act_normalizado_latest.csv`
+- `memorando_status_execucao_latest.csv`
+- `memorando_normalizado_latest.csv`
+- `ted_status_execucao_latest.csv`
 - `parcerias_vigentes_latest.csv`
 
 ### 2. Entrada no SEI
@@ -116,11 +141,12 @@ Para cada processo do interno:
 2. aguarda pagina pronta;
 3. aciona `Abrir todas as Pastas`;
 4. abre `Pesquisar no Processo`;
-5. busca o tipo exato `PLANO DE TRABALHO - PT`;
-6. tenta abrir o documento mais recente;
-7. se a busca falhar, usa fallback pela arvore do processo.
+5. itera as familias documentais configuradas;
+6. para cada familia, tenta primeiro os aliases de filtro;
+7. consolida candidatos semanticamente validos ou, se necessario, usa fallback pela arvore;
+8. registra na silver os casos `not_found`, `extraction_failure`, `minuta` ou `related_but_not_canonical`.
 
-### 6. Extracao do Plano de Trabalho
+### 6. Extracao e classificacao de documento
 
 Quando o documento esta aberto, o sistema:
 
@@ -129,28 +155,57 @@ Quando o documento esta aberto, o sistema:
 3. se o conteudo estiver vazio ou intermediario, aguarda renderizacao;
 4. se ainda assim falhar, tenta localizar o link de download;
 5. se o anexo for PDF, tenta extracao nativa e depois OCR;
-6. monta um snapshot com:
+6. se o anexo for DOCX ou `zip_docx`, faz leitura estruturada;
+7. monta um snapshot com:
    - `text`
    - `tables`
    - `url`
    - `title`
    - `extraction_mode`
+8. envia o snapshot para classificacao semantica.
 
-### 7. Persistencia de artefatos
+### 7. Classificacao semantica
 
-Para cada PT encontrado:
+Familias de cooperacao usam:
 
-- salva `plano_trabalho_<processo>.json`
-- atualiza `pt_fields_raw.csv`
-- adiciona linha a um relatorio interno de status de execucao
+- `classify_cooperation_snapshot(snapshot, requested_type, collection_context=None)`
 
-Ao final da rodada:
+Retornos principais:
 
-- grava `pt_status_execucao_latest.csv`
-- grava `pt_sem_prazo_latest.csv`
-- roda `export_normalized_csv(...)`
-- grava `pt_normalizado_latest.csv`
-- grava `pt_normalizado_completo_latest.csv`
+- `doc_class`
+- `resolved_document_type`
+- `is_canonical_candidate`
+- `validation_status`
+- `publication_status`
+- `discard_reason`
+- `classification_reason`
+
+Semantica atual:
+
+- `published_gold` apenas para o tipo canonicamente valido para a familia pedida;
+- `retained_silver` para minutas, extratos, termos aditivos, documentos relacionados e `not_found`.
+
+PT usa analise equivalente, mas com regras especificas de periodo, assinatura e canonicidade de minuta/documentacao.
+
+### 8. Persistencia de artefatos
+
+Bronze:
+
+- snapshots JSON por processo e familia
+
+Silver:
+
+- `pt_auditoria_latest.csv`
+- `act_status_execucao_latest.csv`
+- `memorando_status_execucao_latest.csv`
+- `ted_status_execucao_latest.csv`
+
+Gold:
+
+- `pt_normalizado_latest.csv`
+- `pt_normalizado_completo_latest.csv`
+- `act_normalizado_latest.csv`
+- `memorando_normalizado_latest.csv`
 
 ## Contratos de dados atuais
 
@@ -164,20 +219,35 @@ Previa estruturada por processo.
 - `plano_trabalho_<processo>.json`
 Snapshot bruto do documento PT.
 
+- `acordo_cooperacao_tecnica_<processo>.json`
+Snapshot bruto do candidato ou documento da familia ACT.
+
 - `pt_fields_raw.csv`
 Modelo long com campos brutos e evidencias textuais.
 
-- `pt_status_execucao_latest.csv`
-Status de execucao da rodada.
-
-- `pt_sem_prazo_latest.csv`
-Subset dos PTs sem periodo completo detectado.
+- `pt_auditoria_latest.csv`
+Auditoria silver de PT, inclusive `validation_status`, `publication_status` e `period_source`.
 
 - `pt_normalizado_latest.csv`
-Normalizacao consolidada dos snapshots de PT.
+Gold de PT, com apenas registros publicados.
 
 - `pt_normalizado_completo_latest.csv`
-Subset classificado como `completo_padronizado`.
+Subset dos PTs classificados como `completo_padronizado`.
+
+- `act_status_execucao_latest.csv`
+Silver da familia ACT.
+
+- `act_normalizado_latest.csv`
+Gold da familia ACT.
+
+- `memorando_status_execucao_latest.csv`
+Silver da familia memorando.
+
+- `memorando_normalizado_latest.csv`
+Gold da familia memorando.
+
+- `ted_status_execucao_latest.csv`
+Silver da familia TED.
 
 ### Contrato esperado pelo dashboard
 
@@ -216,4 +286,4 @@ Se o CSV nao existir, usa um dataset de exemplo embutido.
 
 ## Lacuna arquitetural atual
 
-Ainda falta uma etapa que converta os artefatos do backend, especialmente `pt_normalizado_latest.csv`, para o contrato `output/sei_dashboard.csv`.
+Ainda falta uma etapa que converta a gold do backend para o contrato `output/sei_dashboard.csv`.

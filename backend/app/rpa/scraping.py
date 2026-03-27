@@ -37,7 +37,14 @@ from app.services.act_normalizer import (
     DOC_CLASS_STUB,
     DOC_CLASS_TED,
     TREE_PENALTY_MARKERS,
-    classify_act_snapshot,
+    VALIDATION_STATUS_VALID,
+    classify_cooperation_snapshot,
+)
+from app.services.pt_normalizer import (
+    CLASSIFICATION_REASON_MINUTA_DOCUMENTACAO,
+    REQUESTED_TYPE_PT,
+    RESOLVED_TYPE_PT,
+    VALIDATION_STATUS_NON_CANONICAL,
 )
 from app.rpa.selenium_utils import (
     get_iframes_info,
@@ -436,6 +443,7 @@ class SEIScraper:
         deadline = time.time() + wait_seconds
         gateway_timeout_retry_limit = 2
         gateway_timeout_hits = 0
+        last_gateway_timeout_state = ""
         login_url_markers = ("/sip/login.php", "sigla_sistema=sei")
         post_login_url_markers = (
             "/sei/controlador.php",
@@ -477,12 +485,14 @@ class SEIScraper:
 
             if self._is_gateway_timeout_page():
                 gateway_timeout_hits += 1
+                last_gateway_timeout_state = self._describe_current_page_state()
                 if gateway_timeout_hits <= gateway_timeout_retry_limit:
                     self.logger.warning(
                         "Tela 504 detectada apos login (%d/%d). "
-                        "Tentando recarregar a pagina.",
+                        "Tentando recarregar a pagina. estado=%s",
                         gateway_timeout_hits,
                         gateway_timeout_retry_limit,
+                        last_gateway_timeout_state,
                     )
                     try:
                         self.driver.refresh()
@@ -498,9 +508,16 @@ class SEIScraper:
 
             time.sleep(UI_SETTLE_SLEEP_SECONDS)
 
+        final_state = self._describe_current_page_state()
+        if gateway_timeout_hits:
+            raise RuntimeError(
+                "Login/autenticacao nao confirmado porque o SEI retornou erro 504 apos o login. "
+                f"tentativas_504={gateway_timeout_hits} ultimo_estado={last_gateway_timeout_state or final_state}"
+            )
+
         raise RuntimeError(
             "Login/autenticacao nao confirmado dentro do tempo limite. "
-            "Confirme se o processo foi concluido no navegador."
+            f"Confirme se o processo foi concluido no navegador. estado_final={final_state}"
         )
 
     def _is_gateway_timeout_page(self) -> bool:
@@ -532,6 +549,25 @@ class SEIScraper:
             return True
 
         return False
+
+    def _describe_current_page_state(self) -> str:
+        try:
+            title = _compact_text(self.driver.title or "")
+        except WebDriverException:
+            title = ""
+
+        try:
+            url = _compact_text(self.driver.current_url or "")
+        except WebDriverException:
+            url = ""
+
+        try:
+            html_preview = _compact_text((self.driver.page_source or "")[:400])
+        except WebDriverException:
+            html_preview = ""
+
+        preview = html_preview[:220]
+        return f"url={url or '<vazia>'} title={title or '<vazio>'} html_preview={preview or '<vazio>'}"
 
 
     def _login_if_possible(self) -> None:
@@ -794,9 +830,16 @@ class SEIScraper:
         return self.document_types_by_key.get(key)
 
     def _iter_unique_search_terms(self, document_type: DocumentTypeSpec) -> List[str]:
+        return self._dedupe_terms(document_type.search_terms)
+
+    def _iter_unique_filter_terms(self, document_type: DocumentTypeSpec) -> List[str]:
+        terms = document_type.filter_type_aliases or document_type.search_terms
+        return self._dedupe_terms(terms)
+
+    def _dedupe_terms(self, terms: Tuple[str, ...] | List[str]) -> List[str]:
         unique_terms: List[str] = []
         seen: Set[str] = set()
-        for term in document_type.search_terms:
+        for term in terms:
             normalized = self._normalize_text(term)
             collapsed = re.sub(r"\s+", " ", normalized).strip()
             if not collapsed or collapsed in seen:
@@ -956,10 +999,78 @@ class SEIScraper:
         self,
         processo: str,
         document_type: DocumentTypeSpec,
-    ) -> Tuple[Optional[document_search.SearchHit], str, Dict[str, Any]]:
+        termo: str,
+    ) -> Tuple[List[document_search.SearchHit], Dict[str, Any]]:
+        try:
+            hits = self.buscar_documentos_no_filtro(
+                termo=termo,
+                timeout_seconds=self.timeout_seconds,
+            )
+        except (TimeoutException, NoSuchElementException) as exc:
+            stagnated = self._is_search_context_stagnation_timeout(exc)
+            if stagnated:
+                self._process_filter_degraded[processo] = True
+            detail = self._log_filter_diagnostics(
+                processo,
+                document_type,
+                termo,
+                outcome="stagnation" if stagnated else "filter_error",
+                exc=exc,
+            )
+            return (
+                [],
+                self._build_collection_context(
+                    found=False,
+                    found_in="filter",
+                    search_term=termo,
+                    results_count=0,
+                    selection_reason="search_context_stagnation" if stagnated else "search_open_error",
+                    selection_detail=detail,
+                    extraction_error=str(exc),
+                ),
+            )
+
+        if not hits:
+            detail = self._log_filter_diagnostics(
+                processo,
+                document_type,
+                termo,
+                outcome="zero_results",
+            )
+            return (
+                [],
+                self._build_collection_context(
+                    found=False,
+                    found_in="filter",
+                    search_term=termo,
+                    results_count=0,
+                    selection_reason="no_results_in_filter",
+                    selection_detail=detail,
+                ),
+            )
+
+        first_hit = hits[0]
+        return (
+            hits,
+            self._build_collection_context(
+                found=True,
+                found_in="filter",
+                search_term=termo,
+                results_count=first_hit.total_resultados,
+                chosen_documento=first_hit.protocolo,
+                selection_reason=first_hit.selection_reason,
+                selection_detail=f"position={first_hit.selected_position} total={first_hit.total_resultados}",
+            ),
+        )
+
+    def _search_document_candidates_in_filter(
+        self,
+        processo: str,
+        document_type: DocumentTypeSpec,
+    ) -> Tuple[List[Tuple[str, List[document_search.SearchHit]]], Dict[str, Any]]:
         process_url = (self.driver.current_url or "").strip()
-        search_terms = self._iter_unique_search_terms(document_type)
-        termo_encontrado = ""
+        search_terms = self._iter_unique_filter_terms(document_type)
+        candidate_groups: List[Tuple[str, List[document_search.SearchHit]]] = []
         collection_context = self._build_collection_context(
             found=False,
             found_in="filter",
@@ -1007,75 +1118,31 @@ class SEIScraper:
                         extraction_error=str(exc),
                     )
                     if stagnated:
-                        return (None, "", collection_context)
+                        return (candidate_groups, collection_context)
                     continue
 
-            try:
-                hit = self.buscar_documento_mais_recente_no_filtro(
-                    termo=termo,
-                    timeout_seconds=self.timeout_seconds,
-                )
-            except (TimeoutException, NoSuchElementException) as exc:
-                stagnated = self._is_search_context_stagnation_timeout(exc)
-                if stagnated:
-                    self._process_filter_degraded[processo] = True
-                detail = self._log_filter_diagnostics(
-                    processo,
-                    document_type,
-                    termo,
-                    outcome="stagnation" if stagnated else "filter_error",
-                    exc=exc,
-                )
-                collection_context = self._build_collection_context(
-                    found=False,
-                    found_in="filter",
-                    search_term=termo,
-                    results_count=0,
-                    selection_reason="search_context_stagnation" if stagnated else "search_open_error",
-                    selection_detail=detail,
-                    extraction_error=str(exc),
-                )
-                if stagnated:
-                    return (None, "", collection_context)
-                continue
-
-            if hit is None:
-                detail = self._log_filter_diagnostics(
-                    processo,
-                    document_type,
-                    termo,
-                    outcome="zero_results",
-                )
-                collection_context = self._build_collection_context(
-                    found=False,
-                    found_in="filter",
-                    search_term=termo,
-                    results_count=0,
-                    selection_reason="no_results_in_filter",
-                    selection_detail=detail,
-                )
-                continue
-
-            termo_encontrado = termo
-            collection_context = self._build_collection_context(
-                found=True,
-                found_in="filter",
-                search_term=termo,
-                results_count=hit.total_resultados,
-                chosen_documento=hit.protocolo,
-                selection_reason=hit.selection_reason,
-                selection_detail=f"position={hit.selected_position} total={hit.total_resultados}",
+            hits, term_context = self._search_document_in_filter(
+                processo=processo,
+                document_type=document_type,
+                termo=termo,
             )
-            return (hit, termo_encontrado, collection_context)
+            collection_context = term_context
+            if not hits:
+                if term_context.get("selection_reason") == "search_context_stagnation":
+                    return (candidate_groups, collection_context)
+                continue
 
-        return (None, termo_encontrado, collection_context)
+            candidate_groups.append((termo, hits))
+            return (candidate_groups, collection_context)
+
+        return (candidate_groups, collection_context)
 
     def _search_pt_document_in_filter(
         self,
         processo: str,
         document_type: DocumentTypeSpec,
-    ) -> Tuple[Optional[document_search.SearchHit], str, Dict[str, Any]]:
-        return self._search_document_in_filter(processo, document_type)
+    ) -> Tuple[List[Tuple[str, List[document_search.SearchHit]]], Dict[str, Any]]:
+        return self._search_document_candidates_in_filter(processo, document_type)
 
     def _score_tree_candidate(
         self,
@@ -1127,6 +1194,11 @@ class SEIScraper:
             ):
                 if marker in normalized:
                     score -= 180
+        elif document_type.key == "pt":
+            if "DOCUMENTACAO" in normalized:
+                score -= 20
+            if "MINUTA" in normalized or "MINUTAS" in normalized:
+                score -= 25
 
         return (score, matched_terms)
 
@@ -1389,11 +1461,8 @@ class SEIScraper:
         processo: str,
         document_type: DocumentTypeSpec,
     ) -> None:
-        termo_encontrado = ""
         collection_context = self._build_collection_context(found=False, found_in="filter")
-        handles_before_click: Set[str] = set()
         processo_handle = ""
-        opened_doc_handles: Set[str] = set()
         process_url = (self.driver.current_url or "").strip()
         try:
             self.logger.info(
@@ -1405,146 +1474,204 @@ class SEIScraper:
                 len(self.driver.window_handles),
             )
             processo_handle = self.driver.current_window_handle
-            hit: Optional[document_search.SearchHit] = None
-            search_terms = self._iter_unique_search_terms(document_type)
-            if len(search_terms) != len(document_type.search_terms):
+            filter_terms = self._iter_unique_filter_terms(document_type)
+            if len(filter_terms) != len(document_type.filter_type_aliases or document_type.search_terms):
                 self.logger.info(
-                    "Processo %s: termos de busca %s deduplicados de %d para %d.",
+                    "Processo %s: aliases de filtro %s deduplicados de %d para %d.",
                     processo,
                     document_type.log_label,
-                    len(document_type.search_terms),
-                    len(search_terms),
+                    len(document_type.filter_type_aliases or document_type.search_terms),
+                    len(filter_terms),
                 )
+            found_any_filter_candidate = False
+            saw_invalid_filter_candidate = False
 
-            hit, termo_encontrado, collection_context = self._search_document_in_filter(
-                processo,
-                document_type,
-            )
-            if hit is None:
-                self.logger.info(
-                    "Processo %s: %s nao encontrado no filtro; tentando fallback pela arvore.",
-                    processo,
-                    document_type.display_name,
-                )
-                if self._open_document_via_tree(processo, document_type, process_url=process_url):
+            for term_index, termo in enumerate(filter_terms):
+                if term_index > 0:
                     self.logger.info(
-                        "Processo %s: %s recuperado via arvore apos filtro (%s).",
+                        "Processo %s: reabrindo filtro em sessao limpa para %s com alias '%s'.",
                         processo,
-                        document_type.log_label,
-                        collection_context.get("selection_reason", "no_results_in_filter"),
+                        document_type.display_name,
+                        termo,
                     )
-                    return
-                collection_context = self._build_collection_context(
-                    found=False,
-                    found_in="none",
-                    search_term="|".join(document_type.search_terms),
-                    results_count=0,
-                    selection_reason="not_found_after_filter_and_tree",
-                    selection_detail=(
-                        "nao encontrado no filtro nem na arvore; "
-                        f"motivo_filtro={collection_context.get('selection_reason', 'no_results_in_filter')}"
-                    ),
-                    extraction_error=collection_context.get("extraction_error", ""),
+                    try:
+                        self._restore_process_base_context(
+                            processo,
+                            process_url=process_url,
+                            reason=f"nova sessao de filtro {document_type.log_label} ({termo})",
+                        )
+                        self._ensure_document_search_open(processo, document_type)
+                    except (TimeoutException, RuntimeError, NoSuchElementException, WebDriverException) as exc:
+                        stagnated = self._is_search_context_stagnation_timeout(exc)
+                        if stagnated:
+                            self._process_filter_degraded[processo] = True
+                        detail = self._log_filter_diagnostics(
+                            processo,
+                            document_type,
+                            termo,
+                            outcome="stagnation" if stagnated else "filter_reopen_error",
+                            exc=exc,
+                        )
+                        collection_context = self._build_collection_context(
+                            found=False,
+                            found_in="filter",
+                            search_term=termo,
+                            results_count=0,
+                            selection_reason="search_context_stagnation" if stagnated else "filter_reopen_error",
+                            selection_detail=detail,
+                            extraction_error=str(exc),
+                        )
+                        if stagnated:
+                            break
+                        continue
+
+                hits, term_context = self._search_document_in_filter(
+                    processo=processo,
+                    document_type=document_type,
+                    termo=termo,
                 )
-                self._record_document_search_outcome(processo, document_type, collection_context)
+                collection_context = term_context
+                if not hits:
+                    if term_context.get("selection_reason") == "search_context_stagnation":
+                        break
+                    continue
+
+                found_any_filter_candidate = True
                 self.logger.info(
-                    "Processo %s: nenhum %s localizado nem no filtro nem na arvore; seguindo.",
+                    "Processo %s: %s retornou %d candidato(s) no filtro para alias '%s'.",
                     processo,
                     document_type.log_label,
+                    len(hits),
+                    termo,
                 )
-                return
-            self.logger.info(
-                "Processo %s: documento encontrado para '%s' (%s). resultados=%d motivo=%s",
-                processo,
-                termo_encontrado or document_type.display_name,
-                hit.protocolo,
-                hit.total_resultados,
-                hit.selection_reason,
-            )
-            handles_before_click = set(self.driver.window_handles)
-            self.abrir_documento_mais_recente_no_filtro(timeout_seconds=self.timeout_seconds)
-            handles_after_click = set(self.driver.window_handles)
-            opened_doc_handles = handles_after_click - handles_before_click
-            self.logger.info(
-                "Processo %s: pos_click_resultado handles_antes=%d handles_depois=%d novos_handles=%s",
-                processo,
-                len(handles_before_click),
-                len(handles_after_click),
-                list(opened_doc_handles),
-            )
-            switched_handle = self._switch_to_newly_opened_window(
-                handles_before=handles_before_click,
-                reason=f"{document_type.log_label} {processo}",
-            )
-            if switched_handle:
-                opened_doc_handles.add(switched_handle)
-            self.logger.info(
-                "Processo %s: clique no primeiro resultado efetuado. contexto_pos_click url=%s title=%s handles=%d",
-                processo,
-                self.driver.current_url,
-                self.driver.title,
-                len(self.driver.window_handles),
-            )
-            self.logger.info(
-                "Processo %s: documento mais recente de '%s' aberto (%s).",
-                processo,
-                termo_encontrado or document_type.display_name,
-                hit.protocolo,
-            )
-            snapshot_saved = self._extract_and_process_document_snapshot(
-                processo=processo,
-                protocolo_documento=hit.protocolo,
-                document_type=document_type,
-                collection_context=collection_context,
-            )
-            if snapshot_saved:
-                return
 
-            self.logger.warning(
-                "Processo %s: snapshot do primeiro resultado do filtro foi rejeitado para %s; tentando fallback pela arvore.",
+                for hit in hits:
+                    attempt_opened_doc_handles: Set[str] = set()
+                    attempt_context = self._build_collection_context(
+                        found=True,
+                        found_in="filter",
+                        search_term=termo,
+                        results_count=hit.total_resultados,
+                        chosen_documento=hit.protocolo,
+                        selection_reason=hit.selection_reason,
+                        selection_detail=f"position={hit.selected_position} total={hit.total_resultados}",
+                    )
+                    try:
+                        if term_index > 0 or hit.selected_position > 1:
+                            self._restore_process_base_context(
+                                processo,
+                                process_url=process_url,
+                                reason=f"novo candidato do filtro {document_type.log_label} rank={hit.selected_position}",
+                            )
+                            self._ensure_document_search_open(processo, document_type)
+                            refreshed_hits, refreshed_context = self._search_document_in_filter(
+                                processo=processo,
+                                document_type=document_type,
+                                termo=termo,
+                            )
+                            if len(refreshed_hits) < hit.selected_position:
+                                self.logger.warning(
+                                    "Processo %s: candidato #%d do filtro para %s nao reapareceu apos reabrir os resultados.",
+                                    processo,
+                                    hit.selected_position,
+                                    document_type.log_label,
+                                )
+                                collection_context = refreshed_context
+                                continue
+                            hit = refreshed_hits[hit.selected_position - 1]
+                            attempt_context = self._build_collection_context(
+                                found=True,
+                                found_in="filter",
+                                search_term=termo,
+                                results_count=hit.total_resultados,
+                                chosen_documento=hit.protocolo,
+                                selection_reason=hit.selection_reason,
+                                selection_detail=f"position={hit.selected_position} total={hit.total_resultados}",
+                            )
+
+                        self.logger.info(
+                            "Processo %s: abrindo candidato do filtro %d/%d para %s (%s).",
+                            processo,
+                            hit.selected_position,
+                            hit.total_resultados,
+                            document_type.log_label,
+                            hit.protocolo,
+                        )
+                        handles_before_click = set(self.driver.window_handles)
+                        self.abrir_documento_no_filtro(
+                            position=hit.selected_position,
+                            timeout_seconds=self.timeout_seconds,
+                        )
+                        handles_after_click = set(self.driver.window_handles)
+                        attempt_opened_doc_handles = handles_after_click - handles_before_click
+                        switched_handle = self._switch_to_newly_opened_window(
+                            handles_before=handles_before_click,
+                            reason=f"{document_type.log_label} {processo} posicao={hit.selected_position}",
+                        )
+                        if switched_handle:
+                            attempt_opened_doc_handles.add(switched_handle)
+                        snapshot_saved = self._extract_and_process_document_snapshot(
+                            processo=processo,
+                            protocolo_documento=hit.protocolo,
+                            document_type=document_type,
+                            collection_context=attempt_context,
+                        )
+                        if snapshot_saved:
+                            return
+                        saw_invalid_filter_candidate = True
+                        collection_context = self._build_collection_context(
+                            found=True,
+                            found_in="filter",
+                            search_term=termo,
+                            results_count=hit.total_resultados,
+                            chosen_documento=hit.protocolo,
+                            selection_reason="candidate_retained_only_in_silver",
+                            selection_detail=f"position={hit.selected_position} total={hit.total_resultados}",
+                        )
+                    finally:
+                        self._close_opened_doc_tabs(
+                            processo=processo,
+                            opened_doc_handles=attempt_opened_doc_handles,
+                            preferred_return_handle=processo_handle,
+                        )
+
+            self.logger.info(
+                "Processo %s: nenhum candidato canonico de %s consolidado no filtro; tentando fallback pela arvore.",
                 processo,
                 document_type.log_label,
             )
-            collection_context = self._build_collection_context(
-                found=False,
-                found_in="filter",
-                search_term=collection_context.get("search_term", termo_encontrado or document_type.display_name),
-                results_count=collection_context.get("results_count", 0),
-                chosen_documento=collection_context.get("chosen_documento", hit.protocolo),
-                selection_reason="invalid_snapshot_after_filter",
-                selection_detail="resultado abriu conteudo invalido; fallback arvore",
-            )
-            try:
-                self._restore_process_base_context(
-                    processo,
-                    process_url=process_url,
-                    reason=f"snapshot invalido apos filtro ({document_type.log_label})",
-                )
-                self._ensure_document_search_open(processo, document_type)
-            except Exception as exc:
-                self.logger.warning(
-                    "Processo %s: falha ao restaurar contexto apos snapshot invalido no filtro para %s (%s).",
-                    processo,
-                    document_type.log_label,
-                    exc,
-                )
             if self._open_document_via_tree(processo, document_type, process_url=process_url):
                 self.logger.info(
-                    "Processo %s: %s recuperado via arvore apos filtro invalido.",
+                    "Processo %s: %s recuperado via arvore apos filtro.",
                     processo,
                     document_type.log_label,
                 )
                 return
+
+            selection_reason = "not_found_after_filter_and_tree"
+            selection_detail = (
+                "nao encontrado no filtro nem na arvore"
+                if not found_any_filter_candidate
+                else "candidatos do filtro/rvore ficaram apenas na silver; nenhum canonico publicado"
+            )
+            if saw_invalid_filter_candidate:
+                selection_reason = "no_canonical_candidate_after_filter_and_tree"
             collection_context = self._build_collection_context(
                 found=False,
                 found_in="none",
-                search_term="|".join(document_type.search_terms),
+                search_term="|".join(filter_terms),
                 results_count=0,
-                chosen_documento=hit.protocolo,
-                selection_reason="invalid_snapshot_after_filter_and_tree",
-                selection_detail="resultado do filtro invalido e nenhum candidato valido na arvore",
+                chosen_documento=collection_context.get("chosen_documento", ""),
+                selection_reason=selection_reason,
+                selection_detail=selection_detail,
+                extraction_error=collection_context.get("extraction_error", ""),
             )
             self._record_document_search_outcome(processo, document_type, collection_context)
+            self.logger.info(
+                "Processo %s: nenhum %s canonico localizado; seguindo.",
+                processo,
+                document_type.log_label,
+            )
         except (TimeoutException, NoSuchElementException) as exc:
             if self._is_search_context_stagnation_timeout(exc):
                 self._process_filter_degraded[processo] = True
@@ -1571,14 +1698,8 @@ class SEIScraper:
             self.logger.warning(
                 "Processo %s: falha resiliente ao buscar/abrir '%s' (%s); seguindo.",
                 processo,
-                termo_encontrado or document_type.display_name,
+                collection_context.get("search_term", document_type.display_name) or document_type.display_name,
                 exc,
-            )
-        finally:
-            self._close_opened_doc_tabs(
-                processo=processo,
-                opened_doc_handles=opened_doc_handles,
-                preferred_return_handle=processo_handle,
             )
 
     def _find_plano_trabalho_link_in_tree(self) -> Optional[Any]:
@@ -1725,18 +1846,42 @@ class SEIScraper:
             timeout_seconds=timeout_seconds,
         )
 
-    def abrir_documento_mais_recente_no_filtro(self, timeout_seconds: int = 20) -> None:
-        """Na tela de resultados, abre o documento mais recente (primeiro resultado)."""
+    def buscar_documentos_no_filtro(
+        self, termo: str, timeout_seconds: int = 20
+    ) -> List[document_search.SearchHit]:
         self.logger.info(
-            "Abertura filtro: tentando abrir primeiro resultado timeout=%ss url=%s title=%s",
+            "Busca filtro: listando resultados termo='%s' timeout=%ss url=%s title=%s",
+            termo,
             timeout_seconds,
             self.driver.current_url,
             self.driver.title,
         )
-        document_search.abrir_documento_mais_recente(
+        return document_search.listar_resultados_pesquisa(
             driver=self.driver,
             selectors=self.selectors,
             logger=self.logger,
+            termo=termo,
+            timeout_seconds=timeout_seconds,
+        )
+
+    def abrir_documento_mais_recente_no_filtro(self, timeout_seconds: int = 20) -> None:
+        """Na tela de resultados, abre o documento mais recente (primeiro resultado)."""
+        self.abrir_documento_no_filtro(position=1, timeout_seconds=timeout_seconds)
+
+    def abrir_documento_no_filtro(self, position: int, timeout_seconds: int = 20) -> None:
+        """Na tela de resultados, abre o documento na posicao informada."""
+        self.logger.info(
+            "Abertura filtro: tentando abrir resultado posicao=%d timeout=%ss url=%s title=%s",
+            position,
+            timeout_seconds,
+            self.driver.current_url,
+            self.driver.title,
+        )
+        document_search.abrir_resultado_pesquisa_por_posicao(
+            driver=self.driver,
+            selectors=self.selectors,
+            logger=self.logger,
+            position=position,
             timeout_seconds=timeout_seconds,
         )
     # Internos (menu, selecao guiada, paginacao)
@@ -2520,15 +2665,56 @@ class SEIScraper:
         hits = sum(1 for marker in email_markers if marker in blob)
         return hits >= 3
 
+    def _classify_pt_snapshot(
+        self,
+        snapshot: Dict[str, Any],
+        collection_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        chosen_documento = self._normalize_text(str((collection_context or {}).get("chosen_documento", "") or ""))
+        title_blob = self._normalize_text(str(snapshot.get("title", "") or ""))
+        text_head = self._normalize_text(str(snapshot.get("text", "") or "")[:1600])
+        title_context = " ".join(part for part in (chosen_documento, title_blob) if part)
+
+        has_plano_marker = "PLANO DE TRABALHO" in text_head or "PLANO DE TRABALHO" in title_context
+        has_documentacao_marker = "DOCUMENTACAO" in title_context
+        has_minuta_marker = "MINUTA" in title_context or "MINUTAS" in title_context
+        has_minuta_text = bool(
+            re.search(r"\bMINUTA(?:\s+DE)?\s+PLANO\s+DE\s+TRABALHO\b", text_head, flags=re.IGNORECASE)
+        )
+
+        is_non_canonical = has_plano_marker and (has_minuta_text or (has_documentacao_marker and has_minuta_marker))
+        if is_non_canonical:
+            return {
+                "doc_class": "pt_minuta_documentacao",
+                "requested_type": REQUESTED_TYPE_PT,
+                "resolved_document_type": RESOLVED_TYPE_PT,
+                "is_canonical_candidate": False,
+                "validation_status": VALIDATION_STATUS_NON_CANONICAL,
+                "publication_status": "retained_silver",
+                "discard_reason": "minuta_documentacao",
+                "classification_reason": CLASSIFICATION_REASON_MINUTA_DOCUMENTACAO,
+            }
+
+        return {
+            "doc_class": RESOLVED_TYPE_PT,
+            "requested_type": REQUESTED_TYPE_PT,
+            "resolved_document_type": RESOLVED_TYPE_PT,
+            "is_canonical_candidate": True,
+            "validation_status": VALIDATION_STATUS_VALID,
+            "publication_status": "",
+            "discard_reason": "",
+            "classification_reason": "",
+        }
+
     def _validate_snapshot_for_document_type(
         self,
         document_type: DocumentTypeSpec,
         snapshot: Dict[str, Any],
         collection_context: Optional[Dict[str, Any]] = None,
-    ) -> Tuple[bool, str]:
+    ) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
         blob = self._snapshot_text_blob(snapshot, collection_context)
         if not blob:
-            return (False, "snapshot_vazio")
+            return (False, "snapshot_vazio", None)
 
         invalid_search_markers = (
             "PESQUISAR NO PROCESSO",
@@ -2536,37 +2722,19 @@ class SEIScraper:
             "VER CRITERIOS DE PESQUISA",
         )
         if any(marker in blob for marker in invalid_search_markers):
-            return (False, "pagina_de_pesquisa")
-
-        if "CLIQUE AQUI PARA VISUALIZAR O CONTEUDO DESTE DOCUMENTO EM UMA NOVA JANELA" in blob:
-            return (False, "stub_visualizacao")
+            return (False, "pagina_de_pesquisa", None)
 
         if document_type.key in {"act", "memorando", "ted"}:
-            if self._looks_like_email_snapshot(snapshot, collection_context):
-                return (False, "email")
-
-            spreadsheet_markers = ("PLANILHA", ".XLS", ".XLSX", "MICROSOFT EXCEL")
-            if any(marker in blob for marker in spreadsheet_markers):
-                return (False, "planilha")
-
-            analysis = classify_act_snapshot(snapshot, collection_context)
-            doc_class = analysis.get("doc_class", "")
-            if doc_class in {DOC_CLASS_STUB, DOC_CLASS_EMAIL_OUTRO}:
-                return (False, doc_class)
-            if document_type.key == "act" and doc_class != DOC_CLASS_ACT_FINAL:
-                return (False, "conteudo_nao_compativel_com_act")
-            if document_type.key == "memorando" and doc_class != DOC_CLASS_MEMORANDO:
-                return (False, "conteudo_nao_compativel_com_memorando")
-            if document_type.key == "ted" and doc_class != DOC_CLASS_TED:
-                return (False, "conteudo_nao_compativel_com_ted")
-            return (True, "ok")
+            analysis = classify_cooperation_snapshot(snapshot, document_type.key, collection_context)
+            return (True, str(analysis.get("doc_class", "") or "ok"), analysis)
 
         if document_type.key == "pt":
             if "PLANO DE TRABALHO" not in blob:
-                return (False, "conteudo_nao_compativel_com_pt")
-            return (True, "ok")
+                return (False, "conteudo_nao_compativel_com_pt", None)
+            analysis = self._classify_pt_snapshot(snapshot, collection_context)
+            return (True, str(analysis.get("doc_class", "") or "ok"), analysis)
 
-        return (True, "ok")
+        return (True, "ok", None)
 
     def _extract_and_process_document_snapshot(
         self,
@@ -2591,7 +2759,7 @@ class SEIScraper:
                 self.driver,
                 logger=self.logger,
             )
-            is_valid, invalid_reason = self._validate_snapshot_for_document_type(
+            is_valid, validation_reason, analysis = self._validate_snapshot_for_document_type(
                 document_type,
                 snapshot,
                 collection_context,
@@ -2601,7 +2769,7 @@ class SEIScraper:
                     "Processo %s: snapshot rejeitado para %s. motivo=%s titulo=%s url=%s texto_preview=%s",
                     processo,
                     document_type.log_label,
-                    invalid_reason,
+                    validation_reason,
                     snapshot.get("title", ""),
                     snapshot.get("url", ""),
                     _compact_text(str(snapshot.get("text", "") or ""))[:280],
@@ -2613,6 +2781,7 @@ class SEIScraper:
                 protocolo_documento=protocolo_documento,
                 snapshot=snapshot,
                 collection_context=collection_context,
+                analysis=analysis,
                 output_dir=self._resolve_preview_output_dir(),
                 logger=self.logger,
                 settings=self.settings,
@@ -2624,6 +2793,28 @@ class SEIScraper:
                     document_type.log_label,
                     output_path,
                 )
+            if document_type.key in {"act", "memorando", "ted"}:
+                is_canonical = bool((analysis or {}).get("validation_status") == VALIDATION_STATUS_VALID)
+                if not is_canonical:
+                    self.logger.warning(
+                        "Processo %s: snapshot de %s retido apenas na silver. doc_class=%s motivo=%s",
+                        processo,
+                        document_type.log_label,
+                        (analysis or {}).get("doc_class", ""),
+                        (analysis or {}).get("classification_reason", validation_reason),
+                    )
+                return is_canonical
+            if document_type.key == "pt":
+                is_canonical = bool((analysis or {}).get("is_canonical_candidate", True))
+                if not is_canonical:
+                    self.logger.warning(
+                        "Processo %s: snapshot de %s retido apenas na silver. doc_class=%s motivo=%s",
+                        processo,
+                        document_type.log_label,
+                        (analysis or {}).get("doc_class", ""),
+                        (analysis or {}).get("classification_reason", validation_reason),
+                    )
+                return is_canonical
             return True
         except Exception as exc:
             failure_context = dict(collection_context or {})

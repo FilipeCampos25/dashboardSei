@@ -17,6 +17,7 @@ class DocumentTypeHandler(Protocol):
         protocolo_documento: str,
         snapshot: dict[str, Any],
         collection_context: Optional[dict[str, Any]] = None,
+        analysis: Optional[dict[str, Any]] = None,
         output_dir: Path,
         logger: Any,
         settings: Any,
@@ -44,3 +45,5 @@ class DocumentTypeSpec:
     log_label: str
     cleanup_patterns: tuple[str, ...]
     handler: DocumentTypeHandler
+    accepted_doc_classes: tuple[str, ...] = ()
+    filter_type_aliases: tuple[str, ...] = ()

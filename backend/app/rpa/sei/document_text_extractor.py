@@ -693,6 +693,21 @@ def _extract_pdf_text_via_anchor_fallback(
     )
 
     if not is_pdf and is_zip:
+        text_docx_direct = _extract_text_from_docx_bytes(pdf_content, logger=logger).strip()
+        if text_docx_direct:
+            _log(
+                logger,
+                "info",
+                "Fallback DOCX: arquivo DOCX bruto extraido com sucesso (chars=%d).",
+                len(text_docx_direct),
+            )
+            return {
+                "text": text_docx_direct,
+                "mode": "zip_docx",
+                "source_url": str(downloaded.get("url") or resolved_url),
+                "source_hint": "docx:raw",
+            }
+
         docx_result = _extract_docx_bytes_from_zip(pdf_content, logger=logger)
         if docx_result:
             text_docx = str(docx_result.get("docx_text") or "").strip()
@@ -944,6 +959,25 @@ def _normalize_date_text(value: str) -> str:
     text = "".join(ch for ch in text if not unicodedata.combining(ch))
     text = text.lower()
     return re.sub(r"\s+", " ", text).strip()
+
+
+def _strip_period_noise(value: str) -> str:
+    cleaned = _normalize_date_text(value)
+    if not cleaned:
+        return ""
+    for pattern in (
+        r"\b\d{1,2}/\d{1,2}/\d{4},\s*\d{1,2}:\d{2}\s+sei/[a-z0-9._-]+\s*-\s*\d+\s*-\s*anexo\b.*",
+        r"\bsei/[a-z0-9._-]+\s*-\s*\d+\s*-\s*anexo\b.*",
+        r"https?://\S+",
+        r"\bdocumento assinado eletronicamente\b.*",
+        r"\ba autenticidade do documento\b.*",
+        r"\bcodigo verificador\b.*",
+        r"\bcodigo crc\b.*",
+        r"\bcriado por\b.*",
+        r"\bbrasilia,\s*na data da assinatura\b.*",
+    ):
+        cleaned = re.sub(pattern, "", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    return re.sub(r"\s+", " ", cleaned).strip(" ;,.")
 
 
 def _last_day_of_month(year: int, month: int) -> int:
@@ -1206,37 +1240,58 @@ def _extract_period_values_v2(text: str) -> Dict[str, str]:
         return " ".join((value or "").split()).strip()
 
     def _slice(label: str) -> str:
-        match = re.search(rf"\b{label}\b[^:]*:\s*", normalized)
-        if not match:
-            return ""
-        tail = normalized[match.end():]
-        stop = re.search(
-            r"\b(?:inicio|termino|objeto|diagnostico|abrangencia|justificativa|objetivo|metodologia|unidade responsavel|resultados esperados|plano de acao)\b",
-            tail,
+        label_prefix = (
+            rf"\b{label}\b"
+            r"\s*\(?(?:m(?:e|ê|Ãª)s\s*/\s*ano)?\)?"
+            r"\s*(?::|-)?\s*"
         )
-        if stop:
-            tail = tail[:stop.start()]
-        return _compact(tail).strip(" ;,.")
+        date_pattern = (
+            r"(\d{1,2}\s*[\/\-.]\s*\d{1,2}\s*[\/\-.]\s*\d{4}"
+            r"|\d{1,2}\s*[\/\-.]\s*\d{4}"
+            r"|(?:jan|fev|mar|abr|mai|jun|jul|ago|set|out|nov|dez|janeiro|fevereiro|marco|abril|maio|junho|julho|agosto|setembro|outubro|novembro|dezembro)\s*[\/ ]\s*\d{2,4}"
+            r"|(?:jan|fev|mar|abr|mai|jun|jul|ago|set|out|nov|dez|janeiro|fevereiro|marco|abril|maio|junho|julho|agosto|setembro|outubro|novembro|dezembro)\d{4})"
+        )
+        explicit = re.search(label_prefix + date_pattern, normalized, flags=re.IGNORECASE)
+        if explicit:
+            return _strip_period_noise(_compact(explicit.group(1)))
+
+        generic = re.search(
+            label_prefix
+            + r"(.{0,140}?)"
+            + r"(?=\b(?:inicio|termino|objeto|diagnostico|abrangencia|justificativa|objetivo|metodologia|unidade responsavel|resultados esperados|plano de acao|assinatura|documento assinado eletronicamente|a autenticidade do documento|codigo verificador|codigo crc|criado por)\b|$)",
+            normalized,
+            flags=re.IGNORECASE,
+        )
+        if not generic:
+            return ""
+        return _strip_period_noise(_compact(generic.group(1)))
 
     inicio_raw = _slice("inicio")
     termino_raw = _slice("termino")
 
     if not inicio_raw or not termino_raw:
+        section_match = re.search(
+            r"\b(?:periodo de execucao|previsao de inicio e termino)\b(.{0,240})",
+            normalized,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        section_blob = _strip_period_noise(section_match.group(1) if section_match else "")
         candidates: List[str] = []
-        for pattern in (
-            r"\b\d{1,2}\s*[\/\-.]\s*\d{1,2}\s*[\/\-.]\s*\d{4}\b",
-            r"\b\d{1,2}\s*[\/\-.]\s*\d{4}\b",
-            r"\b(?:jan|fev|mar|abr|mai|jun|jul|ago|set|out|nov|dez|janeiro|fevereiro|marco|abril|maio|junho|julho|agosto|setembro|outubro|novembro|dezembro)\s*[\/ ]\s*\d{2,4}\b",
-            r"\b\d{1,2}\s+de\s+(?:jan|fev|mar|abr|mai|jun|jul|ago|set|out|nov|dez|janeiro|fevereiro|marco|abril|maio|junho|julho|agosto|setembro|outubro|novembro|dezembro)\s+de\s+\d{4}\b",
-        ):
-            for found in re.finditer(pattern, normalized, flags=re.IGNORECASE):
-                token = _compact(found.group(0))
-                if token and token not in candidates:
-                    candidates.append(token)
-        if not inicio_raw and candidates:
-            inicio_raw = candidates[0]
-        if not termino_raw and len(candidates) >= 2:
-            termino_raw = candidates[1]
+        if section_blob:
+            for pattern in (
+                r"\b\d{1,2}\s*[\/\-.]\s*\d{1,2}\s*[\/\-.]\s*\d{4}\b",
+                r"\b\d{1,2}\s*[\/\-.]\s*\d{4}\b",
+                r"\b(?:jan|fev|mar|abr|mai|jun|jul|ago|set|out|nov|dez|janeiro|fevereiro|marco|abril|maio|junho|julho|agosto|setembro|outubro|novembro|dezembro)\s*[\/ ]\s*\d{2,4}\b",
+                r"\b\d{1,2}\s+de\s+(?:jan|fev|mar|abr|mai|jun|jul|ago|set|out|nov|dez|janeiro|fevereiro|marco|abril|maio|junho|julho|agosto|setembro|outubro|novembro|dezembro)\s+de\s+\d{4}\b",
+            ):
+                for found in re.finditer(pattern, section_blob, flags=re.IGNORECASE):
+                    token = _compact(found.group(0))
+                    if token and token not in candidates:
+                        candidates.append(token)
+            if not inicio_raw and candidates:
+                inicio_raw = candidates[0]
+            if not termino_raw and len(candidates) >= 2:
+                termino_raw = candidates[1]
 
     return {"inicio_raw": inicio_raw, "termino_raw": termino_raw}
 

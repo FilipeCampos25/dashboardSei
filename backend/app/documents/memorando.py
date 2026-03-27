@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from app.documents.cooperation_common import CooperationDocumentHandler
 from app.documents.types import DocumentTypeSpec
+from app.services.act_normalizer import DOC_CLASS_MEMORANDO
 
 MEMORANDO_SEARCH_TERMS = (
     "MEMORANDO DE ENTENDIMENTOS",
@@ -22,8 +23,11 @@ def build_memorando_document_type() -> DocumentTypeSpec:
         cleanup_patterns=(
             "memorando_entendimentos_*.json",
             "memorando_status_execucao_latest.csv",
+            "memorando_normalizado_latest.csv",
         ),
         handler=CooperationDocumentHandler(
             status_filename="memorando_status_execucao_latest.csv",
         ),
+        accepted_doc_classes=(DOC_CLASS_MEMORANDO,),
+        filter_type_aliases=("Memorando de Entendimentos",),
     )

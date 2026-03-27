@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from app.documents.cooperation_common import CooperationDocumentHandler
 from app.documents.types import DocumentTypeSpec
+from app.services.act_normalizer import DOC_CLASS_TED
 
 TED_SEARCH_TERMS = (
     "TED - TERMO DE EXECUCAO DESCENTRALIZADA",
@@ -31,8 +32,14 @@ def build_ted_document_type() -> DocumentTypeSpec:
         cleanup_patterns=(
             "termo_execucao_descentralizada_*.json",
             "ted_status_execucao_latest.csv",
+            "ted_normalizado_latest.csv",
         ),
         handler=CooperationDocumentHandler(
             status_filename="ted_status_execucao_latest.csv",
+        ),
+        accepted_doc_classes=(DOC_CLASS_TED,),
+        filter_type_aliases=(
+            "Termo de Execução Descentralizada",
+            "TED - Termo de Execução Descentralizada",
         ),
     )

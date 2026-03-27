@@ -27,6 +27,7 @@ class PTDocumentHandler:
         protocolo_documento: str,
         snapshot: dict[str, Any],
         collection_context: Optional[dict[str, Any]] = None,
+        analysis: Optional[dict[str, Any]] = None,
         output_dir: Path,
         logger: Any,
         settings: Any,
@@ -79,6 +80,8 @@ class PTDocumentHandler:
             protocolo_documento=protocolo_documento,
             snapshot=snapshot,
             prazos=prazos,
+            analysis=analysis,
+            collection_context=collection_context,
             output_dir=output_dir,
             logger=logger,
         )
@@ -88,6 +91,7 @@ class PTDocumentHandler:
             protocolo_documento=protocolo_documento,
             snapshot=snapshot,
             prazos=prazos,
+            analysis=analysis,
             output_path=output_path,
             collection_context=collection_context,
         )
@@ -120,6 +124,9 @@ class PTDocumentHandler:
             "tem_inicio",
             "tem_termino",
             "sem_prazo",
+            "classification_reason",
+            "validation_status",
+            "publication_status",
             "json_path",
         ]
         all_path = output_dir / "pt_status_execucao_latest.csv"
@@ -156,6 +163,8 @@ class PTDocumentHandler:
         protocolo_documento: str,
         snapshot: dict[str, Any],
         prazos: dict[str, str],
+        analysis: Optional[dict[str, Any]],
+        collection_context: Optional[dict[str, Any]],
         output_dir: Path,
         logger: Any,
     ) -> Optional[Path]:
@@ -166,7 +175,14 @@ class PTDocumentHandler:
             snapshot=snapshot,
             output_dir=output_dir,
             logger=logger,
-            extra_payload={"prazos": prazos},
+            extra_payload={
+                "document_family": "pt",
+                "resolved_document_type": "plano_trabalho",
+                "requested_type": spec.key,
+                "collection": collection_context or {},
+                "prazos": prazos,
+                "analysis": analysis or {},
+            },
         )
 
     def _register_tracking_record(
@@ -177,6 +193,7 @@ class PTDocumentHandler:
         protocolo_documento: str,
         snapshot: dict[str, Any],
         prazos: dict[str, str],
+        analysis: Optional[dict[str, Any]],
         output_path: Optional[Path],
         collection_context: Optional[dict[str, Any]] = None,
     ) -> None:
@@ -201,6 +218,9 @@ class PTDocumentHandler:
             "tem_inicio": inicio_found,
             "tem_termino": termino_found,
             "sem_prazo": sem_prazo,
+            "classification_reason": ((analysis or {}).get("classification_reason", "") or ""),
+            "validation_status": ((analysis or {}).get("validation_status", "") or ""),
+            "publication_status": ((analysis or {}).get("publication_status", "") or ""),
             }
         )
         self._tracking_records.append(record)
@@ -228,8 +248,10 @@ def build_pt_document_type() -> DocumentTypeSpec:
             "pt_fields_raw.csv",
             "pt_status_execucao_latest.csv",
             "pt_sem_prazo_latest.csv",
+            "pt_auditoria_latest.csv",
             "pt_normalizado_latest.csv",
             "pt_normalizado_completo_latest.csv",
         ),
         handler=PTDocumentHandler(),
+        filter_type_aliases=("Plano de Trabalho - PT", "Plano de Trabalho"),
     )

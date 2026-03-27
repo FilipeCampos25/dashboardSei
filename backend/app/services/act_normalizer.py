@@ -74,6 +74,19 @@ DOC_CLASS_SNAPSHOT_PREFIX = {
     DOC_CLASS_EMAIL_OUTRO: SNAPSHOT_PREFIX_ACT,
 }
 
+REQUESTED_TYPE_TO_PREFIX = {
+    "act": SNAPSHOT_PREFIX_ACT,
+    "memorando": SNAPSHOT_PREFIX_MEMORANDO,
+    "ted": SNAPSHOT_PREFIX_TED,
+}
+
+VALIDATION_STATUS_VALID = "valid_for_requested_type"
+VALIDATION_STATUS_RELATED = "related_but_not_requested"
+VALIDATION_STATUS_REJECTED = "rejected_snapshot"
+
+PUBLICATION_STATUS_GOLD = "published_gold"
+PUBLICATION_STATUS_SILVER = "retained_silver"
+
 HEADER_SCAN_CHARS = 1800
 OPENING_SCAN_CHARS = 4200
 LEAD_SCAN_CHARS = 350
@@ -249,7 +262,7 @@ def _text_blobs(
     }
 
 
-def classify_act_snapshot(
+def _classify_snapshot_core(
     snapshot: Dict[str, Any],
     collection_context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
@@ -310,17 +323,65 @@ def classify_act_snapshot(
 
 
 def _classification_record(doc_class: str, reason: str) -> Dict[str, Any]:
-    is_canonical = doc_class == DOC_CLASS_ACT_FINAL
     return {
         "doc_class": doc_class,
         "resolved_document_type": DOC_CLASS_RESOLVED_TYPE.get(doc_class, RESOLVED_TYPE_ACT_RELATED),
         "snapshot_prefix": DOC_CLASS_SNAPSHOT_PREFIX.get(doc_class, SNAPSHOT_PREFIX_ACT),
-        "is_canonical_candidate": is_canonical,
-        "normalization_status": "classificado_canonico" if is_canonical else "descartado_semantico",
-        "discard_reason": "" if is_canonical else doc_class,
         "classification_reason": reason,
         "classification_priority": DOC_CLASS_PRIORITY.get(doc_class, 0),
     }
+
+
+def _accepted_doc_classes_for_requested_type(requested_type: str) -> Tuple[str, ...]:
+    return {
+        "act": (DOC_CLASS_ACT_FINAL,),
+        "memorando": (DOC_CLASS_MEMORANDO,),
+        "ted": (DOC_CLASS_TED,),
+    }.get(requested_type, ())
+
+
+def classify_cooperation_snapshot(
+    snapshot: Dict[str, Any],
+    requested_type: str,
+    collection_context: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    requested = _clean_spaces(requested_type or "").lower()
+    base = _classify_snapshot_core(snapshot, collection_context)
+    accepted_doc_classes = _accepted_doc_classes_for_requested_type(requested)
+    doc_class = str(base.get("doc_class", "") or "")
+    is_canonical = doc_class in accepted_doc_classes
+
+    validation_status = VALIDATION_STATUS_VALID if is_canonical else VALIDATION_STATUS_RELATED
+    if doc_class in {DOC_CLASS_STUB, DOC_CLASS_EMAIL_OUTRO}:
+        validation_status = VALIDATION_STATUS_REJECTED
+
+    publication_status = PUBLICATION_STATUS_GOLD if is_canonical else PUBLICATION_STATUS_SILVER
+    normalization_status = "classificado_canonico" if is_canonical else "descartado_semantico"
+    if publication_status == PUBLICATION_STATUS_GOLD:
+        normalization_status = "publicado_canonico"
+
+    return {
+        **base,
+        "requested_type": requested,
+        "accepted_doc_classes": accepted_doc_classes,
+        "is_canonical_candidate": is_canonical,
+        "validation_status": validation_status,
+        "publication_status": publication_status,
+        "normalization_status": normalization_status,
+        "discard_reason": "" if is_canonical else doc_class,
+        "requested_snapshot_prefix": REQUESTED_TYPE_TO_PREFIX.get(requested, SNAPSHOT_PREFIX_ACT),
+    }
+
+
+def classify_act_snapshot(
+    snapshot: Dict[str, Any],
+    collection_context: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    return classify_cooperation_snapshot(
+        snapshot=snapshot,
+        requested_type="act",
+        collection_context=collection_context,
+    )
 
 
 def _read_json(path: Path) -> Dict[str, Any]:
@@ -736,8 +797,9 @@ def build_normalized_record(payload: Dict[str, Any], json_path: Path) -> Dict[st
     snapshot = payload.get("snapshot", {}) or {}
     collection = payload.get("collection", {}) or {}
     analysis = dict(payload.get("analysis", {}) or {})
+    requested_type = _clean_spaces(str(payload.get("requested_type", "") or str(payload.get("document_type", "") or ""))).lower() or "act"
     if not analysis:
-        analysis = classify_act_snapshot(snapshot, collection)
+        analysis = classify_cooperation_snapshot(snapshot, requested_type, collection)
 
     numero_acordo = ""
     data_inicio_vigencia = ""
@@ -769,6 +831,7 @@ def build_normalized_record(payload: Dict[str, Any], json_path: Path) -> Dict[st
         validation_warning = _collect_validation_warnings(payload, snapshot, vigencia_warning)
 
     record = {
+        "requested_type": requested_type,
         "numero_acordo": numero_acordo,
         "processo": _clean_spaces(str(payload.get("processo", "") or "")),
         "data_inicio_vigencia": data_inicio_vigencia,
@@ -785,6 +848,8 @@ def build_normalized_record(payload: Dict[str, Any], json_path: Path) -> Dict[st
         "doc_class": analysis.get("doc_class", ""),
         "resolved_document_type": analysis.get("resolved_document_type", ""),
         "is_canonical_candidate": bool(analysis.get("is_canonical_candidate")),
+        "validation_status": analysis.get("validation_status", ""),
+        "publication_status": analysis.get("publication_status", ""),
         "normalization_status": analysis.get("normalization_status", ""),
         "discard_reason": analysis.get("discard_reason", ""),
         "classification_reason": analysis.get("classification_reason", ""),
@@ -829,6 +894,7 @@ def export_normalized_csv(output_dir: Path, logger: Any = None) -> Dict[str, Any
         if not canonical_candidates:
             for record in records:
                 record["normalization_status"] = "descartado_nao_canonico"
+                record["publication_status"] = PUBLICATION_STATUS_SILVER
                 if not record.get("discard_reason"):
                     record["discard_reason"] = record.get("doc_class", "")
                 if not record.get("canon_rejection_reason"):
@@ -849,15 +915,18 @@ def export_normalized_csv(output_dir: Path, logger: Any = None) -> Dict[str, Any
         for record in records:
             if record is canonical:
                 record["normalization_status"] = "publicado_canonico"
+                record["publication_status"] = PUBLICATION_STATUS_GOLD
                 record["discard_reason"] = ""
                 record["canon_rejection_reason"] = ""
                 canonical_records.append(record)
             elif record.get("doc_class") == DOC_CLASS_ACT_FINAL:
                 record["normalization_status"] = "descartado_por_desempate"
+                record["publication_status"] = PUBLICATION_STATUS_SILVER
                 record["discard_reason"] = "act_final_nao_canonico"
                 record["canon_rejection_reason"] = "act_final_nao_canonico"
             else:
                 record["normalization_status"] = "descartado_nao_canonico"
+                record["publication_status"] = PUBLICATION_STATUS_SILVER
                 if not record.get("discard_reason"):
                     record["discard_reason"] = record.get("doc_class", "")
                 if not record.get("canon_rejection_reason"):
@@ -868,11 +937,14 @@ def export_normalized_csv(output_dir: Path, logger: Any = None) -> Dict[str, Any
         _log(logger, "info", "Normalizador ACT: processo %s canonico=%s.", processo, canonical.get("json_path", ""))
 
     audit_columns = [
+        "requested_type",
         "processo",
         "numero_acordo",
         "doc_class",
         "resolved_document_type",
         "is_canonical_candidate",
+        "validation_status",
+        "publication_status",
         "normalization_status",
         "discard_reason",
         "classification_reason",

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from app.documents.cooperation_common import CooperationDocumentHandler
 from app.documents.types import DocumentTypeSpec
+from app.services.act_normalizer import DOC_CLASS_ACT_FINAL
 
 ACT_SEARCH_TERMS = (
     "ACORDO DE COOPERACAO TECNICA - ACT",
@@ -40,5 +41,10 @@ def build_act_document_type() -> DocumentTypeSpec:
         handler=CooperationDocumentHandler(
             status_filename="act_status_execucao_latest.csv",
             export_act_normalized=True,
+        ),
+        accepted_doc_classes=(DOC_CLASS_ACT_FINAL,),
+        filter_type_aliases=(
+            "Acordo de Cooperação Técnica",
+            "Acordo de Cooperação",
         ),
     )

@@ -15,10 +15,13 @@ from app.services.act_normalizer import (
     DOC_CLASS_MEMORANDO,
     DOC_CLASS_TERMO_ADESAO,
     DOC_CLASS_TERMO_ADITIVO,
+    PUBLICATION_STATUS_GOLD,
     RESOLVED_TYPE_ACT,
     RESOLVED_TYPE_MEMORANDO,
+    VALIDATION_STATUS_VALID,
     build_normalized_record,
     classify_act_snapshot,
+    classify_cooperation_snapshot,
     export_normalized_csv,
 )
 
@@ -71,6 +74,18 @@ class ACTNormalizerTests(unittest.TestCase):
                     self.assertEqual(result["resolved_document_type"], RESOLVED_TYPE_ACT)
                 if expected == DOC_CLASS_MEMORANDO:
                     self.assertEqual(result["resolved_document_type"], RESOLVED_TYPE_MEMORANDO)
+
+    def test_classify_cooperation_snapshot_respects_requested_family(self) -> None:
+        snapshot = {
+            "title": "SEI - Memorando de Entendimentos",
+            "text": "Memorando de Entendimentos no 1 que entre si celebram a Uniao e o Estado de Roraima.",
+        }
+
+        result = classify_cooperation_snapshot(snapshot, requested_type="memorando", collection_context={})
+        self.assertEqual(result["doc_class"], DOC_CLASS_MEMORANDO)
+        self.assertTrue(result["is_canonical_candidate"])
+        self.assertEqual(result["validation_status"], VALIDATION_STATUS_VALID)
+        self.assertEqual(result["publication_status"], PUBLICATION_STATUS_GOLD)
 
     def test_classify_act_snapshot_rejeita_documentos_relacionados_no_cabecalho(self) -> None:
         cases = [
@@ -243,10 +258,26 @@ class ACTNormalizerTests(unittest.TestCase):
             }
             memorando_payload = {
                 "processo": "60091.000060/2023-87",
+                "requested_type": "memorando",
                 "snapshot": {
                     "title": "SEI - Memorando de Entendimentos",
                     "extraction_mode": "html_dom",
                     "text": "Memorando de Entendimentos no 1 que entre si celebram a Uniao e o Estado de Roraima.",
+                },
+                "analysis": {
+                    "doc_class": DOC_CLASS_MEMORANDO,
+                    "resolved_document_type": RESOLVED_TYPE_MEMORANDO,
+                    "snapshot_prefix": "memorando_entendimentos",
+                    "classification_reason": "cabecalho_memorando",
+                    "classification_priority": 80,
+                    "requested_type": "memorando",
+                    "accepted_doc_classes": (DOC_CLASS_MEMORANDO,),
+                    "is_canonical_candidate": True,
+                    "validation_status": VALIDATION_STATUS_VALID,
+                    "publication_status": PUBLICATION_STATUS_GOLD,
+                    "normalization_status": "publicado_canonico",
+                    "discard_reason": "",
+                    "requested_snapshot_prefix": "memorando_entendimentos",
                 },
                 "collection": {"chosen_documento": "Memorando de Entendimentos no 1 (6256843)"},
             }
@@ -271,14 +302,14 @@ class ACTNormalizerTests(unittest.TestCase):
             self.assertTrue(normalized_path.exists())
             self.assertTrue(audit_path.exists())
 
-            with normalized_path.open("r", encoding="utf-8-sig", newline="") as f:
-                rows = list(csv.DictReader(f))
+            with normalized_path.open("r", encoding="utf-8-sig", newline="") as file_obj:
+                rows = list(csv.DictReader(file_obj))
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0]["processo"], "08650.063489/2021-11")
             self.assertEqual(rows[0]["classificacao"], DOC_CLASS_ACT_FINAL)
 
-            with audit_path.open("r", encoding="utf-8-sig", newline="") as f:
-                audit_rows = list(csv.DictReader(f))
+            with audit_path.open("r", encoding="utf-8-sig", newline="") as file_obj:
+                audit_rows = list(csv.DictReader(file_obj))
             self.assertEqual(len(audit_rows), 2)
             classes = {row["doc_class"] for row in audit_rows}
             self.assertIn(DOC_CLASS_ACT_FINAL, classes)

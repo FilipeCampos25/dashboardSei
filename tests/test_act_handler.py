@@ -48,7 +48,7 @@ class ACTHandlerTests(unittest.TestCase):
                     "captured_at": "2026-03-18T10:00:00",
                     "found": True,
                     "found_in": "filter",
-                    "search_term": "Acordo de Cooperação Técnica",
+                    "search_term": "Acordo de Cooperacao Tecnica",
                     "results_count": 3,
                     "chosen_documento": "123456",
                     "selection_reason": "primeiro_resultado_mais_recente",
@@ -66,6 +66,7 @@ class ACTHandlerTests(unittest.TestCase):
             self.assertEqual(payload["document_type"], "act")
             self.assertEqual(payload["document_family"], "cooperacao")
             self.assertEqual(payload["resolved_document_type"], "act")
+            self.assertEqual(payload["requested_type"], "act")
             self.assertEqual(payload["processo"], "60090.000001/2026-00")
             self.assertEqual(payload["documento"], "123456")
             self.assertEqual(payload["collection"]["results_count"], 3)
@@ -80,10 +81,11 @@ class ACTHandlerTests(unittest.TestCase):
 
             status_path = output_dir / "act_status_execucao_latest.csv"
             self.assertTrue(status_path.exists())
-            with status_path.open("r", encoding="utf-8-sig", newline="") as f:
-                rows = list(csv.DictReader(f))
+            with status_path.open("r", encoding="utf-8-sig", newline="") as file_obj:
+                rows = list(csv.DictReader(file_obj))
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0]["document_type"], "act")
+            self.assertEqual(rows[0]["requested_type"], "act")
             self.assertEqual(rows[0]["processo"], "60090.000001/2026-00")
             self.assertEqual(rows[0]["found"], "True")
             self.assertEqual(rows[0]["results_count"], "3")
@@ -94,6 +96,8 @@ class ACTHandlerTests(unittest.TestCase):
             self.assertEqual(rows[0]["resolved_document_type"], "act")
             self.assertEqual(rows[0]["snapshot_prefix"], "acordo_cooperacao_tecnica")
             self.assertEqual(rows[0]["is_canonical_candidate"], "True")
+            self.assertEqual(rows[0]["validation_status"], "valid_for_requested_type")
+            self.assertEqual(rows[0]["publication_status"], "published_gold")
 
             normalized_path = output_dir / "act_normalizado_latest.csv"
             audit_path = output_dir / "act_classificacao_latest.csv"
@@ -102,12 +106,12 @@ class ACTHandlerTests(unittest.TestCase):
         finally:
             shutil.rmtree(output_dir, ignore_errors=True)
 
-    def test_act_handler_saves_memorando_with_separate_prefix(self) -> None:
+    def test_act_handler_saves_memorando_with_family_publication(self) -> None:
         spec = build_memorando_document_type()
         handler = spec.handler
         handler.reset_run()
         snapshot = {
-            "text": "Memorando de Entendimentos nº 1 que entre si celebram a União e o Estado de Roraima.",
+            "text": "Memorando de Entendimentos no 1 que entre si celebram a Uniao e o Estado de Roraima.",
             "tables": [],
             "extraction_mode": "html_dom",
             "title": "Memorando de Entendimentos",
@@ -148,8 +152,25 @@ class ACTHandlerTests(unittest.TestCase):
             payload = json.loads(output_path.read_text(encoding="utf-8"))
             self.assertEqual(payload["document_type"], "memorando")
             self.assertEqual(payload["document_family"], "cooperacao")
+            self.assertEqual(payload["requested_type"], "memorando")
             self.assertEqual(payload["resolved_document_type"], "memorando_entendimentos")
             self.assertEqual(payload["analysis"]["doc_class"], "memorando")
+            self.assertEqual(payload["analysis"]["validation_status"], "valid_for_requested_type")
+            self.assertEqual(payload["analysis"]["publication_status"], "published_gold")
+
+            handler.finalize_run(
+                spec=spec,
+                output_dir=output_dir,
+                logger=logger,
+                settings=settings,
+            )
+            normalized_path = output_dir / "memorando_normalizado_latest.csv"
+            self.assertTrue(normalized_path.exists())
+            with normalized_path.open("r", encoding="utf-8-sig", newline="") as file_obj:
+                rows = list(csv.DictReader(file_obj))
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["requested_type"], "memorando")
+            self.assertEqual(rows[0]["publication_status"], "published_gold")
         finally:
             shutil.rmtree(output_dir, ignore_errors=True)
 
@@ -172,7 +193,7 @@ class ACTHandlerTests(unittest.TestCase):
                     "captured_at": "2026-03-18T10:10:00",
                     "found": False,
                     "found_in": "none",
-                    "search_term": "Acordo de Cooperação Técnica",
+                    "search_term": "Acordo de Cooperacao Tecnica",
                     "results_count": 0,
                     "chosen_documento": "",
                     "selection_reason": "not_found",
@@ -188,14 +209,15 @@ class ACTHandlerTests(unittest.TestCase):
             )
 
             status_path = output_dir / "act_status_execucao_latest.csv"
-            with status_path.open("r", encoding="utf-8-sig", newline="") as f:
-                rows = list(csv.DictReader(f))
+            with status_path.open("r", encoding="utf-8-sig", newline="") as file_obj:
+                rows = list(csv.DictReader(file_obj))
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0]["found"], "False")
             self.assertEqual(rows[0]["selection_reason"], "not_found")
             self.assertEqual(rows[0]["results_count"], "0")
             self.assertEqual(rows[0]["normalization_status"], "not_found")
             self.assertEqual(rows[0]["discard_reason"], "not_found")
+            self.assertEqual(rows[0]["publication_status"], "retained_silver")
         finally:
             shutil.rmtree(output_dir, ignore_errors=True)
 
