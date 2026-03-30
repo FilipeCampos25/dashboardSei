@@ -24,6 +24,7 @@ from app.config import get_settings
 from app.core.driver_factory import create_chrome_driver
 from app.core.logging_config import setup_logger
 from app.documents import resolve_document_types
+from app.documents.common import sanitize_snapshot
 from app.documents.types import DocumentTypeSpec
 from app.output import csv_writer
 from app.rpa.sei import process_navigation
@@ -258,7 +259,7 @@ class SEIScraper:
         output_dir = self._resolve_preview_output_dir()
         csv_writer.ensure_output_dir(output_dir)
 
-        cleanup_patterns = {"parcerias_vigentes_latest.csv"}
+        cleanup_patterns = {"parcerias_vigentes_latest.csv", "dashboard_ready_latest.csv"}
         for document_type in self.document_types:
             document_type.handler.reset_run()
             cleanup_patterns.update(document_type.cleanup_patterns)
@@ -2708,6 +2709,7 @@ class SEIScraper:
 
     def _validate_snapshot_for_document_type(
         self,
+        processo: str,
         document_type: DocumentTypeSpec,
         snapshot: Dict[str, Any],
         collection_context: Optional[Dict[str, Any]] = None,
@@ -2725,7 +2727,7 @@ class SEIScraper:
             return (False, "pagina_de_pesquisa", None)
 
         if document_type.key in {"act", "memorando", "ted"}:
-            analysis = classify_cooperation_snapshot(snapshot, document_type.key, collection_context)
+            analysis = classify_cooperation_snapshot(snapshot, document_type.key, collection_context, processo=processo)
             return (True, str(analysis.get("doc_class", "") or "ok"), analysis)
 
         if document_type.key == "pt":
@@ -2755,11 +2757,14 @@ class SEIScraper:
             )
             if iframe_info:
                 self.logger.info("Processo %s: iframes pre_snapshot=%s", processo, iframe_info)
-            snapshot = document_text_extractor.extract_document_snapshot(
-                self.driver,
-                logger=self.logger,
+            snapshot = sanitize_snapshot(
+                document_text_extractor.extract_document_snapshot(
+                    self.driver,
+                    logger=self.logger,
+                )
             )
             is_valid, validation_reason, analysis = self._validate_snapshot_for_document_type(
+                processo,
                 document_type,
                 snapshot,
                 collection_context,

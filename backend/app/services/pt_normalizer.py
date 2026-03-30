@@ -137,10 +137,21 @@ def _maybe_fix_mojibake(value: str) -> str:
     text = value or ""
     if not text or not any(marker in text for marker in ("Ã", "Â", "\ufffd")):
         return text
-    try:
-        return text.encode("latin1").decode("utf-8")
-    except UnicodeError:
-        return text
+    repaired = text
+    for _ in range(2):
+        candidate = repaired
+        for source_encoding in ("latin1", "cp1252"):
+            try:
+                candidate = repaired.encode(source_encoding).decode("utf-8")
+                break
+            except UnicodeError:
+                candidate = repaired
+        if candidate == repaired:
+            break
+        repaired = candidate
+        if not any(marker in repaired for marker in ("Ã", "Â", "â", "\ufffd")):
+            break
+    return repaired
 
 
 def _prepare_text(value: str) -> str:
@@ -824,6 +835,7 @@ def export_normalized_csv(output_dir: Path, logger: Any = None) -> Dict[str, Any
     published_rows = [record for record in records if record.get("publication_status") == PUBLICATION_STATUS_GOLD]
     csv_path = output_dir / "pt_normalizado_latest.csv"
     complete_path = output_dir / "pt_normalizado_completo_latest.csv"
+    # Ambos os arquivos publicam apenas o subconjunto gold; a dashboard deve consumir o export consolidado.
     csv_writer.write_csv(published_rows, csv_path, columns=columns)
     csv_writer.write_csv(published_rows, complete_path, columns=columns)
 

@@ -16,8 +16,10 @@ from app.services.act_normalizer import (
     DOC_CLASS_TERMO_ADESAO,
     DOC_CLASS_TERMO_ADITIVO,
     PUBLICATION_STATUS_GOLD,
+    PUBLICATION_STATUS_SILVER,
     RESOLVED_TYPE_ACT,
     RESOLVED_TYPE_MEMORANDO,
+    VALIDATION_STATUS_RELATED,
     VALIDATION_STATUS_VALID,
     build_normalized_record,
     classify_act_snapshot,
@@ -169,6 +171,136 @@ class ACTNormalizerTests(unittest.TestCase):
         self.assertEqual(record["field_source_vigencia"], "clausula_vigencia_ultima_assinatura")
         self.assertEqual(record["validation_warning"], "")
 
+    def test_build_normalized_record_handles_mojibake_and_external_process_reference(self) -> None:
+        title_mojibake = b"SEI - Acordo de Coopera\xc3\xa7\xc3\xa3o T\xc3\xa9cnica".decode("latin1")
+        body_mojibake = (
+            b"Acordo de Coopera\xc3\xa7\xc3\xa3o T\xc3\xa9cnica (PROCESSO INPE N\xc2\xba - 01340.009269/2023-68)\n"
+            b"ACORDO DE COOPERA\xc3\x87\xc3\x83O T\xc3\x89CNICA QUE ENTRE SI CELEBRAM A UNI\xc3\x83O, POR INTERM\xc3\x89DIO DO\n"
+            b"INSTITUTO NACIONAL DE PESQUISAS ESPACIAIS - INPE E O MINIST\xc3\x89RIO DA DEFESA POR INTERM\xc3\x89DIO\n"
+            b"DO CENTRO GESTOR E OPERACIONAL DO SISTEMA DE PROTE\xc3\x87\xc3\x83O DA AMAZ\xc3\x94NIA - CENSIPAM,\n"
+            b"PARA OS FINS QUE ESPECIFICA.\n\n"
+            b"RESOLVEM celebrar o presente Acordo de Coopera\xc3\xa7\xc3\xa3o T\xc3\xa9cnica tendo em vista o que consta\n"
+            b"do Processo n. 01340.003873/2025-42.\n"
+        ).decode("latin1")
+        payload = {
+            "processo": "60090.000702/2025-10",
+            "snapshot": {
+                "title": title_mojibake,
+                "extraction_mode": "html_dom",
+                "text": f"""
+                    Instituto Nacional de Pesquisas Espaciais
+                    {body_mojibake}
+
+                    1. CLÁUSULA PRIMEIRA – DO OBJETO
+                    O objeto do presente Acordo de Cooperação Técnica é a execução de atividades conjuntas
+                    de CT&I relativamente ao projeto Rede INPE-CENSIPAM.
+
+                    9. CLÁUSULA NONA – DO PRAZO E VIGÊNCIA
+                    O prazo de vigência deste Acordo de Cooperação Técnica é de 5 anos a partir da data da última assinatura.
+
+                    Documento assinado eletronicamente por Antonio Miguel Vieira Monteiro, em 10/11/2025.
+                    Documento assinado eletronicamente por Richard Fernandez Nunes, em 05/01/2026.
+                """,
+            },
+            "collection": {"chosen_documento": b"Acordo de Coopera\xc3\xa7\xc3\xa3o T\xc3\xa9cnica INPE-CENSIPAM".decode("latin1")},
+        }
+
+        record = build_normalized_record(payload, Path("acordo_cooperacao_tecnica_60090.000702_2025-10.json"))
+        self.assertEqual(record["validation_status"], VALIDATION_STATUS_VALID)
+        self.assertEqual(record["publication_status"], PUBLICATION_STATUS_GOLD)
+        self.assertEqual(record["data_inicio_vigencia"], "2026-01-05")
+        self.assertEqual(record["data_fim_vigencia"], "2031-01-04")
+        self.assertIn("instituto nacional de pesquisas espaciais", record["orgao_convenente"].lower())
+        self.assertIn("rede inpe-censipam", record["objeto"].lower())
+        self.assertIn("processo_referencia_externa_documento=01340.009269/2023-68", record["validation_warning"])
+
+    def test_build_normalized_record_extracts_orgao_when_censipam_is_second_party(self) -> None:
+        payload = {
+            "processo": "60090.001292/2025-24",
+            "snapshot": {
+                "title": "SEI - Acordo de Cooperacao Tecnica",
+                "extraction_mode": "html_dom",
+                "text": """
+                    ACORDO DE COOPERAÇÃO TÉCNICA Nº 1-2025/MB/DIGER
+                    ACORDO DE COOPERAÇÃO TÉCNICA QUE ENTRE SI CELEBRAM A MARINHA DO BRASIL,
+                    POR INTERMÉDIO DO ESTADO-MAIOR DA ARMADA, E O CENTRO GESTOR E OPERACIONAL
+                    DO SISTEMA DE PROTEÇÃO DA AMAZÔNIA PARA OS FINS QUE ESPECIFICA.
+
+                    A Marinha do Brasil (MB), com sede em Brasília, DF, inscrita no CNPJ/MF sob o nº 00.394.502/0074-08.
+                    O Centro Gestor e Operacional do Sistema de Proteção da Amazônia (CENSIPAM),
+                    com sede em Brasília, DF, inscrito no CNPJ/MF sob o nº 07.129.796/0001-26.
+
+                    CLÁUSULA PRIMEIRA – DO OBJETO
+                    O objeto do presente Acordo de Cooperação Técnica é a execução colaborativa de atividades
+                    voltadas à geração de conhecimento operacional.
+
+                    CLÁUSULA NONA – DO PRAZO E VIGÊNCIA
+                    O prazo de vigência deste Acordo de Cooperação Técnica será de 5 anos a partir da assinatura.
+
+                    Brasília, DF, em 5 de novembro de 2025.
+                """,
+            },
+            "collection": {"chosen_documento": "ACT MB DIGER"},
+        }
+
+        record = build_normalized_record(payload, Path("acordo_cooperacao_tecnica_60090.001292_2025-24.json"))
+        self.assertEqual(record["numero_acordo"], "1-2025/mb/diger")
+        self.assertEqual(record["data_inicio_vigencia"], "2025-11-05")
+        self.assertEqual(record["data_fim_vigencia"], "2030-11-04")
+        self.assertIn("marinha do brasil", record["orgao_convenente"].lower())
+        self.assertEqual(record["field_source_vigencia"], "clausula_vigencia_assinatura")
+
+    def test_build_normalized_record_extracts_objeto_outside_first_clause(self) -> None:
+        payload = {
+            "processo": "60090.001333/2026-44",
+            "snapshot": {
+                "title": "SEI - Acordo de Cooperacao Tecnica",
+                "extraction_mode": "html_dom",
+                "text": """
+                    ACORDO DE COOPERACAO TECNICA Nº 7/2026 QUE ENTRE SI CELEBRAM A UNIÃO,
+                    POR INTERMÉDIO DO CENSIPAM E A UNIVERSIDADE FEDERAL DE TESTE.
+
+                    CLÁUSULA PRIMEIRA – DAS DISPOSIÇÕES INICIAIS
+                    As partes definem as premissas institucionais.
+
+                    CLÁUSULA SEGUNDA – DO OBJETO
+                    O objeto do presente Acordo de Cooperação Técnica é a implantação conjunta
+                    de laboratório de monitoramento remoto.
+                """,
+            },
+            "collection": {"chosen_documento": "Acordo de Cooperacao Tecnica 7/2026"},
+        }
+
+        record = build_normalized_record(payload, Path("acordo_cooperacao_tecnica_60090.001333_2026-44.json"))
+        self.assertIn("monitoramento remoto", record["objeto"].lower())
+        self.assertEqual(record["field_source_objeto"], "clausula_objeto")
+
+    def test_build_normalized_record_relegates_materially_divergent_act_to_silver(self) -> None:
+        payload = {
+            "processo": "60090.000615/2022-10",
+            "snapshot": {
+                "title": "SEI - Acordo de Cooperacao Tecnica",
+                "extraction_mode": "html_dom",
+                "text": """
+                    MINISTÉRIO DA ECONOMIA
+                    ACORDO DE COOPERAÇÃO TÉCNICA Nº 109/2022
+                    TERMO DE COOPERAÇÃO TÉCNICA QUE, ENTRE SI, CELEBRAM A UNIÃO,
+                    POR INTERMÉDIO DA CENTRAL DE COMPRAS E O BANCO DO BRASIL S.A.
+                    Processo nº 14022.172688/2022-07.
+
+                    CLÁUSULA PRIMEIRA – DO OBJETO
+                    O objeto do presente acordo é a operacionalização de conta-depósito vinculada.
+                """,
+            },
+            "collection": {"chosen_documento": "Acordo de Cooperacao Tecnica 109/2022"},
+        }
+
+        record = build_normalized_record(payload, Path("acordo_cooperacao_tecnica_60090.000615_2022-10.json"))
+        self.assertEqual(record["validation_status"], VALIDATION_STATUS_RELATED)
+        self.assertEqual(record["publication_status"], PUBLICATION_STATUS_SILVER)
+        self.assertEqual(record["classification_reason"], "act_sem_marcador_interno")
+        self.assertIn("processo_divergente_documento=14022.172688/2022-07", record["validation_warning"])
+
     def test_build_normalized_record_leaves_missing_fields_blank_when_only_publication_rule_exists(self) -> None:
         payload = {
             "processo": "60090.000445/2023-54",
@@ -239,7 +371,8 @@ class ACTNormalizerTests(unittest.TestCase):
                     "text": """
                         Acordo de Cooperacao Tecnica no 2/2023
                         PROCESSO No 08650.063489/2021-11
-                        ACORDO DE COOPERACAO TECNICA No 2/2023 QUE ENTRE SI CELEBRAM A UNIAO
+                        ACORDO DE COOPERACAO TECNICA No 2/2023 QUE ENTRE SI CELEBRAM A UNIAO,
+                        REPRESENTADA PELO MINISTERIO DA DEFESA, POR INTERMEDIO DO CENSIPAM
                         E A POLICIA RODOVIARIA FEDERAL.
                         CLAUSULA PRIMEIRA - DO OBJETO
                         O objeto do presente Acordo de Cooperacao Tecnica e a realizacao da analise integrada de informacoes.

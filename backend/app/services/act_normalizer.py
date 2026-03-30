@@ -5,7 +5,7 @@ import re
 import unicodedata
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from app.output import csv_writer
 
@@ -90,6 +90,17 @@ PUBLICATION_STATUS_SILVER = "retained_silver"
 HEADER_SCAN_CHARS = 1800
 OPENING_SCAN_CHARS = 4200
 LEAD_SCAN_CHARS = 350
+PROCESS_SCAN_CHARS = 12000
+SECTION_WINDOW_CHARS = 2200
+
+DATE_PATTERN = r"(\d{1,2}(?:[./-]\d{1,2}[./-]\d{4}|\s+de\s+[A-Za-z\u00c0-\u00ff]+\s+de\s+\d{4}))"
+PROCESS_PATTERN = r"[0-9]{5}\.[0-9]{6}/[0-9]{4}-[0-9]{2}"
+SECTION_STOP_PATTERN = (
+    r"(?:\n\s*(?:\d+\s*[.)-]\s*)?CL[\u00c1A]USULA\b"
+    r"|\n\s*SUBCL[\u00c1A]USULA\b"
+    r"|\n\s*REFER[\u00caE]NCIA:\b"
+    r"|\bDocumento assinado eletronicamente\b)"
+)
 
 CONTRACTUAL_MARKERS = (
     "que entre si celebram",
@@ -166,6 +177,13 @@ PERIODIC_REPORT_MARKERS = (
     "anual",
 )
 
+INTERNAL_ACT_MARKERS = (
+    "censipam",
+    "ministerio da defesa",
+    "centro gestor e operacional do sistema de protecao da amazonia",
+    "sistema de protecao da amazonia",
+)
+
 
 def _log(logger: Any, level: str, msg: str, *args: Any) -> None:
     if logger is None:
@@ -184,12 +202,24 @@ def _clean_spaces(value: str) -> str:
 
 def _maybe_fix_mojibake(value: str) -> str:
     text = value or ""
-    if not text or not any(marker in text for marker in ("Ãƒ", "Ã‚", "\ufffd")):
+    if not text or not any(marker in text for marker in ("Ã", "Â", "â", "\ufffd")):
         return text
-    try:
-        return text.encode("latin1").decode("utf-8")
-    except UnicodeError:
-        return text
+
+    repaired = text
+    for _ in range(2):
+        candidate = repaired
+        for source_encoding in ("latin1", "cp1252"):
+            try:
+                candidate = repaired.encode(source_encoding).decode("utf-8")
+                break
+            except UnicodeError:
+                candidate = repaired
+        if candidate == repaired:
+            break
+        repaired = candidate
+        if not any(marker in repaired for marker in ("Ã", "Â", "â", "\ufffd")):
+            break
+    return repaired
 
 
 def _prepare_text(value: str) -> str:
@@ -198,14 +228,23 @@ def _prepare_text(value: str) -> str:
         return ""
     replacements = {
         "\u00a0": " ",
-        "Ã¢â‚¬â€œ": "-",
-        "Ã¢â‚¬â€": "-",
-        "â€“": "-",
-        "â€”": "-",
+        "\ufb01": "fi",
+        "\ufb02": "fl",
+        "\ufb00": "ff",
+        "\ufb03": "ffi",
+        "\ufb04": "ffl",
+        "Гўв‚¬вЂњ": "-",
+        "Гўв‚¬вЂќ": "-",
+        "вЂ“": "-",
+        "вЂ”": "-",
     }
     for src, dst in replacements.items():
         text = text.replace(src, dst)
     text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"\bPORINTERM[EÉ]DIO\b", "POR INTERMEDIO", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bPARAOPERA[CÇ][AÃ]O\b", "PARA OPERACAO", text, flags=re.IGNORECASE)
+    text = re.sub(r"(?<=[a-z\u00e0-\u00ff])(?=[A-Z\u00c0-\u00dd])", " ", text)
+    text = re.sub(r"(?<=[A-Za-z\u00c0-\u00ff])(?=\d{4}\b)", " ", text)
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
@@ -217,7 +256,8 @@ def _normalize_text(value: str) -> str:
         return ""
     text = unicodedata.normalize("NFKD", text)
     text = "".join(ch for ch in text if not unicodedata.combining(ch))
-    return re.sub(r"\s+", " ", text.lower().replace("Âº", "o").replace("Â°", "o")).strip()
+    text = text.lower().replace("\u00ba", "o").replace("\u00b0", "o")
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def _trim_noise(value: str) -> str:
@@ -227,7 +267,8 @@ def _trim_noise(value: str) -> str:
     for marker in INVALID_TAIL_MARKERS:
         match = re.search(re.escape(marker), prepared, flags=re.IGNORECASE)
         if match:
-            return prepared[: match.start()].strip()
+            prepared = prepared[: match.start()]
+            break
     return prepared.strip()
 
 
@@ -262,6 +303,16 @@ def _text_blobs(
     }
 
 
+def _classification_record(doc_class: str, reason: str) -> Dict[str, Any]:
+    return {
+        "doc_class": doc_class,
+        "resolved_document_type": DOC_CLASS_RESOLVED_TYPE.get(doc_class, RESOLVED_TYPE_ACT_RELATED),
+        "snapshot_prefix": DOC_CLASS_SNAPSHOT_PREFIX.get(doc_class, SNAPSHOT_PREFIX_ACT),
+        "classification_reason": reason,
+        "classification_priority": DOC_CLASS_PRIORITY.get(doc_class, 0),
+    }
+
+
 def _classify_snapshot_core(
     snapshot: Dict[str, Any],
     collection_context: Optional[Dict[str, Any]] = None,
@@ -281,10 +332,7 @@ def _classify_snapshot_core(
     if not opening_blob:
         return _classification_record(DOC_CLASS_EMAIL_OUTRO, "snapshot_vazio")
 
-    if (
-        "pesquisar no processo" in opening_blob
-        or "tipos de documentos disponiveis neste processo" in opening_blob
-    ):
+    if "pesquisar no processo" in opening_blob or "tipos de documentos disponiveis neste processo" in opening_blob:
         return _classification_record(DOC_CLASS_STUB, "pagina_de_pesquisa")
 
     if "clique aqui para visualizar o conteudo deste documento" in opening_blob:
@@ -322,16 +370,6 @@ def _classify_snapshot_core(
     return _classification_record(DOC_CLASS_EMAIL_OUTRO, "conteudo_nao_classificado")
 
 
-def _classification_record(doc_class: str, reason: str) -> Dict[str, Any]:
-    return {
-        "doc_class": doc_class,
-        "resolved_document_type": DOC_CLASS_RESOLVED_TYPE.get(doc_class, RESOLVED_TYPE_ACT_RELATED),
-        "snapshot_prefix": DOC_CLASS_SNAPSHOT_PREFIX.get(doc_class, SNAPSHOT_PREFIX_ACT),
-        "classification_reason": reason,
-        "classification_priority": DOC_CLASS_PRIORITY.get(doc_class, 0),
-    }
-
-
 def _accepted_doc_classes_for_requested_type(requested_type: str) -> Tuple[str, ...]:
     return {
         "act": (DOC_CLASS_ACT_FINAL,),
@@ -340,16 +378,103 @@ def _accepted_doc_classes_for_requested_type(requested_type: str) -> Tuple[str, 
     }.get(requested_type, ())
 
 
+def _has_internal_act_context(
+    snapshot: Dict[str, Any],
+    collection_context: Optional[Dict[str, Any]] = None,
+) -> bool:
+    blobs = _text_blobs(snapshot, collection_context)
+    opening_blob = " ".join(
+        part
+        for part in (
+            blobs["normalized_title"],
+            blobs["normalized_selected"],
+            blobs["normalized_opening"],
+        )
+        if part
+    )
+    return any(marker in opening_blob for marker in INTERNAL_ACT_MARKERS)
+
+
+def _extract_document_processes(snapshot: Dict[str, Any]) -> List[str]:
+    source = " ".join(
+        part
+        for part in (
+            _prepare_text(str(snapshot.get("title", "") or "")),
+            _trim_noise(str(snapshot.get("text", "") or ""))[:PROCESS_SCAN_CHARS],
+        )
+        if part
+    )
+    normalized = _normalize_text(source)
+    if not normalized:
+        return []
+
+    processes: List[str] = []
+    for match in re.findall(PROCESS_PATTERN, normalized):
+        cleaned = _clean_spaces(match)
+        if cleaned and cleaned not in processes:
+            processes.append(cleaned)
+    return processes
+
+
+def _assess_process_alignment(
+    snapshot: Dict[str, Any],
+    *,
+    processo: str,
+    has_internal_context: Optional[bool] = None,
+) -> Dict[str, Any]:
+    payload_processo = _clean_spaces(processo)
+    document_processos = _extract_document_processes(snapshot)
+    if not payload_processo or not document_processos:
+        return {
+            "status": "unknown",
+            "document_processo": "",
+            "document_processos": document_processos,
+        }
+    if payload_processo in document_processos:
+        return {
+            "status": "aligned",
+            "document_processo": payload_processo,
+            "document_processos": document_processos,
+        }
+    internal_context = has_internal_context if has_internal_context is not None else _has_internal_act_context(snapshot)
+    return {
+        "status": "external_reference" if internal_context else "material_mismatch",
+        "document_processo": document_processos[0],
+        "document_processos": document_processos,
+    }
+
+
 def classify_cooperation_snapshot(
     snapshot: Dict[str, Any],
     requested_type: str,
     collection_context: Optional[Dict[str, Any]] = None,
+    processo: str = "",
 ) -> Dict[str, Any]:
     requested = _clean_spaces(requested_type or "").lower()
     base = _classify_snapshot_core(snapshot, collection_context)
     accepted_doc_classes = _accepted_doc_classes_for_requested_type(requested)
     doc_class = str(base.get("doc_class", "") or "")
+    classification_reason = str(base.get("classification_reason", "") or "")
     is_canonical = doc_class in accepted_doc_classes
+    discard_reason = "" if is_canonical else doc_class
+    has_internal_context = False
+    process_alignment = {"status": "unknown", "document_processo": "", "document_processos": []}
+
+    if requested == "act" and doc_class == DOC_CLASS_ACT_FINAL:
+        has_internal_context = _has_internal_act_context(snapshot, collection_context)
+        process_alignment = _assess_process_alignment(
+            snapshot,
+            processo=processo,
+            has_internal_context=has_internal_context,
+        )
+        if not has_internal_context:
+            is_canonical = False
+            classification_reason = "act_sem_marcador_interno"
+            discard_reason = "act_sem_marcador_interno"
+        elif process_alignment["status"] == "material_mismatch":
+            is_canonical = False
+            classification_reason = "processo_divergente_documento"
+            discard_reason = "processo_divergente_documento"
 
     validation_status = VALIDATION_STATUS_VALID if is_canonical else VALIDATION_STATUS_RELATED
     if doc_class in {DOC_CLASS_STUB, DOC_CLASS_EMAIL_OUTRO}:
@@ -368,19 +493,26 @@ def classify_cooperation_snapshot(
         "validation_status": validation_status,
         "publication_status": publication_status,
         "normalization_status": normalization_status,
-        "discard_reason": "" if is_canonical else doc_class,
+        "discard_reason": "" if is_canonical else discard_reason,
+        "classification_reason": classification_reason,
         "requested_snapshot_prefix": REQUESTED_TYPE_TO_PREFIX.get(requested, SNAPSHOT_PREFIX_ACT),
+        "has_internal_context": has_internal_context,
+        "process_alignment_status": process_alignment["status"],
+        "document_processo": process_alignment["document_processo"],
+        "document_processos": process_alignment["document_processos"],
     }
 
 
 def classify_act_snapshot(
     snapshot: Dict[str, Any],
     collection_context: Optional[Dict[str, Any]] = None,
+    processo: str = "",
 ) -> Dict[str, Any]:
     return classify_cooperation_snapshot(
         snapshot=snapshot,
         requested_type="act",
         collection_context=collection_context,
+        processo=processo,
     )
 
 
@@ -471,19 +603,31 @@ def _add_duration(start_iso: str, raw_amount: str, raw_unit: str) -> str:
     return ""
 
 
+def _dedupe(values: Iterable[str]) -> List[str]:
+    out: List[str] = []
+    for value in values:
+        cleaned = _clean_spaces(value)
+        if cleaned and cleaned not in out:
+            out.append(cleaned)
+    return out
+
+
 def _extract_signature_dates(text: str) -> List[str]:
     prepared = _prepare_text(text)
-    matches = re.findall(
-        r"documento assinado eletronicamente .*? em (\d{1,2}/\d{1,2}/\d{4})",
-        prepared,
-        flags=re.IGNORECASE,
-    )
-    out: List[str] = []
-    for token in matches:
-        iso = _normalize_date_token(token)
-        if iso and iso not in out:
-            out.append(iso)
-    return out
+    if not prepared:
+        return []
+    matches: List[str] = []
+    for pattern in (
+        rf"documento assinado eletronicamente .*? em {DATE_PATTERN}",
+        rf"assinad[oa].{{0,200}}?\bem\s+{DATE_PATTERN}",
+        rf"(?:bras[ií]lia(?:,\s*df)?|cidade)\s*,?\s*em\s+{DATE_PATTERN}",
+    ):
+        for match in re.finditer(pattern, prepared, flags=re.IGNORECASE | re.DOTALL):
+            token = match.group(1)
+            iso = _normalize_date_token(token)
+            if iso:
+                matches.append(iso)
+    return _dedupe(matches)
 
 
 def _extract_preamble(text: str) -> str:
@@ -496,6 +640,17 @@ def _extract_preamble(text: str) -> str:
     return prepared[:OPENING_SCAN_CHARS].strip()
 
 
+def _extract_focus_window(text: str, patterns: Tuple[str, ...], window_chars: int = SECTION_WINDOW_CHARS) -> str:
+    prepared = _prepare_text(text)
+    if not prepared:
+        return ""
+    for pattern in patterns:
+        match = re.search(pattern, prepared, flags=re.IGNORECASE)
+        if match:
+            return prepared[match.start() : match.start() + window_chars].strip()
+    return ""
+
+
 def _extract_section(text: str, heading_patterns: Tuple[str, ...]) -> str:
     prepared = _prepare_text(text)
     if not prepared:
@@ -504,14 +659,17 @@ def _extract_section(text: str, heading_patterns: Tuple[str, ...]) -> str:
         match = re.search(heading_pattern, prepared, flags=re.IGNORECASE)
         if not match:
             continue
-        tail = prepared[match.end():]
-        stop = re.search(
-            r"\bCL[\u00c1A]USULA\b|\bSUBCL[\u00c1A]USULA\b|\bREFER[\u00caE]NCIA:\b|Documento assinado eletronicamente",
-            tail,
-            flags=re.IGNORECASE,
-        )
+        tail = prepared[match.end() :]
+        stop = re.search(SECTION_STOP_PATTERN, tail, flags=re.IGNORECASE)
         return tail[: stop.start()].strip() if stop else tail.strip()
     return ""
+
+
+def _clean_clause_value(value: str) -> str:
+    cleaned = _trim_noise(value)
+    cleaned = re.split(r"\bSubcl[a\u00e1]usula\b", cleaned, maxsplit=1, flags=re.IGNORECASE)[0]
+    cleaned = re.sub(r"^[\s\-:.;]+", "", cleaned)
+    return _clean_spaces(cleaned)
 
 
 def _extract_numero_acordo(snapshot: Dict[str, Any]) -> Tuple[str, str]:
@@ -520,11 +678,10 @@ def _extract_numero_acordo(snapshot: Dict[str, Any]) -> Tuple[str, str]:
         ("cabecalho_documento", _trim_noise(str(snapshot.get("text", "") or ""))[:HEADER_SCAN_CHARS]),
     )
     patterns = (
-        ("cabecalho_act_tecnica", r"acordo de cooperacao tecnica\s+(?:n[o.]|no)\s*[:o]?\s*([a-z0-9./-]+)"),
+        ("cabecalho_act_tecnica", r"acordo de cooperacao tecnica\s+(?:n[o.]|no|n)?\s*[:o]?\s*([a-z0-9./-]*\d[a-z0-9./-]*)"),
         ("cabecalho_act_tecnica", r"acordo de cooperacao tecnica\s+([0-9]{1,4}/[0-9]{2,4})"),
-        ("cabecalho_act_generico", r"acordo de cooperacao\s+(?:n[o.]|no)\s*[:o]?\s*([a-z0-9./-]+)"),
+        ("cabecalho_act_generico", r"acordo de cooperacao\s+(?:n[o.]|no|n)?\s*[:o]?\s*([a-z0-9./-]*\d[a-z0-9./-]*)"),
         ("cabecalho_act_generico", r"acordo de cooperacao\s+(?!tecnica\b)([0-9]{1,4}/[0-9]{2,4})"),
-        ("cabecalho_act_generico", r"acordo de cooperacao\s+([0-9]{1,4}/[0-9]{2,4})"),
     )
     for _, source in sources:
         normalized_source = _normalize_text(source)
@@ -538,17 +695,13 @@ def _extract_numero_acordo(snapshot: Dict[str, Any]) -> Tuple[str, str]:
 
 
 def _extract_document_process(snapshot: Dict[str, Any]) -> str:
-    header = _normalize_text(_trim_noise(str(snapshot.get("text", "") or ""))[:HEADER_SCAN_CHARS])
-    if not header:
-        return ""
-    match = re.search(r"processo\s+(?:n[o.]|no)?\s*([0-9]{5}\.[0-9]{6}/[0-9]{4}-[0-9]{2})", header)
-    return _clean_spaces(match.group(1)) if match else ""
+    processes = _extract_document_processes(snapshot)
+    return processes[0] if processes else ""
 
 
 def _extract_explicit_period(prepared: str) -> Tuple[str, str]:
-    date_pattern = r"(\d{1,2}(?:[./-]\d{1,2}[./-]\d{4}|\s+de\s+[A-Za-z\u00c0-\u00ff]+\s+de\s+\d{4}))"
     match = re.search(
-        rf"(?:de|entre)\s+{date_pattern}\s+(?:a|ate|at[e\u00e9]|-)\s+{date_pattern}",
+        rf"(?:de|entre)\s+{DATE_PATTERN}\s+(?:a|ate|at[e\u00e9]|-)\s+{DATE_PATTERN}",
         prepared,
         flags=re.IGNORECASE,
     )
@@ -560,17 +713,7 @@ def _extract_explicit_period(prepared: str) -> Tuple[str, str]:
 
 
 def _extract_first_date_after_marker(prepared: str, marker: str) -> str:
-    normalized = _normalize_text(prepared)
-    marker_normalized = _normalize_text(marker)
-    idx = normalized.find(marker_normalized)
-    if idx < 0:
-        return ""
-    tail = prepared[idx:]
-    match = re.search(
-        r"(\d{1,2}(?:[./-]\d{1,2}[./-]\d{4}|\s+de\s+[A-Za-z\u00c0-\u00ff]+\s+de\s+\d{4}))",
-        tail,
-        flags=re.IGNORECASE,
-    )
+    match = re.search(rf"{re.escape(marker)}.{{0,160}}?{DATE_PATTERN}", prepared, flags=re.IGNORECASE | re.DOTALL)
     return _normalize_date_token(match.group(1)) if match else ""
 
 
@@ -579,17 +722,24 @@ def _extract_vigencia(snapshot: Dict[str, Any]) -> Tuple[str, str, str, str]:
     section = _extract_section(
         text,
         (
-            r"CL[\u00c1A]USULA\s+(?:NONA|S[\u00c9E]TIMA|QUINTA|D[\u00c9E]CIMA\s+QUINTA)\s*[-–]?\s*(?:DO\s+)?PRAZO(?:\s+E\s+VIG[\u00caE]NCIA)?",
-            r"CL[\u00c1A]USULA\s+.*?\s*[-–]?\s*(?:DA|DO)\s+VIG[\u00caE]NCIA",
+            r"(?:\d+\s*[.)-]\s*)?CL[\u00c1A]USULA\s+(?:NONA|S[\u00c9E]TIMA|OITAVA|QUINTA|D[\u00c9E]CIMA(?:\s+\w+)*)\s*[-–—]?\s*(?:DO\s+)?PRAZO(?:\s+E\s+VIG[\u00caE]NCIA)?",
+            r"(?:\d+\s*[.)-]\s*)?CL[\u00c1A]USULA\s+.*?\s*[-–—]?\s*(?:DA|DO)\s+VIG[\u00caE]NCIA",
             r"\bPRAZO\s+E\s+VIG[\u00caE]NCIA\b",
+            r"\bPRAZO\s+DE\s+VIG[\u00caE]NCIA\b",
             r"\bVIG[\u00caE]NCIA\b\s*:",
         ),
     )
     if not section:
-        normalized_text = _normalize_text(text)
-        if "prazo de vigencia" not in normalized_text and "vigencia" not in normalized_text:
+        section = _extract_focus_window(
+            text,
+            (
+                r"\bPRAZO\s+DE\s+VIG[\u00caE]NCIA\b",
+                r"\bPRAZO\s+E\s+VIG[\u00caE]NCIA\b",
+                r"\bVIG[\u00caE]NCIA\b",
+            ),
+        )
+        if not section:
             return ("", "", "", "")
-        section = _prepare_text(text[:OPENING_SCAN_CHARS])
 
     prepared = _prepare_text(section)
     explicit_start, explicit_end = _extract_explicit_period(prepared)
@@ -597,10 +747,10 @@ def _extract_vigencia(snapshot: Dict[str, Any]) -> Tuple[str, str, str, str]:
         return (explicit_start, explicit_end, "clausula_vigencia_periodo_explicito", "")
 
     normalized = _normalize_text(prepared)
-    duration = re.search(r"(\d{1,3})\s*(?:\([^)]+\))?\s+(meses|anos)", normalized, flags=re.IGNORECASE)
+    duration = re.search(r"(\d{1,3})\s*(?:\([^)]+\))?\s+(mes(?:es)?|anos?)", normalized, flags=re.IGNORECASE)
 
     start_match = re.search(
-        r"(?:a partir de|a contar de)\s+(\d{1,2}(?:[./-]\d{1,2}[./-]\d{4}|\s+de\s+[A-Za-z\u00c0-\u00ff]+\s+de\s+\d{4}))",
+        rf"(?:a partir de|a contar de|contados? de|contado da)\s+{DATE_PATTERN}",
         prepared,
         flags=re.IGNORECASE,
     )
@@ -613,15 +763,17 @@ def _extract_vigencia(snapshot: Dict[str, Any]) -> Tuple[str, str, str, str]:
             return (start_iso, end_iso, "clausula_vigencia_data_inicial_explicita", "")
         return (start_iso, "", "clausula_vigencia_data_inicial_explicita", "")
 
-    if "ultima assinatura" in normalized:
+    if "assinatura" in normalized:
         signatures = _extract_signature_dates(text)
         start_iso = max(signatures) if signatures else ""
         if not start_iso:
-            return ("", "", "", "vigencia_dependente_ultima_assinatura_sem_datas")
+            return ("", "", "", "vigencia_dependente_assinatura_sem_data")
         if duration:
             end_iso = _add_duration(start_iso, duration.group(1), duration.group(2))
-            return (start_iso, end_iso, "clausula_vigencia_ultima_assinatura", "")
-        return (start_iso, "", "clausula_vigencia_ultima_assinatura", "")
+            source = "clausula_vigencia_ultima_assinatura" if "ultima assinatura" in normalized else "clausula_vigencia_assinatura"
+            return (start_iso, end_iso, source, "")
+        source = "clausula_vigencia_ultima_assinatura" if "ultima assinatura" in normalized else "clausula_vigencia_assinatura"
+        return (start_iso, "", source, "")
 
     if "publicacao" in normalized:
         publication_date = _extract_first_date_after_marker(prepared, "publicacao")
@@ -648,26 +800,67 @@ def _looks_like_internal_orgao(value: str) -> bool:
     )
 
 
+def _clean_party_candidate(value: str) -> str:
+    candidate = _clean_spaces(value)
+    candidate = re.sub(r"^(?:a|o|as|os)\s+", "", candidate, flags=re.IGNORECASE)
+    for pattern in (
+        r",\s+por\s+interm[eé]dio.*$",
+        r",\s+neste\s+ato.*$",
+        r",\s+doravante.*$",
+        r",\s+com\s+sede.*$",
+        r",\s*inscrit[oa].*$",
+        r",\s+qualificad[oa].*$",
+    ):
+        candidate = re.sub(pattern, "", candidate, flags=re.IGNORECASE)
+    candidate = re.sub(r"\s*\([^)]*\)", "", candidate)
+    return candidate.strip(" ,.;:-")
+
+
 def _extract_orgao_convenente(snapshot: Dict[str, Any]) -> Tuple[str, str]:
     preamble = _extract_preamble(str(snapshot.get("text", "") or ""))
     if not preamble:
         return ("", "")
-    patterns = (
-        r"que entre si celebram.*?censipam\s+e\s+(?:a|o|as|os)\s+(.+?),\s+para os fins que especifica",
-        r"que entre si celebram.*?censipam\s+e\s+(?:a|o|as|os)\s+(.+?),\s+doravante",
-        r"que entre si celebram.*?censipam\s+e\s+(?:a|o|as|os)\s+(.+?),\s+neste ato",
-        r"censipam\s+e\s+(?:a|o|as|os)\s+(.+?),\s+para os fins que especifica",
-    )
-    for pattern in patterns:
+
+    for pattern in (
+        r"que entre si celebram\s+a\s+uniao,\s+por\s+interm[eé]dio\s+do\s+(.+?)(?:,\s*|\s+)e\s+o\s+ministerio\s+da\s+defesa",
+        r"que entre si celebram.*?censipam\s+e\s+(?:a|o|as|os)\s+(.+?)(?:,\s+para os fins que especifica|,\s+doravante|,\s+neste ato)",
+        r"que entre si celebram\s+(?:a|o|as|os)\s+(.+?)(?:,\s*|\s+)e\s+(?:o|a)\s+(?:centro gestor e operacional do sistema de protecao da amazonia|censipam)",
+    ):
         match = re.search(pattern, preamble, flags=re.IGNORECASE | re.DOTALL)
         if not match:
             continue
-        candidate = _clean_spaces(match.group(1))
-        candidate = re.split(r",\s*neste ato representad", candidate, maxsplit=1, flags=re.IGNORECASE)[0]
-        candidate = re.split(r",\s*doravante", candidate, maxsplit=1, flags=re.IGNORECASE)[0]
-        candidate = re.split(r",\s*inscrit[oa]\s+no", candidate, maxsplit=1, flags=re.IGNORECASE)[0]
+        candidate = _clean_party_candidate(match.group(1))
         if _has_content(candidate, min_alpha=4) and not _looks_like_internal_orgao(candidate):
             return (candidate, "preambulo_qualificacao_partes")
+
+    for paragraph in re.split(r"\n\s*\n", _prepare_text(preamble)):
+        snippet = _clean_spaces(paragraph[:900])
+        if not snippet:
+            continue
+        for pattern in (
+            r"^(?:a|o)\s+(.+?)(?:,\s+com\s+sede|,\s*inscrit[oa]|,\s+neste\s+ato|,\s+doravante)",
+            r"^(?:a|o)\s+(.+?)(?:\s+com\s+sede|\s*inscrit[oa])",
+        ):
+            match = re.search(pattern, snippet, flags=re.IGNORECASE)
+            if not match:
+                continue
+            candidate = _clean_party_candidate(match.group(1))
+            if _has_content(candidate, min_alpha=4) and not _looks_like_internal_orgao(candidate):
+                return (candidate, "preambulo_paragrafo_partes")
+
+    normalized_preamble = _normalize_text(preamble)
+    for pattern in (
+        r"que entre si celebram\s+a\s+uniao,\s+por\s+intermedio\s+do\s+(.+?)(?:,\s*|\s+)e\s+o\s+ministerio\s+da\s+defesa",
+        r"que entre si celebram.*?censipam\s+e\s+(?:a|o|as|os)\s+(.+?)(?:,\s+para os fins que especifica|,\s+doravante|,\s+neste ato)",
+        r"que entre si celebram\s+(?:a|o|as|os)\s+(.+?)(?:,\s*|\s+)e\s+(?:o|a)\s+(?:centro gestor e operacional do sistema de protecao da amazonia|censipam)",
+    ):
+        match = re.search(pattern, normalized_preamble, flags=re.IGNORECASE | re.DOTALL)
+        if not match:
+            continue
+        candidate = _clean_party_candidate(match.group(1))
+        if _has_content(candidate, min_alpha=4) and not _looks_like_internal_orgao(candidate):
+            return (candidate, "preambulo_normalizado_partes")
+
     return ("", "")
 
 
@@ -676,13 +869,14 @@ def _extract_objeto(snapshot: Dict[str, Any]) -> Tuple[str, str]:
     section = _extract_section(
         text,
         (
-            r"CL[\u00c1A]USULA\s+PRIMEIRA\s*[-–]?\s*DO\s+OBJETO",
+            r"(?:\d+\s*[.)-]\s*)?CL[\u00c1A]USULA\s+PRIMEIRA\s*[-–—]?\s*(?:DO|DA)\s+OBJETO",
+            r"(?:\d+\s*[.)-]\s*)?CL[\u00c1A]USULA\s+.*?\s*[-–—]?\s*(?:DO|DA)\s+OBJETO",
             r"\bDO\s+OBJETO\b\s*:",
             r"\bOBJETO\b\s*:",
         ),
     )
     if section:
-        cleaned = _clean_spaces(re.split(r"\bSubcl[a\u00e1]usula\b", section, maxsplit=1, flags=re.IGNORECASE)[0].strip())
+        cleaned = _clean_clause_value(section)
         return (cleaned, "clausula_objeto") if cleaned else ("", "")
 
     prepared = _prepare_text(text[:HEADER_SCAN_CHARS])
@@ -736,14 +930,25 @@ def _extract_relatorio_encerramento(snapshot: Dict[str, Any]) -> bool:
     return False
 
 
-def _collect_validation_warnings(payload: Dict[str, Any], snapshot: Dict[str, Any], vigencia_warning: str) -> str:
+def _collect_validation_warnings(
+    payload: Dict[str, Any],
+    analysis: Dict[str, Any],
+    vigencia_warning: str,
+) -> str:
     warnings: List[str] = []
-    payload_processo = _clean_spaces(str(payload.get("processo", "") or ""))
-    document_processo = _extract_document_process(snapshot)
-    if payload_processo and document_processo and payload_processo != document_processo:
+    alignment_status = _clean_spaces(str(analysis.get("process_alignment_status", "") or ""))
+    document_processo = _clean_spaces(str(analysis.get("document_processo", "") or ""))
+    if alignment_status == "material_mismatch" and document_processo:
         warnings.append(f"processo_divergente_documento={document_processo}")
+    elif alignment_status == "external_reference" and document_processo:
+        warnings.append(f"processo_referencia_externa_documento={document_processo}")
+    if _clean_spaces(str(analysis.get("classification_reason", "") or "")) == "act_sem_marcador_interno":
+        warnings.append("act_sem_marcador_interno")
     if vigencia_warning:
         warnings.append(vigencia_warning)
+    payload_processo = _clean_spaces(str(payload.get("processo", "") or ""))
+    if not payload_processo and document_processo:
+        warnings.append(f"processo_documento_sem_payload={document_processo}")
     return "; ".join(warnings)
 
 
@@ -782,6 +987,15 @@ def _canonical_score(payload: Dict[str, Any], normalized_record: Dict[str, Any])
     if normalized_record.get("orgao_convenente"):
         score += 10
 
+    if normalized_record.get("validation_status") != VALIDATION_STATUS_VALID:
+        score -= 500
+    if not bool(normalized_record.get("has_internal_context")):
+        score -= 400
+    if normalized_record.get("process_alignment_status") == "material_mismatch":
+        score -= 400
+    elif normalized_record.get("process_alignment_status") == "external_reference":
+        score -= 25
+
     for marker in TREE_PENALTY_MARKERS:
         if marker in label_blob:
             score -= 20 if marker == "anexo" else 80
@@ -796,10 +1010,16 @@ def _canonical_score(payload: Dict[str, Any], normalized_record: Dict[str, Any])
 def build_normalized_record(payload: Dict[str, Any], json_path: Path) -> Dict[str, Any]:
     snapshot = payload.get("snapshot", {}) or {}
     collection = payload.get("collection", {}) or {}
-    analysis = dict(payload.get("analysis", {}) or {})
-    requested_type = _clean_spaces(str(payload.get("requested_type", "") or str(payload.get("document_type", "") or ""))).lower() or "act"
-    if not analysis:
-        analysis = classify_cooperation_snapshot(snapshot, requested_type, collection)
+    processo = _clean_spaces(str(payload.get("processo", "") or ""))
+    requested_type = _clean_spaces(
+        str(payload.get("requested_type", "") or str(payload.get("document_type", "") or ""))
+    ).lower() or "act"
+    analysis = classify_cooperation_snapshot(
+        snapshot,
+        requested_type,
+        collection_context=collection,
+        processo=processo,
+    )
 
     numero_acordo = ""
     data_inicio_vigencia = ""
@@ -813,27 +1033,23 @@ def build_normalized_record(payload: Dict[str, Any], json_path: Path) -> Dict[st
     field_source_objeto = ""
     field_source_vigencia = ""
     field_source_gestao = ""
-    validation_warning = ""
+    vigencia_warning = ""
 
     if analysis.get("doc_class") == DOC_CLASS_ACT_FINAL:
         numero_acordo, field_source_numero_acordo = _extract_numero_acordo(snapshot)
-        (
-            data_inicio_vigencia,
-            data_fim_vigencia,
-            field_source_vigencia,
-            vigencia_warning,
-        ) = _extract_vigencia(snapshot)
+        data_inicio_vigencia, data_fim_vigencia, field_source_vigencia, vigencia_warning = _extract_vigencia(snapshot)
         orgao_convenente, _ = _extract_orgao_convenente(snapshot)
         objeto, field_source_objeto = _extract_objeto(snapshot)
         gestor_titular, gestor_substituto, gestor_source = _extract_gestores(snapshot)
         unidade_responsavel, unidade_source = _extract_unidade_responsavel(snapshot)
         field_source_gestao = gestor_source or unidade_source
-        validation_warning = _collect_validation_warnings(payload, snapshot, vigencia_warning)
 
+    validation_warning = _collect_validation_warnings(payload, analysis, vigencia_warning)
+    document_processos = analysis.get("document_processos", []) or []
     record = {
         "requested_type": requested_type,
         "numero_acordo": numero_acordo,
-        "processo": _clean_spaces(str(payload.get("processo", "") or "")),
+        "processo": processo,
         "data_inicio_vigencia": data_inicio_vigencia,
         "data_fim_vigencia": data_fim_vigencia,
         "orgao_convenente": orgao_convenente,
@@ -854,13 +1070,17 @@ def build_normalized_record(payload: Dict[str, Any], json_path: Path) -> Dict[st
         "discard_reason": analysis.get("discard_reason", ""),
         "classification_reason": analysis.get("classification_reason", ""),
         "canon_rejection_reason": ""
-        if analysis.get("doc_class") == DOC_CLASS_ACT_FINAL
+        if analysis.get("publication_status") == PUBLICATION_STATUS_GOLD
         else (analysis.get("classification_reason", "") or analysis.get("discard_reason", "")),
         "field_source_numero_acordo": field_source_numero_acordo,
         "field_source_objeto": field_source_objeto,
         "field_source_vigencia": field_source_vigencia,
         "field_source_gestao": field_source_gestao,
         "validation_warning": validation_warning,
+        "has_internal_context": bool(analysis.get("has_internal_context")),
+        "process_alignment_status": analysis.get("process_alignment_status", ""),
+        "document_processo": analysis.get("document_processo", ""),
+        "document_processos": " | ".join(document_processos),
         "snapshot_mode": _clean_spaces(str(snapshot.get("extraction_mode", "") or "")),
         "text_chars": len(str(snapshot.get("text", "") or "")),
         "json_path": str(json_path),
@@ -890,7 +1110,12 @@ def export_normalized_csv(output_dir: Path, logger: Any = None) -> Dict[str, Any
 
     canonical_records: List[Dict[str, Any]] = []
     for processo, records in grouped.items():
-        canonical_candidates = [record for record in records if record.get("doc_class") == DOC_CLASS_ACT_FINAL]
+        canonical_candidates = [
+            record
+            for record in records
+            if record.get("doc_class") == DOC_CLASS_ACT_FINAL
+            and record.get("validation_status") == VALIDATION_STATUS_VALID
+        ]
         if not canonical_candidates:
             for record in records:
                 record["normalization_status"] = "descartado_nao_canonico"
@@ -919,7 +1144,7 @@ def export_normalized_csv(output_dir: Path, logger: Any = None) -> Dict[str, Any
                 record["discard_reason"] = ""
                 record["canon_rejection_reason"] = ""
                 canonical_records.append(record)
-            elif record.get("doc_class") == DOC_CLASS_ACT_FINAL:
+            elif record.get("doc_class") == DOC_CLASS_ACT_FINAL and record.get("validation_status") == VALIDATION_STATUS_VALID:
                 record["normalization_status"] = "descartado_por_desempate"
                 record["publication_status"] = PUBLICATION_STATUS_SILVER
                 record["discard_reason"] = "act_final_nao_canonico"
@@ -962,6 +1187,10 @@ def export_normalized_csv(output_dir: Path, logger: Any = None) -> Dict[str, Any
         "field_source_vigencia",
         "field_source_gestao",
         "validation_warning",
+        "has_internal_context",
+        "process_alignment_status",
+        "document_processo",
+        "document_processos",
         "snapshot_mode",
         "text_chars",
         "canonical_score",

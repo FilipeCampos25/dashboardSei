@@ -3,7 +3,13 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from app.documents.common import build_basic_tracking_record, save_snapshot_json
+from app.documents.common import (
+    build_basic_tracking_record,
+    derive_search_outcome_status,
+    sanitize_snapshot,
+    sanitize_text_payload,
+    save_snapshot_json,
+)
 from app.documents.types import DocumentTypeSpec
 from app.output import csv_writer
 from app.services.act_normalizer import (
@@ -12,6 +18,7 @@ from app.services.act_normalizer import (
     classify_cooperation_snapshot,
     export_normalized_csv,
 )
+from app.services.dashboard_exporter import export_dashboard_ready_csv
 
 
 class CooperationDocumentHandler:
@@ -37,7 +44,8 @@ class CooperationDocumentHandler:
         settings: Any,
     ) -> Optional[Path]:
         csv_writer.ensure_output_dir(output_dir)
-        analysis = analysis or classify_cooperation_snapshot(snapshot, spec.key, collection_context)
+        snapshot = sanitize_snapshot(snapshot)
+        analysis = analysis or classify_cooperation_snapshot(snapshot, spec.key, collection_context, processo=processo)
         resolved_document_type = analysis.get("resolved_document_type", "")
         snapshot_prefix = analysis.get("snapshot_prefix", spec.snapshot_prefix)
         output_path = save_snapshot_json(
@@ -97,33 +105,36 @@ class CooperationDocumentHandler:
         processo: str,
         collection_context: dict[str, Any],
     ) -> None:
+        sanitized_context = sanitize_text_payload(collection_context)
+        context = sanitized_context if isinstance(sanitized_context, dict) else collection_context
+        outcome_status = derive_search_outcome_status(context)
         self._tracking_records.append(
             {
-                "captured_at": collection_context.get("captured_at", ""),
+                "captured_at": context.get("captured_at", ""),
                 "document_type": spec.key,
                 "requested_type": spec.key,
                 "processo": processo,
-                "documento": collection_context.get("chosen_documento", ""),
-                "found": bool(collection_context.get("found")),
-                "found_in": collection_context.get("found_in", ""),
-                "search_term": collection_context.get("search_term", ""),
-                "results_count": collection_context.get("results_count", 0),
-                "chosen_documento": collection_context.get("chosen_documento", ""),
-                "selection_reason": collection_context.get("selection_reason", ""),
-                "selection_detail": collection_context.get("selection_detail", ""),
+                "documento": context.get("chosen_documento", ""),
+                "found": bool(context.get("found")),
+                "found_in": context.get("found_in", ""),
+                "search_term": context.get("search_term", ""),
+                "results_count": context.get("results_count", 0),
+                "chosen_documento": context.get("chosen_documento", ""),
+                "selection_reason": context.get("selection_reason", ""),
+                "selection_detail": context.get("selection_detail", ""),
                 "snapshot_mode": "",
                 "text_chars": 0,
                 "tables_count": 0,
-                "extraction_error": collection_context.get("extraction_error", ""),
+                "extraction_error": context.get("extraction_error", ""),
                 "json_path": "",
                 "doc_class": "",
                 "resolved_document_type": "",
                 "snapshot_prefix": "",
                 "is_canonical_candidate": False,
-                "validation_status": "not_found",
+                "validation_status": outcome_status["validation_status"],
                 "publication_status": PUBLICATION_STATUS_SILVER,
-                "normalization_status": "not_found",
-                "discard_reason": "not_found",
+                "normalization_status": outcome_status["normalization_status"],
+                "discard_reason": outcome_status["discard_reason"],
                 "classification_reason": "",
             }
         )
@@ -136,24 +147,26 @@ class CooperationDocumentHandler:
         protocolo_documento: str,
         collection_context: dict[str, Any],
     ) -> None:
+        sanitized_context = sanitize_text_payload(collection_context)
+        context = sanitized_context if isinstance(sanitized_context, dict) else collection_context
         self._tracking_records.append(
             {
-                "captured_at": collection_context.get("captured_at", ""),
+                "captured_at": context.get("captured_at", ""),
                 "document_type": spec.key,
                 "requested_type": spec.key,
                 "processo": processo,
                 "documento": protocolo_documento,
-                "found": bool(collection_context.get("found")),
-                "found_in": collection_context.get("found_in", ""),
-                "search_term": collection_context.get("search_term", ""),
-                "results_count": collection_context.get("results_count", 0),
-                "chosen_documento": collection_context.get("chosen_documento", protocolo_documento),
-                "selection_reason": collection_context.get("selection_reason", ""),
-                "selection_detail": collection_context.get("selection_detail", ""),
+                "found": bool(context.get("found")),
+                "found_in": context.get("found_in", ""),
+                "search_term": context.get("search_term", ""),
+                "results_count": context.get("results_count", 0),
+                "chosen_documento": context.get("chosen_documento", protocolo_documento),
+                "selection_reason": context.get("selection_reason", ""),
+                "selection_detail": context.get("selection_detail", ""),
                 "snapshot_mode": "",
                 "text_chars": 0,
                 "tables_count": 0,
-                "extraction_error": collection_context.get("extraction_error", ""),
+                "extraction_error": context.get("extraction_error", ""),
                 "json_path": "",
                 "doc_class": "",
                 "resolved_document_type": "",
@@ -179,6 +192,7 @@ class CooperationDocumentHandler:
             return
 
         csv_writer.ensure_output_dir(output_dir)
+        # `*_status_execucao_latest.csv` e uma trilha operacional da coleta, nao a base final da dashboard.
         columns = [
             "captured_at",
             "document_type",
@@ -217,6 +231,10 @@ class CooperationDocumentHandler:
         )
         if not self._export_act_normalized:
             self._export_published_manifest(spec=spec, output_dir=output_dir)
+            try:
+                export_dashboard_ready_csv(output_dir, logger=logger)
+            except Exception as exc:
+                logger.warning("Falha ao gerar CSV dashboard_ready_latest.csv (%s).", exc)
             return
         try:
             export_result = export_normalized_csv(output_dir, logger=logger)
@@ -230,8 +248,13 @@ class CooperationDocumentHandler:
                 )
         except Exception as exc:
             logger.warning("Falha ao gerar CSV %s normalizado (%s).", spec.log_label, exc)
+        try:
+            export_dashboard_ready_csv(output_dir, logger=logger)
+        except Exception as exc:
+            logger.warning("Falha ao gerar CSV dashboard_ready_latest.csv (%s).", exc)
 
     def _export_published_manifest(self, *, spec: DocumentTypeSpec, output_dir: Path) -> None:
+        # Manifesto gold enxuto para familias que nao possuem normalizacao rica nesta rodada.
         published_rows = [
             {
                 "captured_at": record.get("captured_at", ""),

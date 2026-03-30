@@ -221,6 +221,52 @@ class ACTHandlerTests(unittest.TestCase):
         finally:
             shutil.rmtree(output_dir, ignore_errors=True)
 
+    def test_act_handler_preserves_filter_error_search_outcome(self) -> None:
+        spec = build_act_document_type()
+        handler = spec.handler
+        handler.reset_run()
+        settings = SimpleNamespace(export_raw_fields_csv=False)
+        logger = logging.getLogger("act-handler-test")
+
+        output_dir = Path.cwd() / "tests" / "_tmp_act_handler_filter_error"
+        if output_dir.exists():
+            shutil.rmtree(output_dir, ignore_errors=True)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            handler.record_search_outcome(
+                spec=spec,
+                processo="60090.000003/2026-00",
+                collection_context={
+                    "captured_at": "2026-03-18T10:20:00",
+                    "found": False,
+                    "found_in": "filter",
+                    "search_term": "Acordo de Cooperacao Tecnica",
+                    "results_count": 0,
+                    "chosen_documento": "",
+                    "selection_reason": "search_open_error",
+                    "selection_detail": "anchor do filtro indisponivel",
+                    "extraction_error": "Timeout aguardando elemento no contexto de pesquisa",
+                },
+            )
+            handler.finalize_run(
+                spec=spec,
+                output_dir=output_dir,
+                logger=logger,
+                settings=settings,
+            )
+
+            status_path = output_dir / "act_status_execucao_latest.csv"
+            with status_path.open("r", encoding="utf-8-sig", newline="") as file_obj:
+                rows = list(csv.DictReader(file_obj))
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["validation_status"], "filter_error")
+            self.assertEqual(rows[0]["normalization_status"], "filter_error")
+            self.assertEqual(rows[0]["discard_reason"], "filter_error")
+            self.assertEqual(rows[0]["publication_status"], "retained_silver")
+            self.assertIn("Timeout", rows[0]["extraction_error"])
+        finally:
+            shutil.rmtree(output_dir, ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main()

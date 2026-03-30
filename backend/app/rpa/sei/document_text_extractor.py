@@ -1130,10 +1130,21 @@ def _maybe_fix_mojibake(value: str) -> str:
         return text
     if not any(marker in text for marker in ("Ã", "Â", "Ãƒ", "Ã‚", "\ufffd")):
         return text
-    try:
-        return text.encode("latin1").decode("utf-8")
-    except UnicodeError:
-        return text
+    repaired = text
+    for _ in range(2):
+        candidate = repaired
+        for source_encoding in ("latin1", "cp1252"):
+            try:
+                candidate = repaired.encode(source_encoding).decode("utf-8")
+                break
+            except UnicodeError:
+                candidate = repaired
+        if candidate == repaired:
+            break
+        repaired = candidate
+        if not any(marker in repaired for marker in ("Ã", "Â", "â", "\ufffd")):
+            break
+    return repaired
 
 
 def _slice_period_value(text: str, label: str) -> str:

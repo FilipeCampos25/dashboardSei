@@ -245,6 +245,14 @@ class ResultElement:
     def __init__(self, text: str) -> None:
         self.text = text
 
+    def find_elements(self, by: Any, value: str) -> list[Any]:
+        if by == By.XPATH and ".//a" in value:
+            return [self]
+        return []
+
+    def get_attribute(self, name: str) -> str:
+        return ""
+
 
 class ResultFallbackDriver:
     def find_elements(self, by: Any, value: str) -> list[Any]:
@@ -274,6 +282,7 @@ class FakeScraperDriver:
         self.title = "SEI - Processo"
         self.window_handles = ["main"]
         self.current_window_handle = "main"
+        self.switch_to = SimpleNamespace(default_content=Mock())
 
 
 class SimpleSelectors:
@@ -667,8 +676,32 @@ class WaitOptimizationTests(unittest.TestCase):
 
         with patch.object(
             scraper,
-            "buscar_documento_mais_recente_no_filtro",
-            side_effect=[None, document_search.SearchHit(protocolo="123", total_resultados=1)],
+            "_search_document_in_filter",
+            side_effect=[
+                (
+                    [],
+                    scraper._build_collection_context(
+                        found=False,
+                        found_in="filter",
+                        search_term="PLANO DE TRABALHO - PT",
+                        results_count=0,
+                        selection_reason="no_results_in_filter",
+                        selection_detail="sem resultados para o alias inicial",
+                    ),
+                ),
+                (
+                    [document_search.SearchHit(protocolo="123", total_resultados=1)],
+                    scraper._build_collection_context(
+                        found=True,
+                        found_in="filter",
+                        search_term="Plano de Trabalho",
+                        results_count=1,
+                        chosen_documento="123",
+                        selection_reason="primeiro_resultado_mais_recente",
+                        selection_detail="position=1 total=1",
+                    ),
+                ),
+            ],
         ), patch.object(
             scraper,
             "_restore_process_base_context",
@@ -676,14 +709,17 @@ class WaitOptimizationTests(unittest.TestCase):
             scraper,
             "_ensure_document_search_open",
         ) as ensure_mock:
-            hit, termo, _ = scraping.SEIScraper._search_pt_document_in_filter(
+            candidate_groups, collection_context = scraping.SEIScraper._search_pt_document_in_filter(
                 scraper,
                 "60090.000269/2020-16",
                 document_type,
             )
 
-        self.assertIsNotNone(hit)
-        self.assertEqual(termo, "Plano de Trabalho")
+        self.assertEqual(len(candidate_groups), 1)
+        self.assertEqual(candidate_groups[0][0], "Plano de Trabalho")
+        self.assertEqual(candidate_groups[0][1][0].protocolo, "123")
+        self.assertTrue(collection_context["found"])
+        self.assertEqual(collection_context["search_term"], "Plano de Trabalho")
         restore_mock.assert_called_once()
         ensure_mock.assert_called_once()
 
@@ -727,6 +763,23 @@ class WaitOptimizationTests(unittest.TestCase):
         scraper._extract_and_process_document_snapshot = lambda *args, **kwargs: None
         document_type = make_document_type("pt", "Plano de Trabalho")
 
+        def stale_search(*args: Any, **kwargs: Any) -> tuple[list[document_search.SearchHit], dict[str, Any]]:
+            scraper._process_filter_degraded["60093.000015/2020-60"] = True
+            return (
+                [],
+                scraper._build_collection_context(
+                    found=False,
+                    found_in="filter",
+                    search_term="Plano de Trabalho",
+                    results_count=0,
+                    selection_reason="search_context_stagnation",
+                    selection_detail="timeout no contexto de pesquisa",
+                    extraction_error="motivo=estagnacao_do_contexto",
+                ),
+            )
+
+        scraper._search_document_in_filter = Mock(side_effect=stale_search)
+
         scraping.SEIScraper._buscar_e_abrir_documento_mais_recente(
             scraper,
             "60093.000015/2020-60",
@@ -767,7 +820,32 @@ class WaitOptimizationTests(unittest.TestCase):
         scraper._record_document_search_outcome = Mock()
         scraper._close_opened_doc_tabs = lambda *args, **kwargs: None
         scraper._open_document_via_tree = Mock(return_value=False)
-        scraper.buscar_documento_mais_recente_no_filtro = Mock(return_value=None)
+        scraper._search_document_in_filter = Mock(
+            side_effect=[
+                (
+                    [],
+                    scraper._build_collection_context(
+                        found=False,
+                        found_in="filter",
+                        search_term="PLANO DE TRABALHO - PT",
+                        results_count=0,
+                        selection_reason="no_results_in_filter",
+                        selection_detail="sem resultados para o alias inicial",
+                    ),
+                ),
+                (
+                    [],
+                    scraper._build_collection_context(
+                        found=False,
+                        found_in="filter",
+                        search_term="Plano de Trabalho - PT",
+                        results_count=0,
+                        selection_reason="no_results_in_filter",
+                        selection_detail="sem resultados para o alias alternativo",
+                    ),
+                ),
+            ]
+        )
         scraper.abrir_documento_mais_recente_no_filtro = lambda *args, **kwargs: None
         scraper._switch_to_newly_opened_window = lambda *args, **kwargs: None
         scraper._extract_and_process_document_snapshot = lambda *args, **kwargs: None
@@ -846,8 +924,32 @@ class WaitOptimizationTests(unittest.TestCase):
 
         with patch.object(
             scraper,
-            "buscar_documento_mais_recente_no_filtro",
-            side_effect=[None, document_search.SearchHit(protocolo="MEMO-1", total_resultados=1)],
+            "_search_document_in_filter",
+            side_effect=[
+                (
+                    [],
+                    scraper._build_collection_context(
+                        found=False,
+                        found_in="filter",
+                        search_term="ACORDO DE COOPERACAO TECNICA - ACT",
+                        results_count=0,
+                        selection_reason="no_results_in_filter",
+                        selection_detail="sem resultados para o alias inicial",
+                    ),
+                ),
+                (
+                    [document_search.SearchHit(protocolo="MEMO-1", total_resultados=1)],
+                    scraper._build_collection_context(
+                        found=True,
+                        found_in="filter",
+                        search_term="Memorando de Entendimentos",
+                        results_count=1,
+                        chosen_documento="MEMO-1",
+                        selection_reason="primeiro_resultado_mais_recente",
+                        selection_detail="position=1 total=1",
+                    ),
+                ),
+            ],
         ), patch.object(
             scraper,
             "_restore_process_base_context",
@@ -855,14 +957,17 @@ class WaitOptimizationTests(unittest.TestCase):
             scraper,
             "_ensure_document_search_open",
         ) as ensure_mock:
-            hit, termo, _ = scraping.SEIScraper._search_document_in_filter(
+            candidate_groups, collection_context = scraping.SEIScraper._search_document_candidates_in_filter(
                 scraper,
                 "60091.000060/2023-87",
                 document_type,
             )
 
-        self.assertIsNotNone(hit)
-        self.assertEqual(termo, "Memorando de Entendimentos")
+        self.assertEqual(len(candidate_groups), 1)
+        self.assertEqual(candidate_groups[0][0], "Memorando de Entendimentos")
+        self.assertEqual(candidate_groups[0][1][0].protocolo, "MEMO-1")
+        self.assertTrue(collection_context["found"])
+        self.assertEqual(collection_context["search_term"], "Memorando de Entendimentos")
         restore_mock.assert_called_once()
         ensure_mock.assert_called_once()
 
@@ -925,8 +1030,7 @@ class WaitOptimizationTests(unittest.TestCase):
         scraper._build_collection_context = scraping.SEIScraper._build_collection_context.__get__(scraper, scraping.SEIScraper)
         scraper._search_document_in_filter = Mock(
             return_value=(
-                document_search.SearchHit(protocolo="MEMO-1", total_resultados=1),
-                "Memorando de Entendimentos",
+                [document_search.SearchHit(protocolo="MEMO-1", total_resultados=1)],
                 scraper._build_collection_context(
                     found=True,
                     found_in="filter",
@@ -944,7 +1048,7 @@ class WaitOptimizationTests(unittest.TestCase):
         scraper._extract_and_process_document_snapshot = Mock(return_value=False)
         scraper._restore_process_base_context = Mock()
         scraper._ensure_document_search_open = Mock()
-        scraper.abrir_documento_mais_recente_no_filtro = lambda *args, **kwargs: None
+        scraper.abrir_documento_no_filtro = lambda *args, **kwargs: None
         scraper._switch_to_newly_opened_window = lambda *args, **kwargs: None
         document_type = DocumentTypeSpec(
             key="act",
@@ -985,15 +1089,18 @@ class WaitOptimizationTests(unittest.TestCase):
             "text": "De: teste@defesa.gov.br Para: equipe@defesa.gov.br Assunto: Memorando de Entendimentos",
         }
 
-        is_valid, reason = scraping.SEIScraper._validate_snapshot_for_document_type(
+        is_valid, reason, analysis = scraping.SEIScraper._validate_snapshot_for_document_type(
             scraper,
             document_type,
             snapshot,
             {"chosen_documento": "E-mail Confirmacao de recebimento-ACT"},
         )
 
-        self.assertFalse(is_valid)
-        self.assertEqual(reason, "email")
+        self.assertTrue(is_valid)
+        self.assertEqual(reason, "email_outro")
+        self.assertIsNotNone(analysis)
+        self.assertEqual(analysis["doc_class"], "email_outro")
+        self.assertEqual(analysis["validation_status"], "rejected_snapshot")
 
 
 if __name__ == "__main__":
