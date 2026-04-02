@@ -47,7 +47,7 @@ class CooperationDocumentHandler:
         snapshot = sanitize_snapshot(snapshot)
         analysis = analysis or classify_cooperation_snapshot(snapshot, spec.key, collection_context, processo=processo)
         resolved_document_type = analysis.get("resolved_document_type", "")
-        snapshot_prefix = analysis.get("snapshot_prefix", spec.snapshot_prefix)
+        snapshot_prefix = analysis.get("requested_snapshot_prefix", spec.snapshot_prefix)
         output_path = save_snapshot_json(
             spec=spec,
             processo=processo,

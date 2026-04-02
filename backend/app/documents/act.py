@@ -47,4 +47,5 @@ def build_act_document_type() -> DocumentTypeSpec:
             "Acordo de Cooperação Técnica",
             "Acordo de Cooperação",
         ),
+        max_filter_candidates=2,
     )

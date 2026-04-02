@@ -20,8 +20,12 @@ class DocumentTypesTests(unittest.TestCase):
 
     def test_act_document_type_is_available(self) -> None:
         specs = resolve_document_types("act")
-        self.assertEqual([spec.key for spec in specs], ["act", "memorando", "ted"])
+        self.assertEqual([spec.key for spec in specs], ["act"])
         self.assertEqual(specs[0].snapshot_prefix, "acordo_cooperacao_tecnica")
+
+    def test_document_types_respect_explicit_env_list_without_expansion(self) -> None:
+        specs = resolve_document_types("pt,act")
+        self.assertEqual([spec.key for spec in specs], ["pt", "act"])
 
     def test_cooperation_document_types_are_separated(self) -> None:
         spec = build_act_document_type()

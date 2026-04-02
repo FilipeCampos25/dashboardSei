@@ -25,6 +25,7 @@ from app.core.driver_factory import create_chrome_driver
 from app.core.logging_config import setup_logger
 from app.documents import resolve_document_types
 from app.documents.common import sanitize_snapshot
+from app.documents.document_utils import should_skip_candidate
 from app.documents.types import DocumentTypeSpec
 from app.output import csv_writer
 from app.rpa.sei import process_navigation
@@ -208,6 +209,8 @@ class SEIScraper:
 
         cfg = get_settings()
         self.settings = cfg
+        self.logger.info("DEBUG CFG document_types raw: %s", cfg.document_types)
+        self.logger.info("DEBUG ENV DOCUMENT_TYPES: %s", os.getenv("DOCUMENT_TYPES"))
         self.base_url = (
             cfg.sei_url
             or os.getenv("URL")
@@ -240,6 +243,9 @@ class SEIScraper:
         self.document_types_by_key = {spec.key: spec for spec in self.document_types}
         self._process_filter_degraded: Dict[str, bool] = {}
         self._process_filter_recovery_attempts: Dict[Tuple[str, str], int] = {}
+        self._process_act_found: Dict[str, bool] = {}
+        self.total_candidatos_avaliados = 0
+        self.candidatos_descartados_pre_abertura = 0
         self.logger.info(
             "Tipos documentais ativos: %s",
             ", ".join(spec.key for spec in self.document_types),
@@ -286,6 +292,7 @@ class SEIScraper:
         if not self.base_url:
             raise RuntimeError("Config ausente: sei_url / URL / SEI_URL")
 
+        self._reset_candidate_screening_stats()
         self._prepare_output_dir_for_run()
 
         self.logger.info("Abrindo SEI em: %s", self.base_url)
@@ -296,6 +303,7 @@ class SEIScraper:
         else:
             self._login_if_possible()
         self._remember_main_window_handle(context="pos_login")
+        self.logger.info("=== START SCRAPING === %s", datetime.now().isoformat())
 
         self._close_popup_if_exists()
         self._open_interno_menu()
@@ -305,6 +313,7 @@ class SEIScraper:
                 "Modo guiado: nenhum interno selecionado pelas descricoes configuradas."
             )
             self._finalize_document_runs()
+            self._log_candidate_screening_summary()
             result = sorted(self.found)
             self.logger.info("Itens unicos encontrados: %d", len(result))
             print(result)
@@ -335,9 +344,8 @@ class SEIScraper:
                 self._wait_page_ready_in_processo()
                 self.logger.info("Processo %s: clicando Abrir todas as Pastas", proc)
                 self._click_abrir_todas_as_pastas()
-                for document_type in self.document_types:
-                    self._ensure_document_search_open(proc, document_type)
-                    self._buscar_e_abrir_documento_mais_recente(proc, document_type)
+                for document_type in self._get_document_types_for_process():
+                    self._run_document_search_for_process(proc, document_type)
 
                 if stop_at_filter:
                     self.logger.info("Processo %s: fechando aba e voltando", proc)
@@ -348,14 +356,17 @@ class SEIScraper:
                         proc,
                     )
                     self._finalize_document_runs()
+                    self._log_candidate_screening_summary()
                     result = sorted(self.found)
                     self.logger.info("Itens unicos encontrados: %d", len(result))
                     print(result)
                     return result
 
         self._finalize_document_runs()
+        self._log_candidate_screening_summary()
         result = sorted(self.found)
         self.logger.info("Itens unicos encontrados: %d", len(result))
+        self.logger.info("=== END SCRAPING === %s", datetime.now().isoformat())
         print(result)
         return result
 
@@ -722,6 +733,120 @@ class SEIScraper:
         self._wait_page_ready_in_processo()
         self._click_abrir_todas_as_pastas()
 
+    def _clear_search_input_if_present(self) -> None:
+        search_input_xpath = (
+            self.selectors.get("pesquisar_processos.caixa_de_texto")
+            or "//input[@id='txtPesquisa']"
+        )
+        try:
+            elems = self.driver.find_elements(By.XPATH, search_input_xpath)
+        except WebDriverException:
+            return
+        if not elems:
+            return
+
+        search_input = elems[0]
+        try:
+            current_value = (
+                search_input.get_attribute("value")
+                or search_input.get_attribute("title")
+                or search_input.text
+                or ""
+            ).strip()
+        except WebDriverException:
+            current_value = ""
+        if not current_value:
+            return
+
+        try:
+            search_input.clear()
+        except WebDriverException:
+            try:
+                self.driver.execute_script("arguments[0].value = '';", search_input)
+            except WebDriverException:
+                return
+
+        self.logger.info("Pesquisar no Processo: campo de busca limpo para reutilizar o filtro.")
+
+    def reset_search_context_light(self, processo: str, *, reason: str = "") -> None:
+        timeout = min(5, max(1, self.timeout_seconds))
+        try:
+            self.driver.switch_to.default_content()
+        except WebDriverException:
+            pass
+
+        try:
+            document_search._switch_to_pesquisa_context(
+                self.driver,
+                self.selectors,
+                self.logger,
+                timeout_seconds=timeout,
+            )
+        except (TimeoutException, RuntimeError, NoSuchElementException, StaleElementReferenceException, WebDriverException):
+            try:
+                self.driver.switch_to.default_content()
+            except WebDriverException:
+                pass
+            self._click_pesquisar_no_processo()
+
+        self._clear_search_input_if_present()
+        self.logger.info(
+            "Processo %s: reset_context_light usado%s.",
+            processo,
+            f" ({reason})" if reason else "",
+        )
+
+    def _should_fallback_to_full_reload(self, exc: Exception) -> bool:
+        if self._is_search_context_stagnation_timeout(exc):
+            return True
+        if isinstance(exc, (NoSuchElementException, StaleElementReferenceException)):
+            return True
+        diagnostics = self._collect_pesquisa_diagnostics()
+        return diagnostics.get("state") == document_search.PESQUISA_STATE_INACTIVE
+
+    def _reset_search_context_with_fallback(
+        self,
+        processo: str,
+        document_type: DocumentTypeSpec,
+        *,
+        process_url: Optional[str] = None,
+        reason: str = "",
+    ) -> None:
+        if self._process_filter_degraded.get(processo):
+            self.logger.info(
+                "Processo %s: reload completo usado (fallback)%s.",
+                processo,
+                f" ({reason}; filtro degradado)" if reason else " (filtro degradado)",
+            )
+            self._restore_process_base_context(
+                processo,
+                process_url=process_url,
+                reason=reason,
+            )
+            self._ensure_document_search_open(processo, document_type)
+            return
+
+        try:
+            self.reset_search_context_light(processo, reason=reason)
+            return
+        except (TimeoutException, RuntimeError, NoSuchElementException, StaleElementReferenceException, WebDriverException) as exc:
+            if self._is_search_context_stagnation_timeout(exc):
+                self._process_filter_degraded[processo] = True
+            if not self._should_fallback_to_full_reload(exc):
+                raise
+            self.logger.warning(
+                "Processo %s: reload completo usado (fallback)%s. erro=%s",
+                processo,
+                f" ({reason})" if reason else "",
+                exc,
+            )
+            self._restore_process_base_context(
+                processo,
+                process_url=process_url,
+                reason=reason,
+            )
+            self._ensure_document_search_open(processo, document_type)
+
     def _clear_process_filter_state(self, processo: str) -> None:
         self._process_filter_degraded.pop(processo, None)
         stale_keys = [
@@ -729,6 +854,60 @@ class SEIScraper:
         ]
         for key in stale_keys:
             self._process_filter_recovery_attempts.pop(key, None)
+        act_state = getattr(self, "_process_act_found", None)
+        if isinstance(act_state, dict):
+            act_state.pop(processo, None)
+
+    def _get_document_types_for_process(self) -> List[DocumentTypeSpec]:
+        ordered = list(self.document_types)
+        ted_index = next((idx for idx, spec in enumerate(ordered) if spec.key == "ted"), None)
+        act_index = next((idx for idx, spec in enumerate(ordered) if spec.key == "act"), None)
+        if ted_index is None or act_index is None or act_index < ted_index:
+            return ordered
+
+        ted_spec = ordered.pop(ted_index)
+        act_index = next(idx for idx, spec in enumerate(ordered) if spec.key == "act")
+        ordered.insert(act_index + 1, ted_spec)
+        return ordered
+
+    def _has_prior_act_for_process(self, processo: str) -> bool:
+        return bool(getattr(self, "_process_act_found", {}).get(processo, False))
+
+    def _should_use_tree_fallback(self, document_type: DocumentTypeSpec) -> bool:
+        return document_type.key in {"pt", "act"}
+
+    def _set_process_act_found(self, processo: str, found: bool) -> None:
+        act_state = getattr(self, "_process_act_found", None)
+        if not isinstance(act_state, dict):
+            act_state = {}
+            self._process_act_found = act_state
+        act_state[processo] = bool(found)
+
+    def _should_run_document_search(self, processo: str, document_type: DocumentTypeSpec) -> bool:
+        if document_type.key != "ted":
+            return True
+        if not self._has_prior_act_for_process(processo):
+            self.logger.info("Processo %s: TED skip: sem ACT prévio", processo)
+            collection_context = self._build_collection_context(
+                found=False,
+                found_in="skipped",
+                search_term="|".join(self._iter_unique_filter_terms(document_type)),
+                selection_reason="skipped_without_prior_act",
+                selection_detail="TED skip: sem ACT prévio",
+            )
+            self._record_document_search_outcome(processo, document_type, collection_context)
+            return False
+        self.logger.info("Processo %s: TED executado: ACT presente", processo)
+        return True
+
+    def _run_document_search_for_process(self, processo: str, document_type: DocumentTypeSpec) -> bool:
+        if not self._should_run_document_search(processo, document_type):
+            return False
+        self._ensure_document_search_open(processo, document_type)
+        found = self._buscar_e_abrir_documento_mais_recente(processo, document_type)
+        if document_type.key == "act":
+            self._set_process_act_found(processo, found)
+        return found
 
     def _is_search_context_stagnation_timeout(self, exc: Exception) -> bool:
         return isinstance(exc, TimeoutException) and "motivo=estagnacao_do_contexto" in str(exc)
@@ -836,6 +1015,40 @@ class SEIScraper:
     def _iter_unique_filter_terms(self, document_type: DocumentTypeSpec) -> List[str]:
         terms = document_type.filter_type_aliases or document_type.search_terms
         return self._dedupe_terms(terms)
+
+    def _get_ordered_filter_hits_for_opening(
+        self,
+        processo: str,
+        document_type: DocumentTypeSpec,
+        termo: str,
+        hits: List[document_search.SearchHit],
+    ) -> List[document_search.SearchHit]:
+        ordered_hits = sorted(
+            hits,
+            key=lambda hit: max(1, int(getattr(hit, "selected_position", 1) or 1)),
+        )
+        max_candidates = max(0, int(document_type.max_filter_candidates or 0))
+        if max_candidates <= 0:
+            return ordered_hits
+
+        limited_hits = ordered_hits[:max_candidates]
+        if len(ordered_hits) > max_candidates:
+            self.logger.info(
+                "Processo %s: %s limitando abertura do filtro aos top %d candidatos (mais recente primeiro) para alias '%s'.",
+                processo,
+                document_type.log_label,
+                max_candidates,
+                termo,
+            )
+        return limited_hits
+
+    def _log_valid_candidate_early_stop(
+        self,
+        processo: str,
+        document_type: DocumentTypeSpec,
+    ) -> None:
+        if document_type.key == "act":
+            self.logger.info("Processo %s: ACT early stop após candidato válido", processo)
 
     def _dedupe_terms(self, terms: Tuple[str, ...] | List[str]) -> List[str]:
         unique_terms: List[str] = []
@@ -1084,18 +1297,18 @@ class SEIScraper:
         for index, termo in enumerate(search_terms):
             if index > 0:
                 self.logger.info(
-                    "Processo %s: reabrindo filtro em sessao limpa para %s com termo '%s'.",
+                    "Processo %s: resetando contexto leve do filtro para %s com termo '%s'.",
                     processo,
                     document_type.display_name,
                     termo,
                 )
                 try:
-                    self._restore_process_base_context(
+                    self._reset_search_context_with_fallback(
                         processo,
+                        document_type,
                         process_url=process_url,
-                        reason=f"nova sessao de filtro {document_type.log_label} ({termo})",
+                        reason=f"nova busca no filtro {document_type.log_label} ({termo})",
                     )
-                    self._ensure_document_search_open(processo, document_type)
                 except (TimeoutException, RuntimeError, NoSuchElementException, WebDriverException) as exc:
                     stagnated = self._is_search_context_stagnation_timeout(exc)
                     if stagnated:
@@ -1339,6 +1552,10 @@ class SEIScraper:
 
         base_process_url = (process_url or self.driver.current_url or "").strip()
         for attempt_index, candidate in enumerate(candidates, start=1):
+            candidate_text = str(candidate.get("text", "") or "")
+            if self._should_skip_candidate_pre_open(candidate_text):
+                continue
+
             if attempt_index > 1:
                 try:
                     self._restore_process_base_context(
@@ -1420,6 +1637,7 @@ class SEIScraper:
                 collection_context=collection_context,
             )
             if snapshot_saved:
+                self._log_valid_candidate_early_stop(processo, document_type)
                 try:
                     self._restore_process_base_context(
                         processo,
@@ -1461,7 +1679,7 @@ class SEIScraper:
         self,
         processo: str,
         document_type: DocumentTypeSpec,
-    ) -> None:
+    ) -> bool:
         collection_context = self._build_collection_context(found=False, found_in="filter")
         processo_handle = ""
         process_url = (self.driver.current_url or "").strip()
@@ -1490,18 +1708,18 @@ class SEIScraper:
             for term_index, termo in enumerate(filter_terms):
                 if term_index > 0:
                     self.logger.info(
-                        "Processo %s: reabrindo filtro em sessao limpa para %s com alias '%s'.",
+                        "Processo %s: resetando contexto leve do filtro para %s com alias '%s'.",
                         processo,
                         document_type.display_name,
                         termo,
                     )
                     try:
-                        self._restore_process_base_context(
+                        self._reset_search_context_with_fallback(
                             processo,
+                            document_type,
                             process_url=process_url,
-                            reason=f"nova sessao de filtro {document_type.log_label} ({termo})",
+                            reason=f"nova busca no filtro {document_type.log_label} ({termo})",
                         )
-                        self._ensure_document_search_open(processo, document_type)
                     except (TimeoutException, RuntimeError, NoSuchElementException, WebDriverException) as exc:
                         stagnated = self._is_search_context_stagnation_timeout(exc)
                         if stagnated:
@@ -1546,7 +1764,17 @@ class SEIScraper:
                     termo,
                 )
 
-                for hit in hits:
+                hits_to_open = self._get_ordered_filter_hits_for_opening(
+                    processo,
+                    document_type,
+                    termo,
+                    hits,
+                )
+                for hit in hits_to_open:
+                    candidate_text = str(hit.protocolo or "")
+                    if self._should_skip_candidate_pre_open(candidate_text):
+                        continue
+
                     attempt_opened_doc_handles: Set[str] = set()
                     attempt_context = self._build_collection_context(
                         found=True,
@@ -1559,12 +1787,15 @@ class SEIScraper:
                     )
                     try:
                         if term_index > 0 or hit.selected_position > 1:
-                            self._restore_process_base_context(
+                            self._reset_search_context_with_fallback(
                                 processo,
+                                document_type,
                                 process_url=process_url,
-                                reason=f"novo candidato do filtro {document_type.log_label} rank={hit.selected_position}",
+                                reason=(
+                                    f"novo candidato do filtro {document_type.log_label} "
+                                    f"rank={hit.selected_position}"
+                                ),
                             )
-                            self._ensure_document_search_open(processo, document_type)
                             refreshed_hits, refreshed_context = self._search_document_in_filter(
                                 processo=processo,
                                 document_type=document_type,
@@ -1580,6 +1811,9 @@ class SEIScraper:
                                 collection_context = refreshed_context
                                 continue
                             hit = refreshed_hits[hit.selected_position - 1]
+                            candidate_text = str(hit.protocolo or "")
+                            if self._should_skip_candidate_pre_open(candidate_text):
+                                continue
                             attempt_context = self._build_collection_context(
                                 found=True,
                                 found_in="filter",
@@ -1618,7 +1852,8 @@ class SEIScraper:
                             collection_context=attempt_context,
                         )
                         if snapshot_saved:
-                            return
+                            self._log_valid_candidate_early_stop(processo, document_type)
+                            return True
                         saw_invalid_filter_candidate = True
                         collection_context = self._build_collection_context(
                             found=True,
@@ -1636,27 +1871,44 @@ class SEIScraper:
                             preferred_return_handle=processo_handle,
                         )
 
-            self.logger.info(
-                "Processo %s: nenhum candidato canonico de %s consolidado no filtro; tentando fallback pela arvore.",
-                processo,
-                document_type.log_label,
-            )
-            if self._open_document_via_tree(processo, document_type, process_url=process_url):
+            attempted_tree_fallback = False
+            if self._should_use_tree_fallback(document_type):
                 self.logger.info(
-                    "Processo %s: %s recuperado via arvore apos filtro.",
+                    "Processo %s: nenhum candidato canonico de %s consolidado no filtro; tentando fallback pela arvore.",
                     processo,
                     document_type.log_label,
                 )
-                return
+                attempted_tree_fallback = True
+                if self._open_document_via_tree(processo, document_type, process_url=process_url):
+                    self.logger.info(
+                        "Processo %s: %s recuperado via arvore apos filtro.",
+                        processo,
+                        document_type.log_label,
+                    )
+                    return True
+            else:
+                self.logger.info(
+                    "Processo %s: %s fallback skip: baixa relevância do tipo.",
+                    processo,
+                    document_type.log_label,
+                )
 
-            selection_reason = "not_found_after_filter_and_tree"
-            selection_detail = (
-                "nao encontrado no filtro nem na arvore"
-                if not found_any_filter_candidate
-                else "candidatos do filtro/rvore ficaram apenas na silver; nenhum canonico publicado"
-            )
+            selection_reason = "not_found_after_filter"
+            selection_detail = "nao encontrado no filtro"
+            if attempted_tree_fallback:
+                selection_reason = "not_found_after_filter_and_tree"
+                selection_detail = (
+                    "nao encontrado no filtro nem na arvore"
+                    if not found_any_filter_candidate
+                    else "candidatos do filtro/arvore ficaram apenas na silver; nenhum canonico publicado"
+                )
             if saw_invalid_filter_candidate:
-                selection_reason = "no_canonical_candidate_after_filter_and_tree"
+                selection_reason = (
+                    "no_canonical_candidate_after_filter_and_tree"
+                    if attempted_tree_fallback
+                    else "no_canonical_candidate_after_filter"
+                )
+                selection_detail = "candidatos do filtro ficaram apenas na silver; nenhum canonico publicado"
             collection_context = self._build_collection_context(
                 found=False,
                 found_in="none",
@@ -1673,6 +1925,7 @@ class SEIScraper:
                 processo,
                 document_type.log_label,
             )
+            return False
         except (TimeoutException, NoSuchElementException) as exc:
             if self._is_search_context_stagnation_timeout(exc):
                 self._process_filter_degraded[processo] = True
@@ -1684,7 +1937,7 @@ class SEIScraper:
             collection_context = self._build_collection_context(
                 found=bool(collection_context.get("found")),
                 found_in=collection_context.get("found_in", "filter"),
-                search_term=collection_context.get("search_term", termo_encontrado or document_type.display_name),
+                search_term=collection_context.get("search_term", document_type.display_name),
                 results_count=collection_context.get("results_count", 0),
                 chosen_documento=collection_context.get("chosen_documento", ""),
                 selection_reason=(
@@ -1702,6 +1955,7 @@ class SEIScraper:
                 collection_context.get("search_term", document_type.display_name) or document_type.display_name,
                 exc,
             )
+            return False
 
     def _find_plano_trabalho_link_in_tree(self) -> Optional[Any]:
         document_type = self._get_document_type("pt")
@@ -2622,6 +2876,29 @@ class SEIScraper:
                 logger=self.logger,
                 settings=self.settings,
             )
+
+    def _reset_candidate_screening_stats(self) -> None:
+        self.total_candidatos_avaliados = 0
+        self.candidatos_descartados_pre_abertura = 0
+
+    def _should_skip_candidate_pre_open(self, candidate_text: str) -> bool:
+        self.total_candidatos_avaliados += 1
+        if not should_skip_candidate(candidate_text):
+            return False
+        self.candidatos_descartados_pre_abertura += 1
+        self.logger.info("candidato_descartado_pre_abertura: %s", candidate_text)
+        return True
+
+    def _log_candidate_screening_summary(self) -> None:
+        total = self.total_candidatos_avaliados
+        discarded = self.candidatos_descartados_pre_abertura
+        discard_percentage = (discarded / total * 100.0) if total else 0.0
+        self.logger.info(
+            "Triagem de candidatos: total_candidatos=%d descartados_pre_abertura=%d percentual_descarte=%.2f%%",
+            total,
+            discarded,
+            discard_percentage,
+        )
 
     def _save_pt_tracking_reports(self) -> None:
         document_type = self._get_document_type("pt")

@@ -174,6 +174,74 @@ class ACTHandlerTests(unittest.TestCase):
         finally:
             shutil.rmtree(output_dir, ignore_errors=True)
 
+    def test_act_handler_keeps_act_snapshot_prefix_for_related_memorando(self) -> None:
+        spec = build_act_document_type()
+        handler = spec.handler
+        handler.reset_run()
+        snapshot = {
+            "text": "Memorando de Entendimentos no 1 que entre si celebram a Uniao e o Estado de Roraima.",
+            "tables": [],
+            "extraction_mode": "html_dom",
+            "title": "Memorando de Entendimentos",
+            "url": "https://sei.exemplo/documento",
+        }
+        settings = SimpleNamespace(export_raw_fields_csv=False)
+        logger = logging.getLogger("act-handler-test")
+
+        output_dir = Path.cwd() / "tests" / "_tmp_act_handler_related_memorando"
+        if output_dir.exists():
+            shutil.rmtree(output_dir, ignore_errors=True)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            output_path = handler.process_snapshot(
+                spec=spec,
+                processo="60091.000060/2023-87",
+                protocolo_documento="6256843",
+                snapshot=snapshot,
+                collection_context={
+                    "captured_at": "2026-03-25T10:00:00",
+                    "found": True,
+                    "found_in": "filter",
+                    "search_term": "Acordo de Cooperacao Tecnica",
+                    "results_count": 6,
+                    "chosen_documento": "6256843",
+                    "selection_reason": "primeiro_resultado_mais_recente",
+                    "selection_detail": "position=1 total=6",
+                    "extraction_error": "",
+                },
+                output_dir=output_dir,
+                logger=logger,
+                settings=settings,
+            )
+            self.assertIsNotNone(output_path)
+            self.assertTrue(output_path.exists())
+            self.assertTrue(output_path.name.startswith("acordo_cooperacao_tecnica_"))
+
+            payload = json.loads(output_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["document_type"], "act")
+            self.assertEqual(payload["requested_type"], "act")
+            self.assertEqual(payload["resolved_document_type"], "memorando_entendimentos")
+            self.assertEqual(payload["snapshot_prefix"], "acordo_cooperacao_tecnica")
+            self.assertEqual(payload["analysis"]["snapshot_prefix"], "memorando_entendimentos")
+
+            handler.finalize_run(
+                spec=spec,
+                output_dir=output_dir,
+                logger=logger,
+                settings=settings,
+            )
+
+            status_path = output_dir / "act_status_execucao_latest.csv"
+            self.assertTrue(status_path.exists())
+            with status_path.open("r", encoding="utf-8-sig", newline="") as file_obj:
+                rows = list(csv.DictReader(file_obj))
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["requested_type"], "act")
+            self.assertEqual(rows[0]["resolved_document_type"], "memorando_entendimentos")
+            self.assertEqual(rows[0]["snapshot_prefix"], "acordo_cooperacao_tecnica")
+        finally:
+            shutil.rmtree(output_dir, ignore_errors=True)
+
     def test_act_handler_records_not_found_search_outcome(self) -> None:
         spec = build_act_document_type()
         handler = spec.handler

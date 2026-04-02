@@ -628,6 +628,70 @@ class WaitOptimizationTests(unittest.TestCase):
 
         self.assertEqual(restore_calls, ["restore"])
 
+    def test_reset_search_context_light_reuses_filter_without_reload(self) -> None:
+        scraper = scraping.SEIScraper.__new__(scraping.SEIScraper)
+        scraper.logger = Mock()
+        scraper.timeout_seconds = 20
+        search_input = Mock()
+
+        def get_attribute(name: str) -> str:
+            return "valor anterior" if name == "value" else ""
+
+        search_input.get_attribute.side_effect = get_attribute
+        search_input.text = ""
+        search_input.clear = Mock()
+        scraper.driver = Mock(find_elements=Mock(return_value=[search_input]))
+        scraper.driver.switch_to = SimpleNamespace(default_content=Mock())
+        scraper.selectors = {}
+        scraper._click_pesquisar_no_processo = Mock()
+
+        with patch("app.rpa.scraping.document_search._switch_to_pesquisa_context", return_value=None) as switch_mock:
+            scraping.SEIScraper.reset_search_context_light(
+                scraper,
+                "60093.000015/2020-60",
+                reason="alias alternativo",
+            )
+
+        switch_mock.assert_called_once()
+        scraper._click_pesquisar_no_processo.assert_not_called()
+        search_input.clear.assert_called_once()
+        self.assertTrue(
+            any("reset_context_light usado" in str(call.args[0]) for call in scraper.logger.info.call_args_list)
+        )
+
+    def test_reset_search_context_with_fallback_usa_reload_quando_contexto_perdido(self) -> None:
+        scraper = scraping.SEIScraper.__new__(scraping.SEIScraper)
+        scraper.logger = Mock()
+        scraper.timeout_seconds = 20
+        scraper.driver = FakeScraperDriver()
+        scraper.selectors = {}
+        scraper._process_filter_degraded = {}
+        scraper._process_filter_recovery_attempts = {}
+        scraper.reset_search_context_light = Mock(side_effect=StaleElementReferenceException("iframe stale"))
+        scraper._restore_process_base_context = Mock()
+        scraper._ensure_document_search_open = Mock()
+        document_type = make_document_type("act", "Acordo de Cooperacao Tecnica")
+
+        scraping.SEIScraper._reset_search_context_with_fallback(
+            scraper,
+            "60093.000015/2020-60",
+            document_type,
+            process_url="https://sei.defesa.gov.br/processo",
+            reason="alias alternativo",
+        )
+
+        scraper._restore_process_base_context.assert_called_once()
+        scraper._ensure_document_search_open.assert_called_once_with(
+            "60093.000015/2020-60",
+            document_type,
+        )
+        self.assertTrue(
+            any(
+                "reload completo usado (fallback)" in str(call.args[0])
+                for call in scraper.logger.warning.call_args_list
+            )
+        )
+
     def test_busca_pt_reabre_filtro_em_sessao_limpa_apos_zero_resultado(self) -> None:
         scraper = scraping.SEIScraper.__new__(scraping.SEIScraper)
         scraper.logger = DummyLogger()
@@ -704,11 +768,8 @@ class WaitOptimizationTests(unittest.TestCase):
             ],
         ), patch.object(
             scraper,
-            "_restore_process_base_context",
-        ) as restore_mock, patch.object(
-            scraper,
-            "_ensure_document_search_open",
-        ) as ensure_mock:
+            "_reset_search_context_with_fallback",
+        ) as reset_mock:
             candidate_groups, collection_context = scraping.SEIScraper._search_pt_document_in_filter(
                 scraper,
                 "60090.000269/2020-16",
@@ -720,8 +781,7 @@ class WaitOptimizationTests(unittest.TestCase):
         self.assertEqual(candidate_groups[0][1][0].protocolo, "123")
         self.assertTrue(collection_context["found"])
         self.assertEqual(collection_context["search_term"], "Plano de Trabalho")
-        restore_mock.assert_called_once()
-        ensure_mock.assert_called_once()
+        reset_mock.assert_called_once()
 
     def test_busca_pt_cai_para_arvore_apos_estagnacao_no_filtro(self) -> None:
         scraper = scraping.SEIScraper.__new__(scraping.SEIScraper)
@@ -849,8 +909,7 @@ class WaitOptimizationTests(unittest.TestCase):
         scraper.abrir_documento_mais_recente_no_filtro = lambda *args, **kwargs: None
         scraper._switch_to_newly_opened_window = lambda *args, **kwargs: None
         scraper._extract_and_process_document_snapshot = lambda *args, **kwargs: None
-        scraper._restore_process_base_context = lambda *args, **kwargs: None
-        scraper._ensure_document_search_open = lambda *args, **kwargs: None
+        scraper._reset_search_context_with_fallback = lambda *args, **kwargs: None
         document_type = DocumentTypeSpec(
             key="pt",
             display_name="Plano de Trabalho",
@@ -875,6 +934,83 @@ class WaitOptimizationTests(unittest.TestCase):
         scraper._record_document_search_outcome.assert_called_once()
         outcome = scraper._record_document_search_outcome.call_args.args[2]
         self.assertEqual(outcome["selection_reason"], "not_found_after_filter_and_tree")
+
+    def test_busca_tipos_baixa_relevancia_pula_fallback_da_arvore_apos_zero_resultado(self) -> None:
+        cases = (
+            (
+                "ted",
+                "Termo de Execucao Descentralizada",
+                "TED",
+                ("TED - Termo de Execucao Descentralizada",),
+                ("termo de execucao descentralizada",),
+            ),
+            (
+                "memorando",
+                "Memorando de Entendimentos",
+                "MEMORANDO",
+                ("Memorando de Entendimentos",),
+                ("memorando de entendimentos",),
+            ),
+        )
+
+        for key, display_name, log_label, search_terms, tree_match_terms in cases:
+            with self.subTest(document_type=key):
+                scraper = scraping.SEIScraper.__new__(scraping.SEIScraper)
+                scraper.logger = Mock()
+                scraper.timeout_seconds = 20
+                scraper.driver = FakeScraperDriver()
+                scraper._process_filter_degraded = {}
+                scraper._process_filter_recovery_attempts = {}
+                scraper._normalize_text = scraping.SEIScraper._normalize_text.__get__(scraper, scraping.SEIScraper)
+                scraper._build_collection_context = scraping.SEIScraper._build_collection_context.__get__(
+                    scraper,
+                    scraping.SEIScraper,
+                )
+                scraper._record_document_search_outcome = Mock()
+                scraper._close_opened_doc_tabs = lambda *args, **kwargs: None
+                scraper._open_document_via_tree = Mock(return_value=True)
+                scraper._search_document_in_filter = Mock(
+                    return_value=(
+                        [],
+                        scraper._build_collection_context(
+                            found=False,
+                            found_in="filter",
+                            search_term=search_terms[0],
+                            results_count=0,
+                            selection_reason="no_results_in_filter",
+                            selection_detail="sem resultados no filtro",
+                        ),
+                    )
+                )
+                document_type = DocumentTypeSpec(
+                    key=key,
+                    display_name=display_name,
+                    search_terms=search_terms,
+                    tree_match_terms=tree_match_terms,
+                    snapshot_prefix=key,
+                    log_label=log_label,
+                    cleanup_patterns=(),
+                    handler=DummyHandler(),
+                )
+
+                result = scraping.SEIScraper._buscar_e_abrir_documento_mais_recente(
+                    scraper,
+                    "60093.000015/2020-60",
+                    document_type,
+                )
+
+                self.assertFalse(result)
+                scraper._open_document_via_tree.assert_not_called()
+                scraper._record_document_search_outcome.assert_called_once()
+                outcome = scraper._record_document_search_outcome.call_args.args[2]
+                self.assertEqual(outcome["selection_reason"], "not_found_after_filter")
+                self.assertEqual(outcome["selection_detail"], "nao encontrado no filtro")
+                self.assertTrue(
+                    any(
+                        "fallback skip: baixa relevância do tipo." in str(call.args[0])
+                        for call in scraper.logger.info.call_args_list
+                    )
+                )
 
     def test_busca_act_reabre_filtro_em_sessao_limpa_apos_zero_resultado(self) -> None:
         scraper = scraping.SEIScraper.__new__(scraping.SEIScraper)
@@ -952,11 +1088,8 @@ class WaitOptimizationTests(unittest.TestCase):
             ],
         ), patch.object(
             scraper,
-            "_restore_process_base_context",
-        ) as restore_mock, patch.object(
-            scraper,
-            "_ensure_document_search_open",
-        ) as ensure_mock:
+            "_reset_search_context_with_fallback",
+        ) as reset_mock:
             candidate_groups, collection_context = scraping.SEIScraper._search_document_candidates_in_filter(
                 scraper,
                 "60091.000060/2023-87",
@@ -968,8 +1101,7 @@ class WaitOptimizationTests(unittest.TestCase):
         self.assertEqual(candidate_groups[0][1][0].protocolo, "MEMO-1")
         self.assertTrue(collection_context["found"])
         self.assertEqual(collection_context["search_term"], "Memorando de Entendimentos")
-        restore_mock.assert_called_once()
-        ensure_mock.assert_called_once()
+        reset_mock.assert_called_once()
 
     def test_open_document_via_tree_tenta_proximo_candidato_apos_snapshot_invalido(self) -> None:
         scraper = scraping.SEIScraper.__new__(scraping.SEIScraper)
@@ -995,6 +1127,7 @@ class WaitOptimizationTests(unittest.TestCase):
         scraper._locate_tree_link_by_text = Mock(side_effect=[first_link, second_link])
         scraper._extract_and_process_document_snapshot = Mock(side_effect=[False, True])
         scraper._restore_process_base_context = Mock()
+        scraper._should_skip_candidate_pre_open = lambda *args, **kwargs: False
         document_type = DocumentTypeSpec(
             key="act",
             display_name="Acordo de Cooperacao Tecnica",
@@ -1048,6 +1181,7 @@ class WaitOptimizationTests(unittest.TestCase):
         scraper._extract_and_process_document_snapshot = Mock(return_value=False)
         scraper._restore_process_base_context = Mock()
         scraper._ensure_document_search_open = Mock()
+        scraper._should_skip_candidate_pre_open = lambda *args, **kwargs: False
         scraper.abrir_documento_no_filtro = lambda *args, **kwargs: None
         scraper._switch_to_newly_opened_window = lambda *args, **kwargs: None
         document_type = DocumentTypeSpec(
@@ -1070,6 +1204,244 @@ class WaitOptimizationTests(unittest.TestCase):
         scraper._open_document_via_tree.assert_called_once()
         scraper._record_document_search_outcome.assert_not_called()
 
+    def test_busca_act_limita_abertura_do_filtro_ao_top_2(self) -> None:
+        scraper = scraping.SEIScraper.__new__(scraping.SEIScraper)
+        scraper.logger = Mock()
+        scraper.timeout_seconds = 20
+        scraper.driver = FakeScraperDriver()
+        scraper._process_filter_degraded = {}
+        scraper._process_filter_recovery_attempts = {}
+        scraper._normalize_text = scraping.SEIScraper._normalize_text.__get__(scraper, scraping.SEIScraper)
+        scraper._iter_unique_filter_terms = scraping.SEIScraper._iter_unique_filter_terms.__get__(
+            scraper,
+            scraping.SEIScraper,
+        )
+        scraper._build_collection_context = scraping.SEIScraper._build_collection_context.__get__(
+            scraper,
+            scraping.SEIScraper,
+        )
+        scraper._get_ordered_filter_hits_for_opening = scraping.SEIScraper._get_ordered_filter_hits_for_opening.__get__(
+            scraper,
+            scraping.SEIScraper,
+        )
+        scraper._log_valid_candidate_early_stop = scraping.SEIScraper._log_valid_candidate_early_stop.__get__(
+            scraper,
+            scraping.SEIScraper,
+        )
+        collection_context = scraper._build_collection_context(
+            found=True,
+            found_in="filter",
+            search_term="Acordo de Cooperação Técnica",
+            results_count=3,
+            chosen_documento="ACT-1",
+            selection_reason="resultado_ranqueado_por_data",
+            selection_detail="position=1 total=3",
+        )
+        scraper._search_document_in_filter = Mock(
+            side_effect=[
+                (
+                    [
+                        document_search.SearchHit(protocolo="ACT-3", total_resultados=3, selected_position=3),
+                        document_search.SearchHit(protocolo="ACT-1", total_resultados=3, selected_position=1),
+                        document_search.SearchHit(protocolo="ACT-2", total_resultados=3, selected_position=2),
+                    ],
+                    collection_context,
+                ),
+                (
+                    [
+                        document_search.SearchHit(protocolo="ACT-1", total_resultados=3, selected_position=1),
+                        document_search.SearchHit(protocolo="ACT-2", total_resultados=3, selected_position=2),
+                        document_search.SearchHit(protocolo="ACT-3", total_resultados=3, selected_position=3),
+                    ],
+                    collection_context,
+                ),
+            ]
+        )
+        scraper._record_document_search_outcome = Mock()
+        scraper._close_opened_doc_tabs = lambda *args, **kwargs: None
+        scraper._open_document_via_tree = Mock(return_value=False)
+        scraper._extract_and_process_document_snapshot = Mock(return_value=False)
+        scraper._reset_search_context_with_fallback = Mock()
+        scraper._restore_process_base_context = Mock()
+        scraper._ensure_document_search_open = Mock()
+        scraper._should_skip_candidate_pre_open = lambda *args, **kwargs: False
+        scraper.abrir_documento_no_filtro = Mock()
+        scraper._switch_to_newly_opened_window = lambda *args, **kwargs: None
+        document_type = DocumentTypeSpec(
+            key="act",
+            display_name="Acordo de Cooperacao Tecnica",
+            search_terms=("Acordo de Cooperação Técnica",),
+            tree_match_terms=("act",),
+            snapshot_prefix="act",
+            log_label="ACT",
+            cleanup_patterns=(),
+            handler=DummyHandler(),
+            max_filter_candidates=2,
+        )
+
+        scraping.SEIScraper._buscar_e_abrir_documento_mais_recente(
+            scraper,
+            "60091.000060/2023-87",
+            document_type,
+        )
+
+        self.assertEqual(scraper.abrir_documento_no_filtro.call_count, 2)
+        opened_positions = [call.kwargs["position"] for call in scraper.abrir_documento_no_filtro.call_args_list]
+        self.assertEqual(opened_positions, [1, 2])
+        scraper.logger.info.assert_any_call(
+            "Processo %s: %s limitando abertura do filtro aos top %d candidatos (mais recente primeiro) para alias '%s'.",
+            "60091.000060/2023-87",
+            "ACT",
+            2,
+            "Acordo de Cooperação Técnica",
+        )
+
+    def test_busca_act_registra_early_stop_apos_primeiro_snapshot_valido(self) -> None:
+        scraper = scraping.SEIScraper.__new__(scraping.SEIScraper)
+        scraper.logger = Mock()
+        scraper.timeout_seconds = 20
+        scraper.driver = FakeScraperDriver()
+        scraper._process_filter_degraded = {}
+        scraper._process_filter_recovery_attempts = {}
+        scraper._normalize_text = scraping.SEIScraper._normalize_text.__get__(scraper, scraping.SEIScraper)
+        scraper._iter_unique_filter_terms = scraping.SEIScraper._iter_unique_filter_terms.__get__(
+            scraper,
+            scraping.SEIScraper,
+        )
+        scraper._build_collection_context = scraping.SEIScraper._build_collection_context.__get__(
+            scraper,
+            scraping.SEIScraper,
+        )
+        scraper._get_ordered_filter_hits_for_opening = scraping.SEIScraper._get_ordered_filter_hits_for_opening.__get__(
+            scraper,
+            scraping.SEIScraper,
+        )
+        scraper._log_valid_candidate_early_stop = scraping.SEIScraper._log_valid_candidate_early_stop.__get__(
+            scraper,
+            scraping.SEIScraper,
+        )
+        scraper._search_document_in_filter = Mock(
+            return_value=(
+                [
+                    document_search.SearchHit(protocolo="ACT-1", total_resultados=3, selected_position=1),
+                    document_search.SearchHit(protocolo="ACT-2", total_resultados=3, selected_position=2),
+                    document_search.SearchHit(protocolo="ACT-3", total_resultados=3, selected_position=3),
+                ],
+                scraper._build_collection_context(
+                    found=True,
+                    found_in="filter",
+                    search_term="Acordo de Cooperação Técnica",
+                    results_count=3,
+                    chosen_documento="ACT-1",
+                    selection_reason="resultado_ranqueado_por_data",
+                    selection_detail="position=1 total=3",
+                ),
+            )
+        )
+        scraper._record_document_search_outcome = Mock()
+        scraper._close_opened_doc_tabs = lambda *args, **kwargs: None
+        scraper._open_document_via_tree = Mock(return_value=False)
+        scraper._extract_and_process_document_snapshot = Mock(side_effect=[False, True])
+        scraper._reset_search_context_with_fallback = Mock()
+        scraper._restore_process_base_context = Mock()
+        scraper._ensure_document_search_open = Mock()
+        scraper._should_skip_candidate_pre_open = lambda *args, **kwargs: False
+        scraper.abrir_documento_no_filtro = Mock()
+        scraper._switch_to_newly_opened_window = lambda *args, **kwargs: None
+        document_type = DocumentTypeSpec(
+            key="act",
+            display_name="Acordo de Cooperacao Tecnica",
+            search_terms=("Acordo de Cooperação Técnica",),
+            tree_match_terms=("act",),
+            snapshot_prefix="act",
+            log_label="ACT",
+            cleanup_patterns=(),
+            handler=DummyHandler(),
+            max_filter_candidates=2,
+        )
+
+        result = scraping.SEIScraper._buscar_e_abrir_documento_mais_recente(
+            scraper,
+            "60091.000060/2023-87",
+            document_type,
+        )
+
+        self.assertTrue(result)
+        self.assertEqual(scraper.abrir_documento_no_filtro.call_count, 2)
+        scraper.logger.info.assert_any_call(
+            "Processo %s: ACT early stop após candidato válido",
+            "60091.000060/2023-87",
+        )
+
+    def test_get_document_types_for_process_reorders_ted_after_act(self) -> None:
+        scraper = scraping.SEIScraper.__new__(scraping.SEIScraper)
+        scraper.document_types = [
+            make_document_type("ted", "TED"),
+            make_document_type("act", "ACT"),
+            make_document_type("pt", "PT"),
+        ]
+
+        ordered = scraping.SEIScraper._get_document_types_for_process(scraper)
+
+        self.assertEqual([spec.key for spec in ordered], ["act", "ted", "pt"])
+
+    def test_run_document_search_for_process_skips_ted_without_prior_act(self) -> None:
+        scraper = scraping.SEIScraper.__new__(scraping.SEIScraper)
+        scraper.logger = Mock()
+        scraper._build_collection_context = scraping.SEIScraper._build_collection_context.__get__(scraper, scraping.SEIScraper)
+        scraper._normalize_text = scraping.SEIScraper._normalize_text.__get__(scraper, scraping.SEIScraper)
+        scraper._dedupe_terms = scraping.SEIScraper._dedupe_terms.__get__(scraper, scraping.SEIScraper)
+        scraper._iter_unique_filter_terms = scraping.SEIScraper._iter_unique_filter_terms.__get__(
+            scraper,
+            scraping.SEIScraper,
+        )
+        scraper._record_document_search_outcome = Mock()
+        scraper._ensure_document_search_open = Mock()
+        scraper._buscar_e_abrir_documento_mais_recente = Mock(return_value=False)
+        document_type = make_document_type("ted", "TED - Termo de Execucao Descentralizada")
+
+        result = scraping.SEIScraper._run_document_search_for_process(
+            scraper,
+            "60093.000015/2020-60",
+            document_type,
+        )
+
+        self.assertFalse(result)
+        scraper._ensure_document_search_open.assert_not_called()
+        scraper._buscar_e_abrir_documento_mais_recente.assert_not_called()
+        scraper._record_document_search_outcome.assert_called_once()
+        outcome = scraper._record_document_search_outcome.call_args.args[2]
+        self.assertEqual(outcome["selection_reason"], "skipped_without_prior_act")
+        self.assertEqual(outcome["selection_detail"], "TED skip: sem ACT prévio")
+        scraper.logger.info.assert_any_call("Processo %s: TED skip: sem ACT prévio", "60093.000015/2020-60")
+
+    def test_run_document_search_for_process_executes_ted_after_act_found(self) -> None:
+        scraper = scraping.SEIScraper.__new__(scraping.SEIScraper)
+        scraper.logger = Mock()
+        scraper._ensure_document_search_open = Mock()
+        scraper._buscar_e_abrir_documento_mais_recente = Mock(side_effect=[True, True])
+        act_document_type = make_document_type("act", "ACT")
+        ted_document_type = make_document_type("ted", "TED - Termo de Execucao Descentralizada")
+
+        act_result = scraping.SEIScraper._run_document_search_for_process(
+            scraper,
+            "60093.000015/2020-60",
+            act_document_type,
+        )
+        ted_result = scraping.SEIScraper._run_document_search_for_process(
+            scraper,
+            "60093.000015/2020-60",
+            ted_document_type,
+        )
+
+        self.assertTrue(act_result)
+        self.assertTrue(ted_result)
+        self.assertTrue(scraping.SEIScraper._has_prior_act_for_process(scraper, "60093.000015/2020-60"))
+        self.assertEqual(scraper._ensure_document_search_open.call_count, 2)
+        self.assertEqual(scraper._buscar_e_abrir_documento_mais_recente.call_count, 2)
+        scraper._ensure_document_search_open.assert_any_call("60093.000015/2020-60", ted_document_type)
+        scraper.logger.info.assert_any_call("Processo %s: TED executado: ACT presente", "60093.000015/2020-60")
+
     def test_validate_snapshot_rejeita_email_para_act(self) -> None:
         scraper = scraping.SEIScraper.__new__(scraping.SEIScraper)
         scraper._normalize_text = scraping.SEIScraper._normalize_text.__get__(scraper, scraping.SEIScraper)
@@ -1091,6 +1463,7 @@ class WaitOptimizationTests(unittest.TestCase):
 
         is_valid, reason, analysis = scraping.SEIScraper._validate_snapshot_for_document_type(
             scraper,
+            "60093.000015/2020-60",
             document_type,
             snapshot,
             {"chosen_documento": "E-mail Confirmacao de recebimento-ACT"},

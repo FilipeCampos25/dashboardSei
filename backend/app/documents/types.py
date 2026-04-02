@@ -47,3 +47,4 @@ class DocumentTypeSpec:
     handler: DocumentTypeHandler
     accepted_doc_classes: tuple[str, ...] = ()
     filter_type_aliases: tuple[str, ...] = ()
+    max_filter_candidates: int = 0
