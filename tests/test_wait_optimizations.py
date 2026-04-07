@@ -138,6 +138,55 @@ class FakeSearchElement:
     pass
 
 
+class SearchResultsRecoveryButton:
+    def __init__(self, driver: "SearchResultsRecoveryDriver") -> None:
+        self.driver = driver
+        self.clicks = 0
+
+    def click(self) -> None:
+        self.clicks += 1
+        self.driver.mode = "form"
+
+
+class SearchResultsRecoveryDriver:
+    def __init__(self) -> None:
+        self.mode = "results"
+        self.context: tuple[str, ...] = ()
+        self.switch_to = FakeSwitchTo(self)
+        self.current_url = "https://sei.defesa.gov.br/controlador.php?acao=procedimento_pesquisar"
+        self.title = "SEI - Pesquisa"
+        self.button = SearchResultsRecoveryButton(self)
+        self.form_anchor = FakeSearchElement()
+
+    def find_elements(self, by: Any, value: str) -> list[Any]:
+        if by == By.TAG_NAME and value == "iframe":
+            return []
+        if by != By.XPATH:
+            return []
+
+        normalized = value.replace('"', "'")
+        if self.mode == "results":
+            if "pesquisaResultado" in value:
+                return [object()]
+            if "@name='sbmPesquisar'" in normalized:
+                return [self.button]
+            if "normalize-space(@value)='Pesquisar'" in normalized:
+                return [self.button]
+            if "normalize-space(.)='Pesquisar'" in normalized:
+                return [self.button]
+            return []
+
+        if value == "//tipo":
+            return [self.form_anchor]
+        return []
+
+
+class SearchFormDriver(SearchResultsRecoveryDriver):
+    def __init__(self) -> None:
+        super().__init__()
+        self.mode = "form"
+
+
 class FakeSearchDriver:
     def __init__(self, clock: FakeClock) -> None:
         self.clock = clock
@@ -466,6 +515,66 @@ class WaitOptimizationTests(unittest.TestCase):
         self.assertIn("motivo=timeout", str(ctx.exception))
         self.assertIn("estado=search_results", str(ctx.exception))
         self.assertGreaterEqual(clock.time(), 4.0)
+
+    def test_switch_to_pesquisa_context_reabre_form_when_current_state_is_search_results(self) -> None:
+        logger = Mock()
+        driver = SearchResultsRecoveryDriver()
+        selectors = SimpleSelectors(
+            {
+                "pesquisar_processos": {
+                    "dropdown_tipos": "//tipo",
+                }
+            }
+        )
+
+        document_search._switch_to_pesquisa_context(
+            driver=driver,
+            selectors=selectors,
+            logger=logger,
+            timeout_seconds=1,
+        )
+
+        self.assertEqual(driver.mode, "form")
+        self.assertEqual(driver.button.clicks, 1)
+        self.assertTrue(
+            any(
+                call.args
+                and call.args[0]
+                == "STATE FIX: SEARCH_RESULTS detectado → clicando em Pesquisar para voltar ao formulário"
+                for call in logger.info.call_args_list
+            )
+        )
+
+    def test_switch_to_pesquisa_context_reuses_current_context_when_already_in_search_form(self) -> None:
+        logger = Mock()
+        driver = SearchFormDriver()
+        selectors = SimpleSelectors(
+            {
+                "pesquisar_processos": {
+                    "dropdown_tipos": "//tipo",
+                }
+            }
+        )
+
+        with patch(
+            "app.rpa.sei.document_search._find_first_in_pesquisa_context"
+        ) as find_first_mock:
+            document_search._switch_to_pesquisa_context(
+                driver=driver,
+                selectors=selectors,
+                logger=logger,
+                timeout_seconds=1,
+            )
+
+        find_first_mock.assert_not_called()
+        self.assertTrue(
+            any(
+                call.args
+                and call.args[0]
+                == "STATE SKIP: já em SEARCH_FORM → reutilizando contexto atual"
+                for call in logger.info.call_args_list
+            )
+        )
 
     def test_get_primeiro_resultado_uses_fallback_xpath_when_primary_row_class_varies(self) -> None:
         driver = ResultFallbackDriver()
@@ -1419,7 +1528,8 @@ class WaitOptimizationTests(unittest.TestCase):
         scraper = scraping.SEIScraper.__new__(scraping.SEIScraper)
         scraper.logger = Mock()
         scraper._ensure_document_search_open = Mock()
-        scraper._buscar_e_abrir_documento_mais_recente = Mock(side_effect=[True, True])
+        scraper._buscar_e_abrir_documento_mais_recente = Mock(return_value=True)
+        scraper._process_ted_via_api = Mock(return_value={"numero_processo": "60093000015202060"})
         act_document_type = make_document_type("act", "ACT")
         ted_document_type = make_document_type("ted", "TED - Termo de Execucao Descentralizada")
 
@@ -1437,10 +1547,9 @@ class WaitOptimizationTests(unittest.TestCase):
         self.assertTrue(act_result)
         self.assertTrue(ted_result)
         self.assertTrue(scraping.SEIScraper._has_prior_act_for_process(scraper, "60093.000015/2020-60"))
-        self.assertEqual(scraper._ensure_document_search_open.call_count, 2)
-        self.assertEqual(scraper._buscar_e_abrir_documento_mais_recente.call_count, 2)
-        scraper._ensure_document_search_open.assert_any_call("60093.000015/2020-60", ted_document_type)
-        scraper.logger.info.assert_any_call("Processo %s: TED executado: ACT presente", "60093.000015/2020-60")
+        self.assertEqual(scraper._ensure_document_search_open.call_count, 1)
+        self.assertEqual(scraper._buscar_e_abrir_documento_mais_recente.call_count, 1)
+        scraper._process_ted_via_api.assert_called_once_with("60093.000015/2020-60", ted_document_type)
 
     def test_validate_snapshot_rejeita_email_para_act(self) -> None:
         scraper = scraping.SEIScraper.__new__(scraping.SEIScraper)

@@ -340,6 +340,35 @@ def describe_pesquisa_context(driver: Any, selectors: Any) -> dict[str, Any]:
     }
 
 
+def log_debug_pesquisa_state(
+    driver: Any,
+    selectors: Any,
+    logger: Any,
+    *,
+    processo: str = "",
+    ponto: str = "",
+) -> None:
+    processo_value = _norm(processo) or "-"
+    ponto_suffix = f" ponto={ponto}" if ponto else ""
+    try:
+        diagnostics = describe_pesquisa_context(driver, selectors)
+        logger.info(
+            "DEBUG STATE: estado=%s url=%s processo=%s%s",
+            (diagnostics.get("state") or PESQUISA_STATE_INACTIVE).upper(),
+            diagnostics.get("current_url") or "-",
+            processo_value,
+            ponto_suffix,
+        )
+    except Exception as exc:
+        logger.info(
+            "DEBUG STATE: estado=UNKNOWN url=%s processo=%s%s erro=%s",
+            _safe_driver_value(driver, "current_url") or "-",
+            processo_value,
+            ponto_suffix,
+            exc,
+        )
+
+
 def _build_context_signature(
     *,
     root_descriptions: list[str],
@@ -615,6 +644,55 @@ def _switch_to_pesquisa_context(
     timeout_seconds: int,
 ) -> None:
     deduped = _get_anchor_xpaths(selectors)
+    current_state, _, _ = _detect_pesquisa_state_in_current_context(
+        driver,
+        search_xpaths=deduped,
+        selectors=selectors,
+    )
+    if current_state == PESQUISA_STATE_SEARCH_FORM:
+        logger.info("STATE SKIP: já em SEARCH_FORM → reutilizando contexto atual")
+        return
+    log_debug_pesquisa_state(
+        driver,
+        selectors,
+        logger,
+        ponto="_switch_to_pesquisa_context:start",
+    )
+    if current_state == PESQUISA_STATE_SEARCH_RESULTS:
+        search_button_xpaths = _dedupe_non_empty(
+            [
+                _selector_get(selectors, "pesquisar_processos.botao_pesquisar"),
+                "//input[@name='sbmPesquisar']",
+                "//button[@name='sbmPesquisar']",
+                "//input[@type='submit' and normalize-space(@value)='Pesquisar']",
+                "//button[normalize-space(.)='Pesquisar']",
+            ]
+        )
+        search_button = None
+        for xp in search_button_xpaths:
+            elems = _find_elements_immediate_in_current_context(driver, xp)
+            if elems:
+                search_button = elems[0]
+                break
+        if search_button is not None:
+            logger.info("STATE FIX: SEARCH_RESULTS detectado → clicando em Pesquisar para voltar ao formulário")
+            _click_element(driver, search_button)
+            form_deadline = time.time() + max(1, int(timeout_seconds))
+            while time.time() < form_deadline:
+                state_after_click, _, _ = _detect_pesquisa_state_in_current_context(
+                    driver,
+                    search_xpaths=deduped,
+                    selectors=selectors,
+                )
+                if state_after_click == PESQUISA_STATE_SEARCH_FORM:
+                    break
+                time.sleep(0.2)
+    log_debug_pesquisa_state(
+        driver,
+        selectors,
+        logger,
+        ponto="_switch_to_pesquisa_context:before_find_first",
+    )
     _find_first_in_pesquisa_context(
         driver=driver,
         logger=logger,

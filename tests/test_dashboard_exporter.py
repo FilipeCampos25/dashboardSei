@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import shutil
 import sys
 import unittest
@@ -17,6 +18,10 @@ def _write_csv(path: Path, fieldnames: list[str], rows: list[dict[str, object]])
         writer.writeheader()
         for row in rows:
             writer.writerow(row)
+
+
+def _write_json(path: Path, payload: dict[str, object]) -> None:
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 class DashboardExporterTests(unittest.TestCase):
@@ -154,6 +159,59 @@ class DashboardExporterTests(unittest.TestCase):
                 ],
             )
 
+            ted_json_path = output_dir / "termo_execucao_descentralizada_60090.000004_2026-04.json"
+            _write_json(
+                ted_json_path,
+                {
+                    "captured_at": "2026-03-30T10:05:00",
+                    "document_type": "ted",
+                    "processo": "60090.000004/2026-04",
+                    "documento": "4",
+                    "snapshot": {
+                        "extraction_mode": "api",
+                        "api_payload": {
+                            "numero_processo": "60090000004202604",
+                            "objeto": "Execucao descentralizada de atividades",
+                            "valor_global": "1500000.00",
+                            "situacao": "Em execucao",
+                            "uf": "DF",
+                            "itens": [],
+                        },
+                    },
+                },
+            )
+            _write_csv(
+                output_dir / "ted_normalizado_latest.csv",
+                [
+                    "captured_at",
+                    "requested_type",
+                    "processo",
+                    "documento",
+                    "resolved_document_type",
+                    "selection_reason",
+                    "classification_reason",
+                    "validation_status",
+                    "publication_status",
+                    "snapshot_mode",
+                    "json_path",
+                ],
+                [
+                    {
+                        "captured_at": "2026-03-30T10:05:00",
+                        "requested_type": "ted",
+                        "processo": "60090.000004/2026-04",
+                        "documento": "4",
+                        "resolved_document_type": "termo_execucao_descentralizada",
+                        "selection_reason": "api_result",
+                        "classification_reason": "api_transferegov",
+                        "validation_status": "valid_for_requested_type",
+                        "publication_status": "published_gold",
+                        "snapshot_mode": "api",
+                        "json_path": str(ted_json_path),
+                    }
+                ],
+            )
+
             # Duplicidades operacionais que nao podem contaminar o dataset final.
             _write_csv(
                 output_dir / "act_status_execucao_latest.csv",
@@ -202,6 +260,15 @@ class DashboardExporterTests(unittest.TestCase):
             row_3 = next(row for row in rows if row["processo"] == "60090.000003/2026-03")
             self.assertEqual(row_3["memorando_gold"], "True")
             self.assertEqual(row_3["memorando_json_path"], "output/memorando_entendimentos_60090.000003_2026-03.json")
+
+            row_4 = next(row for row in rows if row["processo"] == "60090.000004/2026-04")
+            self.assertEqual(row_4["ted_gold"], "True")
+            self.assertEqual(row_4["ted_json_path"], str(ted_json_path))
+            self.assertEqual(row_4["ted_objeto"], "Execucao descentralizada de atividades")
+            self.assertEqual(row_4["ted_valor_global"], "1500000.00")
+            self.assertEqual(row_4["ted_situacao"], "Em execucao")
+            self.assertEqual(row_4["ted_uf"], "DF")
+            self.assertEqual(row_4["quality_status"], "medium")
         finally:
             shutil.rmtree(output_dir, ignore_errors=True)
 

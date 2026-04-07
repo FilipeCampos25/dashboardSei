@@ -26,7 +26,9 @@ from app.core.logging_config import setup_logger
 from app.documents import resolve_document_types
 from app.documents.common import sanitize_snapshot
 from app.documents.document_utils import should_skip_candidate
+from app.documents.ted import build_ted_document_type
 from app.documents.types import DocumentTypeSpec
+from app.integrations.transferegov_client import consultar_ted, normalize_processo_sei
 from app.output import csv_writer
 from app.rpa.sei import process_navigation
 from app.rpa.sei import toolbar_actions
@@ -37,7 +39,6 @@ from app.services.act_normalizer import (
     DOC_CLASS_EMAIL_OUTRO,
     DOC_CLASS_MEMORANDO,
     DOC_CLASS_STUB,
-    DOC_CLASS_TED,
     TREE_PENALTY_MARKERS,
     VALIDATION_STATUS_VALID,
     classify_cooperation_snapshot,
@@ -47,6 +48,11 @@ from app.services.pt_normalizer import (
     REQUESTED_TYPE_PT,
     RESOLVED_TYPE_PT,
     VALIDATION_STATUS_NON_CANONICAL,
+)
+from app.services.ted_api_processor import (
+    build_ted_api_analysis,
+    build_ted_api_snapshot,
+    processar_ted_api,
 )
 from app.rpa.selenium_utils import (
     get_iframes_info,
@@ -59,6 +65,7 @@ from app.rpa.selectors import load_xpath_selectors
 POST_LOGIN_REFRESH_SLEEP_SECONDS = 1.0
 UI_SETTLE_SLEEP_SECONDS = 0.35
 PAGINATION_SETTLE_SLEEP_SECONDS = 0.25
+TED_NUMERO_INSTRUMENTO_FIXO = "274752"
 
 
 @dataclass
@@ -240,10 +247,17 @@ class SEIScraper:
         self.main_window_handle: Optional[str] = None
         self.found: Set[str] = set()
         self.document_types = resolve_document_types(cfg.document_types, logger=self.logger)
+        self.ted_api_document_type = next(
+            (spec for spec in self.document_types if spec.key == "ted"),
+            None,
+        ) or build_ted_document_type()
         self.document_types_by_key = {spec.key: spec for spec in self.document_types}
+        self.document_types_by_key[self.ted_api_document_type.key] = self.ted_api_document_type
         self._process_filter_degraded: Dict[str, bool] = {}
         self._process_filter_recovery_attempts: Dict[Tuple[str, str], int] = {}
         self._process_act_found: Dict[str, bool] = {}
+        self._preview_records_by_processo: Dict[str, Dict[str, str]] = {}
+        self._ted_api_results: Dict[str, Dict[str, Any]] = {}
         self.total_candidatos_avaliados = 0
         self.candidatos_descartados_pre_abertura = 0
         self.logger.info(
@@ -266,7 +280,7 @@ class SEIScraper:
         csv_writer.ensure_output_dir(output_dir)
 
         cleanup_patterns = {"parcerias_vigentes_latest.csv", "dashboard_ready_latest.csv"}
-        for document_type in self.document_types:
+        for document_type in self._get_document_types_for_outputs():
             document_type.handler.reset_run()
             cleanup_patterns.update(document_type.cleanup_patterns)
         removed = 0
@@ -827,6 +841,13 @@ class SEIScraper:
             return
 
         try:
+            document_search.log_debug_pesquisa_state(
+                self.driver,
+                self.selectors,
+                self.logger,
+                processo=processo,
+                ponto="_reset_search_context_with_fallback:before_reset_search_context_light",
+            )
             self.reset_search_context_light(processo, reason=reason)
             return
         except (TimeoutException, RuntimeError, NoSuchElementException, StaleElementReferenceException, WebDriverException) as exc:
@@ -860,6 +881,9 @@ class SEIScraper:
 
     def _get_document_types_for_process(self) -> List[DocumentTypeSpec]:
         ordered = list(self.document_types)
+        ted_spec = getattr(self, "ted_api_document_type", None)
+        if isinstance(ted_spec, DocumentTypeSpec) and all(spec.key != "ted" for spec in ordered):
+            ordered.append(ted_spec)
         ted_index = next((idx for idx, spec in enumerate(ordered) if spec.key == "ted"), None)
         act_index = next((idx for idx, spec in enumerate(ordered) if spec.key == "act"), None)
         if ted_index is None or act_index is None or act_index < ted_index:
@@ -891,23 +915,135 @@ class SEIScraper:
             collection_context = self._build_collection_context(
                 found=False,
                 found_in="skipped",
-                search_term="|".join(self._iter_unique_filter_terms(document_type)),
+                search_term="transferegov_api",
                 selection_reason="skipped_without_prior_act",
                 selection_detail="TED skip: sem ACT prévio",
             )
             self._record_document_search_outcome(processo, document_type, collection_context)
             return False
-        self.logger.info("Processo %s: TED executado: ACT presente", processo)
         return True
 
     def _run_document_search_for_process(self, processo: str, document_type: DocumentTypeSpec) -> bool:
         if not self._should_run_document_search(processo, document_type):
             return False
+        if document_type.key == "ted":
+            ted_payload = self._process_ted_via_api(processo, document_type)
+            return ted_payload is not None
         self._ensure_document_search_open(processo, document_type)
         found = self._buscar_e_abrir_documento_mais_recente(processo, document_type)
         if document_type.key == "act":
             self._set_process_act_found(processo, found)
         return found
+
+    def _get_preview_record_for_processo(self, processo: str) -> Dict[str, str]:
+        preview_records = getattr(self, "_preview_records_by_processo", None)
+        if not isinstance(preview_records, dict):
+            return {}
+        record = preview_records.get(processo)
+        return record if isinstance(record, dict) else {}
+
+    def _get_ted_numero_instrumento(self, processo: str) -> str:
+        return TED_NUMERO_INSTRUMENTO_FIXO
+
+    def _process_ted_via_api(
+        self,
+        processo: str,
+        document_type: DocumentTypeSpec,
+    ) -> Dict[str, Any] | None:
+        self.logger.info("Processo %s: TED via API iniciado", processo)
+        try:
+            numero_processo, ano = normalize_processo_sei(processo)
+        except ValueError as exc:
+            self.logger.warning("Processo %s: TED API skip por numero de processo invalido (%s).", processo, exc)
+            collection_context = self._build_collection_context(
+                found=False,
+                found_in="api",
+                search_term="transferegov_api",
+                selection_reason="invalid_processo_number",
+                selection_detail="numero de processo invalido para TED API",
+                extraction_error=str(exc),
+            )
+            self._record_document_search_outcome(processo, document_type, collection_context)
+            return None
+
+        numero_instrumento = self._get_ted_numero_instrumento(processo)
+        ted_json = consultar_ted(
+            numero_processo=numero_processo,
+            numero_instrumento=numero_instrumento,
+            ano=ano,
+        )
+        if not ted_json:
+            collection_context = self._build_collection_context(
+                found=False,
+                found_in="api",
+                search_term="transferegov_api",
+                chosen_documento=numero_instrumento,
+                selection_reason="no_results_in_api",
+                selection_detail="consulta TED sem resultado",
+            )
+            self._record_document_search_outcome(processo, document_type, collection_context)
+            self.logger.info("Processo %s: TED não encontrado via API", processo)
+            return None
+
+        processed_payload = processar_ted_api(ted_json)
+        collection_context = self._build_collection_context(
+            found=True,
+            found_in="api",
+            search_term="transferegov_api",
+            results_count=len(ted_json),
+            chosen_documento=numero_instrumento,
+            selection_reason="api_result",
+            selection_detail="consulta TED via API",
+        )
+        snapshot = build_ted_api_snapshot(
+            processo=processo,
+            numero_instrumento=numero_instrumento,
+            payload_bruto=ted_json,
+            payload_processado=processed_payload,
+        )
+        analysis = build_ted_api_analysis()
+        protocolo_documento = numero_instrumento or processo
+        output_path = None
+        try:
+            output_path = document_type.handler.process_snapshot(
+                spec=document_type,
+                processo=processo,
+                protocolo_documento=protocolo_documento,
+                snapshot=snapshot,
+                collection_context=collection_context,
+                analysis=analysis,
+                output_dir=self._resolve_preview_output_dir(),
+                logger=self.logger,
+                settings=self.settings,
+            )
+        except Exception as exc:
+            failure_context = dict(collection_context)
+            failure_context["captured_at"] = datetime.now().isoformat(timespec="seconds")
+            failure_context["extraction_error"] = str(exc)
+            self._record_document_extraction_failure(
+                processo=processo,
+                protocolo_documento=protocolo_documento,
+                document_type=document_type,
+                collection_context=failure_context,
+            )
+            self.logger.warning("Processo %s: falha ao publicar TED via API (%s).", processo, exc)
+            return None
+
+        ted_results = getattr(self, "_ted_api_results", None)
+        if isinstance(ted_results, dict):
+            ted_results[processo] = {
+                **processed_payload,
+                "json_path": str(output_path) if output_path else "",
+            }
+        if output_path:
+            self.logger.info(
+                "Processo %s: JSON do documento %s salvo em %s",
+                processo,
+                document_type.log_label,
+                output_path,
+            )
+        self.logger.info("Processo %s: TED encontrado via API", processo)
+        return processed_payload
 
     def _is_search_context_stagnation_timeout(self, exc: Exception) -> bool:
         return isinstance(exc, TimeoutException) and "motivo=estagnacao_do_contexto" in str(exc)
@@ -923,6 +1059,16 @@ class SEIScraper:
         return True
 
     def _ensure_document_search_open(self, processo: str, document_type: DocumentTypeSpec) -> None:
+        if document_type.key == "ted":
+            self.logger.info("Processo %s: TED usa exclusivamente API; filtro Selenium ignorado.", processo)
+            return
+        document_search.log_debug_pesquisa_state(
+            self.driver,
+            self.selectors,
+            self.logger,
+            processo=processo,
+            ponto="_ensure_document_search_open:entry",
+        )
         anchor_timeout = min(3, max(1, self.timeout_seconds))
         force_restore = bool(self._process_filter_degraded.get(processo))
         if force_restore:
@@ -1008,6 +1154,13 @@ class SEIScraper:
 
     def _get_document_type(self, key: str) -> Optional[DocumentTypeSpec]:
         return self.document_types_by_key.get(key)
+
+    def _get_document_types_for_outputs(self) -> List[DocumentTypeSpec]:
+        document_types = list(self.document_types)
+        ted_spec = getattr(self, "ted_api_document_type", None)
+        if isinstance(ted_spec, DocumentTypeSpec) and all(spec.key != "ted" for spec in document_types):
+            document_types.append(ted_spec)
+        return document_types
 
     def _iter_unique_search_terms(self, document_type: DocumentTypeSpec) -> List[str]:
         return self._dedupe_terms(document_type.search_terms)
@@ -1546,6 +1699,9 @@ class SEIScraper:
         *,
         process_url: Optional[str] = None,
     ) -> bool:
+        if document_type.key == "ted":
+            self.logger.info("Processo %s: TED usa exclusivamente API; arvore Selenium ignorada.", processo)
+            return False
         candidates = self._find_document_candidates_in_tree(document_type)
         if not candidates:
             return False
@@ -1680,6 +1836,9 @@ class SEIScraper:
         processo: str,
         document_type: DocumentTypeSpec,
     ) -> bool:
+        if document_type.key == "ted":
+            self.logger.info("Processo %s: TED usa exclusivamente API; busca Selenium ignorada.", processo)
+            return False
         collection_context = self._build_collection_context(found=False, found_in="filter")
         processo_handle = ""
         process_url = (self.driver.current_url or "").strip()
@@ -2064,6 +2223,13 @@ class SEIScraper:
                 self.driver.switch_to.window(self.main_window_handle)
             elif remaining:
                 self.driver.switch_to.window(remaining[0])
+            document_search.log_debug_pesquisa_state(
+                self.driver,
+                self.selectors,
+                self.logger,
+                processo=processo,
+                ponto="_close_opened_doc_tabs:after_close",
+            )
             self.logger.info(
                 "Processo %s: fechamento de abas PT concluido. fechadas=%d falhas=%d handles_restantes=%d atual=%s",
                 processo,
@@ -2869,7 +3035,7 @@ class SEIScraper:
 
     def _finalize_document_runs(self) -> None:
         output_dir = self._resolve_preview_output_dir()
-        for document_type in self.document_types:
+        for document_type in self._get_document_types_for_outputs():
             document_type.handler.finalize_run(
                 spec=document_type,
                 output_dir=output_dir,
@@ -3003,7 +3169,7 @@ class SEIScraper:
         if any(marker in blob for marker in invalid_search_markers):
             return (False, "pagina_de_pesquisa", None)
 
-        if document_type.key in {"act", "memorando", "ted"}:
+        if document_type.key in {"act", "memorando"}:
             analysis = classify_cooperation_snapshot(snapshot, document_type.key, collection_context, processo=processo)
             return (True, str(analysis.get("doc_class", "") or "ok"), analysis)
 
@@ -3075,7 +3241,7 @@ class SEIScraper:
                     document_type.log_label,
                     output_path,
                 )
-            if document_type.key in {"act", "memorando", "ted"}:
+            if document_type.key in {"act", "memorando"}:
                 is_canonical = bool((analysis or {}).get("validation_status") == VALIDATION_STATUS_VALID)
                 if not is_canonical:
                     self.logger.warning(
@@ -3154,6 +3320,7 @@ class SEIScraper:
         return csv_path
 
     def _collect_preview_if_parcerias_vigencias(self) -> None:
+        self._preview_records_by_processo = {}
         try:
             descricao_atual = self._get_current_interno_descricao_value()
             if not descricao_atual:
@@ -3171,6 +3338,11 @@ class SEIScraper:
 
             self.logger.info("Entrou no interno '%s'. Iniciando coleta direcional de PARCERIAS VIGENTES.", descricao_atual)
             records = self._collect_preview_records_from_current_list(descricao_atual)
+            self._preview_records_by_processo = {
+                str(record.get("processo", "") or ""): record
+                for record in records
+                if record.get("processo")
+            }
             csv_path = self._save_preview_records_csv(records)
             self.logger.info("Coleta PARCERIAS VIGENTES: %d registro(s) coletado(s).", len(records))
             if csv_path:
