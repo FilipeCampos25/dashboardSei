@@ -19,6 +19,7 @@ from app.documents.types import DocumentTypeSpec
 from app.rpa import scraping
 from app.rpa.sei import document_search
 from app.rpa.sei import document_text_extractor
+from app.rpa.sei import toolbar_actions
 
 
 class DummyLogger:
@@ -55,6 +56,32 @@ class FakeClock:
 
     def sleep(self, seconds: float) -> None:
         self.now += float(seconds)
+
+
+class FakeConditionalWait:
+    def __init__(
+        self,
+        driver: Any,
+        timeout: float,
+        poll_frequency: float = 0.5,
+        ignored_exceptions: tuple[type[BaseException], ...] | None = None,
+    ) -> None:
+        self.driver = driver
+        self.timeout = float(timeout)
+        self.poll_frequency = float(poll_frequency)
+        self.ignored_exceptions = ignored_exceptions or ()
+
+    def until(self, condition: Any) -> Any:
+        deadline = self.driver.clock.time() + self.timeout
+        while self.driver.clock.time() < deadline:
+            try:
+                value = condition(self.driver)
+            except self.ignored_exceptions:
+                value = False
+            if value:
+                return value
+            self.driver.clock.sleep(self.poll_frequency)
+        raise TimeoutException("fake wait timeout")
 
 
 class PopupElement:
@@ -187,6 +214,44 @@ class SearchFormDriver(SearchResultsRecoveryDriver):
         self.mode = "form"
 
 
+class DelayedSearchResultsRecoveryButton:
+    def __init__(self, driver: "DelayedSearchResultsRecoveryDriver") -> None:
+        self.driver = driver
+        self.clicks = 0
+
+    def click(self) -> None:
+        self.clicks += 1
+        self.driver.form_ready_at = self.driver.clock.time() + 0.2
+
+
+class DelayedSearchResultsRecoveryDriver(SearchResultsRecoveryDriver):
+    def __init__(self, clock: FakeClock) -> None:
+        super().__init__()
+        self.clock = clock
+        self.form_ready_at: float | None = None
+        self.button = DelayedSearchResultsRecoveryButton(self)
+
+    def find_elements(self, by: Any, value: str) -> list[Any]:
+        if self.form_ready_at is not None and self.clock.time() >= self.form_ready_at:
+            self.mode = "form"
+        return super().find_elements(by, value)
+
+
+class NeverRecoverSearchResultsButton:
+    def __init__(self) -> None:
+        self.clicks = 0
+
+    def click(self) -> None:
+        self.clicks += 1
+
+
+class NeverRecoverSearchResultsDriver(SearchResultsRecoveryDriver):
+    def __init__(self, clock: FakeClock) -> None:
+        super().__init__()
+        self.clock = clock
+        self.button = NeverRecoverSearchResultsButton()
+
+
 class FakeSearchDriver:
     def __init__(self, clock: FakeClock) -> None:
         self.clock = clock
@@ -314,6 +379,97 @@ class ResultFallbackDriver:
         return []
 
 
+class SearchNoResultsDriver:
+    def __init__(self) -> None:
+        self.current_url = "https://sei.defesa.gov.br/controlador.php?acao=procedimento_pesquisar"
+        self.title = "SEI - Pesquisa"
+
+    def find_elements(self, by: Any, value: str) -> list[Any]:
+        if by == By.TAG_NAME and value == "iframe":
+            return []
+        if by != By.XPATH:
+            return []
+        if "nenhum resultado" in value:
+            return [object()]
+        return []
+
+
+class SearchLoadingDriver(SearchNoResultsDriver):
+    def find_elements(self, by: Any, value: str) -> list[Any]:
+        if by == By.TAG_NAME and value == "iframe":
+            return []
+        return []
+
+
+class ToolbarActionSwitchTo:
+    def __init__(self, driver: "ToolbarActionDriver") -> None:
+        self.driver = driver
+
+    def default_content(self) -> None:
+        self.driver.context = ()
+
+    def frame(self, frame: FakeFrame) -> None:
+        self.driver.context = self.driver.context + (frame.frame_id,)
+
+    def parent_frame(self) -> None:
+        if self.driver.context:
+            self.driver.context = self.driver.context[:-1]
+
+
+class ToolbarActionDriver:
+    def __init__(self) -> None:
+        self.context: tuple[str, ...] = ()
+        self.current_window_handle = "proc-1"
+        self.current_url = "https://sei.defesa.gov.br/controlador.php?acao=procedimento_trabalhar"
+        self.title = "SEI - Processo"
+        self.switch_to = ToolbarActionSwitchTo(self)
+        self.ifr_arvore = FakeFrame("ifrArvore", src="https://sei.defesa.gov.br/arvore")
+        self.ifr_conteudo = FakeFrame(
+            "ifrConteudoVisualizacao",
+            src="https://sei.defesa.gov.br/visualizacao",
+        )
+        self.ifr_visualizacao = FakeFrame(
+            "ifrVisualizacao",
+            src="https://sei.defesa.gov.br/controlador.php?acao=procedimento_pesquisar",
+        )
+        self.anchor = object()
+        self.scan_log: list[tuple[tuple[str, ...], str]] = []
+
+    def find_element(self, by: Any, value: str) -> Any:
+        elems = self.find_elements(by, value)
+        if not elems:
+            raise WebDriverException(f"not found: by={by} value={value}")
+        return elems[0]
+
+    def find_elements(self, by: Any, value: str) -> list[Any]:
+        if by == By.TAG_NAME and value == "iframe":
+            if self.context == ():
+                return [self.ifr_arvore, self.ifr_conteudo]
+            if self.context == ("ifrConteudoVisualizacao",):
+                return [self.ifr_visualizacao]
+            return []
+
+        if by in {By.ID, By.NAME}:
+            if self.context == ():
+                if value == "ifrArvore":
+                    return [self.ifr_arvore]
+                if value == "ifrConteudoVisualizacao":
+                    return [self.ifr_conteudo]
+            if self.context == ("ifrConteudoVisualizacao",) and value == "ifrVisualizacao":
+                return [self.ifr_visualizacao]
+            return []
+
+        if by != By.XPATH:
+            return []
+
+        self.scan_log.append((self.context, value))
+        if value == "//iframe[@id='ifrConteudoVisualizacao']":
+            return [self.ifr_conteudo]
+        if value == "//anchor" and self.context == ("ifrConteudoVisualizacao", "ifrVisualizacao"):
+            return [self.anchor]
+        return []
+
+
 class FakeDriverSwitchOnly:
     def __init__(self) -> None:
         self.default_content_calls = 0
@@ -334,6 +490,48 @@ class FakeScraperDriver:
         self.switch_to = SimpleNamespace(default_content=Mock())
 
 
+class OverlayElement:
+    def is_displayed(self) -> bool:
+        return True
+
+
+class DelayedOverlayDriver:
+    def __init__(self, clock: FakeClock, *, visible_until: float) -> None:
+        self.clock = clock
+        self.visible_until = visible_until
+
+    def find_elements(self, by: Any, value: str) -> list[Any]:
+        if by == By.XPATH and self.clock.time() < self.visible_until:
+            return [OverlayElement()]
+        return []
+
+
+class WindowSwitchTo:
+    def __init__(self, driver: "DelayedWindowDriver") -> None:
+        self.driver = driver
+
+    def window(self, handle: str) -> None:
+        self.driver.current_window_handle = handle
+        self.driver.current_url = f"https://sei.defesa.gov.br/{handle}"
+        self.driver.title = f"SEI - {handle}"
+
+
+class DelayedWindowDriver:
+    def __init__(self, clock: FakeClock, *, open_at: float) -> None:
+        self.clock = clock
+        self.open_at = open_at
+        self.switch_to = WindowSwitchTo(self)
+        self.current_window_handle = "main"
+        self.current_url = "https://sei.defesa.gov.br/main"
+        self.title = "SEI - main"
+
+    @property
+    def window_handles(self) -> list[str]:
+        if self.clock.time() >= self.open_at:
+            return ["main", "doc"]
+        return ["main"]
+
+
 class SimpleSelectors:
     def __init__(self, mapping: dict[str, Any]) -> None:
         self.mapping = mapping
@@ -345,6 +543,20 @@ class SimpleSelectors:
                 return default
             node = node[part]
         return node
+
+    def require(self, path: str) -> Any:
+        value = self.get(path)
+        if value is None:
+            raise KeyError(path)
+        return value
+
+    def get_many(self, path: str) -> list[Any]:
+        value = self.get(path)
+        if value is None:
+            return []
+        if isinstance(value, (list, tuple)):
+            return list(value)
+        return [value]
 
 
 def make_document_type(key: str, display_name: str) -> DocumentTypeSpec:
@@ -431,6 +643,61 @@ class WaitOptimizationTests(unittest.TestCase):
 
         self.assertTrue(result)
         sleep_mock.assert_called_once_with(scraping.PAGINATION_SETTLE_SLEEP_SECONDS)
+
+    def test_wait_for_overlay_to_clear_uses_condition_before_fallback(self) -> None:
+        clock = FakeClock()
+        scraper = scraping.SEIScraper.__new__(scraping.SEIScraper)
+        scraper.driver = DelayedOverlayDriver(clock, visible_until=0.2)
+
+        with patch("app.rpa.scraping.WebDriverWait", FakeConditionalWait), patch(
+            "app.rpa.scraping.profiler_sleep"
+        ) as sleep_mock:
+            result = scraping.SEIScraper._wait_for_overlay_to_clear(
+                scraper,
+                timeout_seconds=1.0,
+            )
+
+        self.assertTrue(result)
+        self.assertAlmostEqual(clock.time(), 0.2, places=6)
+        sleep_mock.assert_not_called()
+
+    def test_wait_for_overlay_to_clear_keeps_short_fallback_after_condition_timeout(self) -> None:
+        clock = FakeClock()
+        scraper = scraping.SEIScraper.__new__(scraping.SEIScraper)
+        scraper.driver = DelayedOverlayDriver(clock, visible_until=2.0)
+
+        with patch("app.rpa.scraping.WebDriverWait", FakeConditionalWait), patch(
+            "app.rpa.scraping.profiler_sleep",
+            side_effect=clock.sleep,
+        ) as sleep_mock:
+            result = scraping.SEIScraper._wait_for_overlay_to_clear(
+                scraper,
+                timeout_seconds=0.5,
+            )
+
+        self.assertFalse(result)
+        sleep_mock.assert_called_once_with(scraping.OVERLAY_WAIT_FALLBACK_SLEEP_SECONDS)
+
+    def test_switch_to_newly_opened_window_uses_condition_before_fallback(self) -> None:
+        clock = FakeClock()
+        scraper = scraping.SEIScraper.__new__(scraping.SEIScraper)
+        scraper.driver = DelayedWindowDriver(clock, open_at=0.2)
+        scraper.logger = DummyLogger()
+
+        with patch("app.rpa.scraping.WebDriverWait", FakeConditionalWait), patch(
+            "app.rpa.scraping.profiler_sleep"
+        ) as sleep_mock:
+            handle = scraping.SEIScraper._switch_to_newly_opened_window(
+                scraper,
+                handles_before={"main"},
+                reason="teste",
+                timeout_seconds=1,
+            )
+
+        self.assertEqual(handle, "doc")
+        self.assertEqual(scraper.driver.current_window_handle, "doc")
+        self.assertAlmostEqual(clock.time(), 0.2, places=6)
+        sleep_mock.assert_not_called()
 
     def test_find_first_in_pesquisa_context_uses_outer_deadline_without_inner_polling(self) -> None:
         clock = FakeClock()
@@ -576,6 +843,200 @@ class WaitOptimizationTests(unittest.TestCase):
             )
         )
 
+    def test_switch_to_pesquisa_context_uses_conditional_wait_before_fallback(self) -> None:
+        clock = FakeClock()
+        logger = Mock()
+        driver = DelayedSearchResultsRecoveryDriver(clock)
+        selectors = SimpleSelectors(
+            {
+                "pesquisar_processos": {
+                    "dropdown_tipos": "//tipo",
+                }
+            }
+        )
+
+        with patch("app.rpa.sei.document_search.WebDriverWait", FakeConditionalWait), patch(
+            "app.rpa.sei.document_search.profiler_sleep"
+        ) as sleep_mock, patch(
+            "app.rpa.sei.document_search._find_first_in_pesquisa_context",
+            return_value=driver.form_anchor,
+        ):
+            document_search._switch_to_pesquisa_context(
+                driver=driver,
+                selectors=selectors,
+                logger=logger,
+                timeout_seconds=1,
+            )
+
+        self.assertEqual(driver.mode, "form")
+        self.assertEqual(driver.button.clicks, 1)
+        self.assertAlmostEqual(clock.time(), 0.2, places=6)
+        sleep_mock.assert_not_called()
+
+    def test_switch_to_pesquisa_context_keeps_short_fallback_after_condition_timeout(self) -> None:
+        clock = FakeClock()
+        logger = Mock()
+        driver = NeverRecoverSearchResultsDriver(clock)
+        selectors = SimpleSelectors(
+            {
+                "pesquisar_processos": {
+                    "dropdown_tipos": "//tipo",
+                }
+            }
+        )
+
+        with patch("app.rpa.sei.document_search.WebDriverWait", FakeConditionalWait), patch(
+            "app.rpa.sei.document_search.profiler_sleep",
+            side_effect=clock.sleep,
+        ) as sleep_mock, patch(
+            "app.rpa.sei.document_search._find_first_in_pesquisa_context",
+            return_value=None,
+        ):
+            document_search._switch_to_pesquisa_context(
+                driver=driver,
+                selectors=selectors,
+                logger=logger,
+                timeout_seconds=1,
+            )
+
+        sleep_mock.assert_called_once_with(document_search.PESQUISA_SEARCH_FORM_FALLBACK_SLEEP_SECONDS)
+
+    def test_wait_pesquisa_anchor_honors_explicit_probe_timeout(self) -> None:
+        clock = FakeClock()
+        driver = ToolbarActionDriver()
+        driver.ifr_visualizacao.src = "https://sei.defesa.gov.br/visualizacao_interna"
+        selectors = SimpleSelectors(
+            {
+                "processo": {
+                    "iframe_visualizacao": "//iframe[@id='ifrConteudoVisualizacao']",
+                    "pesquisa_anchor": "//missing",
+                }
+            }
+        )
+
+        with patch("app.rpa.sei.toolbar_actions.time.time", side_effect=clock.time), patch(
+            "app.rpa.sei.toolbar_actions.time.sleep",
+            side_effect=clock.sleep,
+        ):
+            with self.assertRaises(RuntimeError):
+                toolbar_actions.wait_pesquisa_anchor(
+                    driver,
+                    selectors,
+                    DummyLogger(),
+                    timeout=3,
+                )
+
+        self.assertGreaterEqual(clock.time(), 3.0)
+        self.assertLess(clock.time(), 3.5)
+
+    def test_collect_result_links_returns_early_on_explicit_no_results(self) -> None:
+        clock = FakeClock()
+        driver = SearchNoResultsDriver()
+        selectors = SimpleSelectors({"pesquisar_processos": {}})
+
+        with patch("app.rpa.sei.document_search.time.time", side_effect=clock.time), patch(
+            "app.rpa.sei.document_search.time.sleep",
+            side_effect=clock.sleep,
+        ):
+            links = document_search._collect_result_links(
+                driver=driver,
+                selectors=selectors,
+                timeout_seconds=20,
+            )
+
+        self.assertEqual(links, [])
+        self.assertLess(clock.time(), 1.0)
+
+    def test_collect_result_links_respects_timeout_when_results_page_keeps_loading(self) -> None:
+        clock = FakeClock()
+        driver = SearchLoadingDriver()
+        selectors = SimpleSelectors({"pesquisar_processos": {}})
+
+        with patch("app.rpa.sei.document_search.time.time", side_effect=clock.time), patch(
+            "app.rpa.sei.document_search.time.sleep",
+            side_effect=clock.sleep,
+        ):
+            with self.assertRaises(TimeoutException) as ctx:
+                document_search._collect_result_links(
+                    driver=driver,
+                    selectors=selectors,
+                    timeout_seconds=3,
+                )
+
+        self.assertIn("motivo=timeout_dos_resultados", str(ctx.exception))
+        self.assertGreaterEqual(clock.time(), 3.0)
+        self.assertLess(clock.time(), 3.5)
+
+    def test_click_pesquisar_no_processo_reuses_cached_context_hint(self) -> None:
+        driver = ToolbarActionDriver()
+        selectors = SimpleSelectors({"processo": {"pesquisar_no_processo": "//pesquisar"}})
+        attempts: list[tuple[str, ...]] = []
+
+        def fake_click(
+            current_driver: Any,
+            xpaths: list[str],
+            label: str,
+            default_timeout_seconds: int,
+            timeout_seconds: float | None = None,
+        ) -> str:
+            attempts.append(current_driver.context)
+            if current_driver.context == ("ifrConteudoVisualizacao",):
+                return xpaths[0]
+            raise TimeoutException(f"nao encontrado: {current_driver.context}")
+
+        with patch("app.rpa.sei.toolbar_actions.click_xpath_with_retry", side_effect=fake_click):
+            toolbar_actions.click_pesquisar_no_processo(driver, selectors, DummyLogger())
+            attempts.clear()
+            toolbar_actions.click_pesquisar_no_processo(driver, selectors, DummyLogger())
+
+        self.assertEqual(attempts, [("ifrConteudoVisualizacao",)])
+
+    def test_click_abrir_todas_as_pastas_reuses_cached_context_hint(self) -> None:
+        driver = ToolbarActionDriver()
+        selectors = SimpleSelectors({"processo": {"abrir_todas_as_pastas": "//abrir"}})
+        attempts: list[tuple[str, ...]] = []
+
+        def fake_click(
+            current_driver: Any,
+            xpaths: list[str],
+            label: str,
+            default_timeout_seconds: int,
+            timeout_seconds: float | None = None,
+        ) -> str:
+            attempts.append(current_driver.context)
+            if current_driver.context == ("ifrArvore",):
+                return xpaths[0]
+            raise TimeoutException(f"nao encontrado: {current_driver.context}")
+
+        with patch("app.rpa.sei.toolbar_actions.click_xpath_with_retry", side_effect=fake_click):
+            toolbar_actions.click_abrir_todas_as_pastas(driver, selectors, DummyLogger())
+            attempts.clear()
+            toolbar_actions.click_abrir_todas_as_pastas(driver, selectors, DummyLogger())
+
+        self.assertEqual(attempts, [("ifrArvore",)])
+
+    def test_wait_pesquisa_anchor_reuses_cached_context_hint(self) -> None:
+        clock = FakeClock()
+        driver = ToolbarActionDriver()
+        selectors = SimpleSelectors(
+            {
+                "processo": {
+                    "iframe_visualizacao": "//iframe[@id='ifrConteudoVisualizacao']",
+                    "pesquisa_anchor": "//anchor",
+                }
+            }
+        )
+
+        with patch("app.rpa.sei.toolbar_actions.time.time", side_effect=clock.time), patch(
+            "app.rpa.sei.toolbar_actions.time.sleep",
+            side_effect=clock.sleep,
+        ):
+            toolbar_actions.wait_pesquisa_anchor(driver, selectors, DummyLogger(), timeout=2)
+            driver.scan_log.clear()
+            toolbar_actions.wait_pesquisa_anchor(driver, selectors, DummyLogger(), timeout=2)
+
+        self.assertEqual(driver.scan_log, [(("ifrConteudoVisualizacao", "ifrVisualizacao"), "//anchor")])
+
     def test_get_primeiro_resultado_uses_fallback_xpath_when_primary_row_class_varies(self) -> None:
         driver = ResultFallbackDriver()
         selectors = SimpleSelectors({"pesquisar_processos": {}})
@@ -703,6 +1164,29 @@ class WaitOptimizationTests(unittest.TestCase):
         self.assertEqual(call_order[:2], ["restore", "click"])
         self.assertNotIn("60093.000015/2020-60", scraper._process_filter_degraded)
 
+    def test_ensure_document_search_open_skips_debug_diagnostics_on_nominal_path(self) -> None:
+        scraper = scraping.SEIScraper.__new__(scraping.SEIScraper)
+        scraper.logger = DummyLogger()
+        scraper.timeout_seconds = 20
+        scraper.driver = FakeScraperDriver()
+        scraper.selectors = {}
+        scraper.settings = SimpleNamespace(debug=False)
+        scraper._process_filter_degraded = {}
+        scraper._process_filter_recovery_attempts = {}
+        document_type = make_document_type("act", "Acordo de Cooperacao Tecnica")
+
+        with patch("app.rpa.scraping.document_search.log_debug_pesquisa_state") as debug_mock, patch(
+            "app.rpa.scraping.toolbar_actions.wait_pesquisa_anchor",
+            return_value=None,
+        ):
+            scraping.SEIScraper._ensure_document_search_open(
+                scraper,
+                "60093.000015/2020-60",
+                document_type,
+            )
+
+        debug_mock.assert_not_called()
+
     def test_ensure_document_search_open_does_not_loop_after_second_stagnation(self) -> None:
         scraper = scraping.SEIScraper.__new__(scraping.SEIScraper)
         scraper.logger = DummyLogger()
@@ -773,6 +1257,7 @@ class WaitOptimizationTests(unittest.TestCase):
         scraper.logger = Mock()
         scraper.timeout_seconds = 20
         scraper.driver = FakeScraperDriver()
+        scraper.performance_profiler = Mock(start_span=Mock(), end_span=Mock())
         scraper.selectors = {}
         scraper._process_filter_degraded = {}
         scraper._process_filter_recovery_attempts = {}
@@ -1110,16 +1595,27 @@ class WaitOptimizationTests(unittest.TestCase):
 
                 self.assertFalse(result)
                 scraper._open_document_via_tree.assert_not_called()
-                scraper._record_document_search_outcome.assert_called_once()
-                outcome = scraper._record_document_search_outcome.call_args.args[2]
-                self.assertEqual(outcome["selection_reason"], "not_found_after_filter")
-                self.assertEqual(outcome["selection_detail"], "nao encontrado no filtro")
-                self.assertTrue(
-                    any(
-                        "fallback skip: baixa relevância do tipo." in str(call.args[0])
-                        for call in scraper.logger.info.call_args_list
+                if key == "ted":
+                    scraper._record_document_search_outcome.assert_not_called()
+                else:
+                    scraper._record_document_search_outcome.assert_called_once()
+                    outcome = scraper._record_document_search_outcome.call_args.args[2]
+                    self.assertEqual(outcome["selection_reason"], "not_found_after_filter")
+                    self.assertEqual(outcome["selection_detail"], "nao encontrado no filtro")
+                if key == "ted":
+                    self.assertTrue(
+                        any(
+                            "TED usa exclusivamente API; busca Selenium ignorada." in str(call.args[0])
+                            for call in scraper.logger.info.call_args_list
+                        )
                     )
-                )
+                else:
+                    self.assertTrue(
+                        any(
+                            "fallback skip: baixa relevância do tipo." in str(call.args[0])
+                            for call in scraper.logger.info.call_args_list
+                        )
+                    )
 
     def test_busca_act_reabre_filtro_em_sessao_limpa_apos_zero_resultado(self) -> None:
         scraper = scraping.SEIScraper.__new__(scraping.SEIScraper)
@@ -1527,6 +2023,7 @@ class WaitOptimizationTests(unittest.TestCase):
     def test_run_document_search_for_process_executes_ted_after_act_found(self) -> None:
         scraper = scraping.SEIScraper.__new__(scraping.SEIScraper)
         scraper.logger = Mock()
+        scraper.performance_profiler = Mock(start_span=Mock(), end_span=Mock())
         scraper._ensure_document_search_open = Mock()
         scraper._buscar_e_abrir_documento_mais_recente = Mock(return_value=True)
         scraper._process_ted_via_api = Mock(return_value={"numero_processo": "60093000015202060"})

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from selenium.common.exceptions import (
@@ -12,14 +12,35 @@ from selenium.common.exceptions import (
     WebDriverException,
 )
 from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
 
+from app.rpa.performance_profiler import profiler_sleep, target_span
+from app.rpa.selenium_utils import (
+    UIContextHint,
+    clear_ui_context_hint,
+    get_ui_context_hint,
+    remember_ui_context_hint,
+    switch_to_ui_context_hint,
+)
 from app.rpa.selectors import XPathSelectors
 
 PESQUISA_CONTEXT_STAGNATION_PASSES = 6
 PESQUISA_CONTEXT_STAGNATION_MIN_SECONDS = 2.0
+PESQUISA_CURRENT_CONTEXT_POLL_SECONDS = 0.15
+PESQUISA_SEARCH_FORM_WAIT_POLL_SECONDS = 0.1
+PESQUISA_SEARCH_FORM_FALLBACK_SLEEP_SECONDS = 0.1
+PESQUISA_RESULT_STAGNATION_PASSES = 6
+PESQUISA_RESULT_STAGNATION_MIN_SECONDS = 2.0
+PESQUISA_RESULT_POLL_SECONDS = 0.2
 PESQUISA_STATE_SEARCH_FORM = "search_form"
 PESQUISA_STATE_SEARCH_RESULTS = "search_results"
 PESQUISA_STATE_INACTIVE = "inactive"
+PESQUISA_RESULT_HITS = "hits"
+PESQUISA_RESULT_NO_RESULTS = "no_results"
+PESQUISA_RESULT_LOADING = "loading"
+PESQUISA_RESULT_INACTIVE = "inactive"
+PESQUISA_RESULT_STAGNATED = "stagnated"
+UI_HINT_PESQUISA_ANCHOR = "processo.pesquisa_anchor"
 
 
 @dataclass(frozen=True)
@@ -31,6 +52,16 @@ class SearchHit:
     total_resultados: int = 0
     selected_position: int = 1
     selection_reason: str = "primeiro_resultado_mais_recente"
+
+
+@dataclass
+class SearchProbeResult:
+    state: str
+    links: list[Any] = field(default_factory=list)
+    primary_result_count: int = 0
+    fallback_result_count: int = 0
+    reason: str = ""
+    timed_out: bool = False
 
 
 def _selector_get(selectors: Any, path: str, default: Any = None) -> Any:
@@ -80,7 +111,8 @@ def _find_elements_in_current_context(
             elems = []
         if elems:
             return elems
-        time.sleep(0.2)
+        # Use a tighter local poll interval to reduce idle wait without changing the timeout.
+        profiler_sleep(PESQUISA_CURRENT_CONTEXT_POLL_SECONDS)
     return []
 
 
@@ -89,6 +121,13 @@ def _find_elements_immediate_in_current_context(driver: Any, xpath: str) -> list
         return driver.find_elements(By.XPATH, xpath)
     except WebDriverException:
         return []
+
+
+def _safe_current_window_handle(driver: Any) -> str:
+    try:
+        return str(getattr(driver, "current_window_handle", "") or "")
+    except WebDriverException:
+        return ""
 
 
 def _append_unique_context(contexts: list[str], value: str) -> None:
@@ -147,6 +186,13 @@ def _get_anchor_xpaths(selectors: Any) -> list[str]:
         ]
     )
     return _dedupe_non_empty(anchor_xpaths)
+
+
+def _get_no_results_xpath() -> str:
+    return (
+        "//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', "
+        "'abcdefghijklmnopqrstuvwxyz'), 'nenhum resultado')]"
+    )
 
 
 def _get_primary_result_xpath(selectors: Any) -> str:
@@ -213,7 +259,7 @@ def _detect_pesquisa_state_in_current_context(
     ) or bool(
         _find_elements_immediate_in_current_context(
             driver,
-            "//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'nenhum resultado')]",
+            _get_no_results_xpath(),
         )
     )
     page_marker = (
@@ -225,119 +271,120 @@ def _detect_pesquisa_state_in_current_context(
 
 
 def describe_pesquisa_context(driver: Any, selectors: Any) -> dict[str, Any]:
-    search_xpaths = _get_anchor_xpaths(selectors)
-    context_state = PESQUISA_STATE_INACTIVE
-    primary_result_count = 0
-    fallback_result_count = 0
-    ifr_conteudo_src = ""
-    ifr_visualizacao_src = ""
+    with target_span(driver, "infra:describe_pesquisa_context"):
+        search_xpaths = _get_anchor_xpaths(selectors)
+        context_state = PESQUISA_STATE_INACTIVE
+        primary_result_count = 0
+        fallback_result_count = 0
+        ifr_conteudo_src = ""
+        ifr_visualizacao_src = ""
 
-    try:
-        driver.switch_to.default_content()
-    except WebDriverException:
-        pass
-
-    top_url = _safe_driver_value(driver, "current_url")
-    top_title = _safe_driver_value(driver, "title")
-
-    state_here, primary_here, fallback_here = _detect_pesquisa_state_in_current_context(
-        driver,
-        search_xpaths=search_xpaths,
-        selectors=selectors,
-    )
-    context_state = _merge_search_state(context_state, state_here)
-    primary_result_count = max(primary_result_count, primary_here)
-    fallback_result_count = max(fallback_result_count, fallback_here)
-
-    try:
-        root_iframes = driver.find_elements(By.TAG_NAME, "iframe")
-    except WebDriverException:
-        root_iframes = []
-
-    for root_idx in range(len(root_iframes)):
         try:
             driver.switch_to.default_content()
-            root_iframes_now = driver.find_elements(By.TAG_NAME, "iframe")
-            if root_idx >= len(root_iframes_now):
-                continue
-            root_frame = root_iframes_now[root_idx]
-            root_id = _safe_get_attribute(root_frame, "id")
-            root_name = _safe_get_attribute(root_frame, "name")
-            root_src = _safe_get_attribute(root_frame, "src")
-            if root_id == "ifrConteudoVisualizacao" or root_name == "ifrConteudoVisualizacao":
-                ifr_conteudo_src = root_src
+        except WebDriverException:
+            pass
 
-            driver.switch_to.frame(root_frame)
-            state_here, primary_here, fallback_here = _detect_pesquisa_state_in_current_context(
-                driver,
-                search_xpaths=search_xpaths,
-                selectors=selectors,
-                frame_src=root_src,
-            )
-            context_state = _merge_search_state(context_state, state_here)
-            primary_result_count = max(primary_result_count, primary_here)
-            fallback_result_count = max(fallback_result_count, fallback_here)
+        top_url = _safe_driver_value(driver, "current_url")
+        top_title = _safe_driver_value(driver, "title")
 
-            try:
-                inner_iframes = driver.find_elements(By.TAG_NAME, "iframe")
-            except WebDriverException:
-                inner_iframes = []
+        state_here, primary_here, fallback_here = _detect_pesquisa_state_in_current_context(
+            driver,
+            search_xpaths=search_xpaths,
+            selectors=selectors,
+        )
+        context_state = _merge_search_state(context_state, state_here)
+        primary_result_count = max(primary_result_count, primary_here)
+        fallback_result_count = max(fallback_result_count, fallback_here)
 
-            for inner_idx in range(len(inner_iframes)):
-                try:
-                    driver.switch_to.default_content()
-                    root_iframes_now = driver.find_elements(By.TAG_NAME, "iframe")
-                    if root_idx >= len(root_iframes_now):
-                        break
+        try:
+            root_iframes = driver.find_elements(By.TAG_NAME, "iframe")
+        except WebDriverException:
+            root_iframes = []
 
-                    root_frame = root_iframes_now[root_idx]
-                    root_id = _safe_get_attribute(root_frame, "id")
-                    root_name = _safe_get_attribute(root_frame, "name")
-                    root_src = _safe_get_attribute(root_frame, "src")
-                    if root_id == "ifrConteudoVisualizacao" or root_name == "ifrConteudoVisualizacao":
-                        ifr_conteudo_src = root_src
-
-                    driver.switch_to.frame(root_frame)
-                    inner_iframes_now = driver.find_elements(By.TAG_NAME, "iframe")
-                    if inner_idx >= len(inner_iframes_now):
-                        continue
-
-                    inner_frame = inner_iframes_now[inner_idx]
-                    inner_id = _safe_get_attribute(inner_frame, "id")
-                    inner_name = _safe_get_attribute(inner_frame, "name")
-                    inner_src = _safe_get_attribute(inner_frame, "src")
-                    if inner_id == "ifrVisualizacao" or inner_name == "ifrVisualizacao":
-                        ifr_visualizacao_src = inner_src
-
-                    driver.switch_to.frame(inner_frame)
-                    state_here, primary_here, fallback_here = _detect_pesquisa_state_in_current_context(
-                        driver,
-                        search_xpaths=search_xpaths,
-                        selectors=selectors,
-                        frame_src=inner_src,
-                    )
-                    context_state = _merge_search_state(context_state, state_here)
-                    primary_result_count = max(primary_result_count, primary_here)
-                    fallback_result_count = max(fallback_result_count, fallback_here)
-                except (NoSuchFrameException, StaleElementReferenceException, WebDriverException):
-                    continue
-        except (NoSuchFrameException, StaleElementReferenceException, WebDriverException):
-            continue
-        finally:
+        for root_idx in range(len(root_iframes)):
             try:
                 driver.switch_to.default_content()
-            except WebDriverException:
-                pass
+                root_iframes_now = driver.find_elements(By.TAG_NAME, "iframe")
+                if root_idx >= len(root_iframes_now):
+                    continue
+                root_frame = root_iframes_now[root_idx]
+                root_id = _safe_get_attribute(root_frame, "id")
+                root_name = _safe_get_attribute(root_frame, "name")
+                root_src = _safe_get_attribute(root_frame, "src")
+                if root_id == "ifrConteudoVisualizacao" or root_name == "ifrConteudoVisualizacao":
+                    ifr_conteudo_src = root_src
 
-    return {
-        "state": context_state,
-        "current_url": top_url,
-        "current_title": top_title,
-        "ifrConteudoVisualizacao_src": ifr_conteudo_src,
-        "ifrVisualizacao_src": ifr_visualizacao_src,
-        "primary_result_count": primary_result_count,
-        "fallback_result_count": fallback_result_count,
-    }
+                driver.switch_to.frame(root_frame)
+                state_here, primary_here, fallback_here = _detect_pesquisa_state_in_current_context(
+                    driver,
+                    search_xpaths=search_xpaths,
+                    selectors=selectors,
+                    frame_src=root_src,
+                )
+                context_state = _merge_search_state(context_state, state_here)
+                primary_result_count = max(primary_result_count, primary_here)
+                fallback_result_count = max(fallback_result_count, fallback_here)
+
+                try:
+                    inner_iframes = driver.find_elements(By.TAG_NAME, "iframe")
+                except WebDriverException:
+                    inner_iframes = []
+
+                for inner_idx in range(len(inner_iframes)):
+                    try:
+                        driver.switch_to.default_content()
+                        root_iframes_now = driver.find_elements(By.TAG_NAME, "iframe")
+                        if root_idx >= len(root_iframes_now):
+                            break
+
+                        root_frame = root_iframes_now[root_idx]
+                        root_id = _safe_get_attribute(root_frame, "id")
+                        root_name = _safe_get_attribute(root_frame, "name")
+                        root_src = _safe_get_attribute(root_frame, "src")
+                        if root_id == "ifrConteudoVisualizacao" or root_name == "ifrConteudoVisualizacao":
+                            ifr_conteudo_src = root_src
+
+                        driver.switch_to.frame(root_frame)
+                        inner_iframes_now = driver.find_elements(By.TAG_NAME, "iframe")
+                        if inner_idx >= len(inner_iframes_now):
+                            continue
+
+                        inner_frame = inner_iframes_now[inner_idx]
+                        inner_id = _safe_get_attribute(inner_frame, "id")
+                        inner_name = _safe_get_attribute(inner_frame, "name")
+                        inner_src = _safe_get_attribute(inner_frame, "src")
+                        if inner_id == "ifrVisualizacao" or inner_name == "ifrVisualizacao":
+                            ifr_visualizacao_src = inner_src
+
+                        driver.switch_to.frame(inner_frame)
+                        state_here, primary_here, fallback_here = _detect_pesquisa_state_in_current_context(
+                            driver,
+                            search_xpaths=search_xpaths,
+                            selectors=selectors,
+                            frame_src=inner_src,
+                        )
+                        context_state = _merge_search_state(context_state, state_here)
+                        primary_result_count = max(primary_result_count, primary_here)
+                        fallback_result_count = max(fallback_result_count, fallback_here)
+                    except (NoSuchFrameException, StaleElementReferenceException, WebDriverException):
+                        continue
+            except (NoSuchFrameException, StaleElementReferenceException, WebDriverException):
+                continue
+            finally:
+                try:
+                    driver.switch_to.default_content()
+                except WebDriverException:
+                    pass
+
+        return {
+            "state": context_state,
+            "current_url": top_url,
+            "current_title": top_title,
+            "ifrConteudoVisualizacao_src": ifr_conteudo_src,
+            "ifrVisualizacao_src": ifr_visualizacao_src,
+            "primary_result_count": primary_result_count,
+            "fallback_result_count": fallback_result_count,
+        }
 
 
 def log_debug_pesquisa_state(
@@ -367,6 +414,39 @@ def log_debug_pesquisa_state(
             ponto_suffix,
             exc,
         )
+
+
+def _remember_anchor_hint(
+    driver: Any,
+    *,
+    context_label: str,
+    root_frame: Any | None = None,
+    root_frame_index: int | None = None,
+    inner_frame: Any | None = None,
+    inner_frame_index: int | None = None,
+) -> None:
+    def _attr(elem: Any | None, name: str) -> str:
+        if elem is None:
+            return ""
+        try:
+            return str(elem.get_attribute(name) or "")
+        except WebDriverException:
+            return ""
+
+    remember_ui_context_hint(
+        driver,
+        UI_HINT_PESQUISA_ANCHOR,
+        UIContextHint(
+            context_label=context_label,
+            window_handle=_safe_current_window_handle(driver),
+            root_frame_id=_attr(root_frame, "id"),
+            root_frame_name=_attr(root_frame, "name"),
+            root_frame_index=root_frame_index,
+            inner_frame_id=_attr(inner_frame, "id"),
+            inner_frame_name=_attr(inner_frame, "name"),
+            inner_frame_index=inner_frame_index,
+        ),
+    )
 
 
 def _build_context_signature(
@@ -402,141 +482,89 @@ def _find_first_in_pesquisa_context(
     element_name: str,
     selectors: Any | None = None,
 ) -> Any:
-    deadline = time.time() + max(1, int(timeout_seconds))
-    tried_contexts: list[str] = []
-    last_error: Exception | None = None
-    last_signature: tuple[str, ...] | None = None
-    signature_started_at: float | None = None
-    same_signature_passes = 0
-    pass_number = 0
-    stagnated = False
+    with target_span(driver, "infra:_find_first_in_pesquisa_context"):
+        deadline = time.time() + max(1, int(timeout_seconds))
+        tried_contexts: list[str] = []
+        last_error: Exception | None = None
+        last_signature: tuple[str, ...] | None = None
+        signature_started_at: float | None = None
+        same_signature_passes = 0
+        pass_number = 0
+        stagnated = False
 
-    while time.time() < deadline:
-        pass_number += 1
-        matched_xpath = False
-        context_state = PESQUISA_STATE_INACTIVE
-        root_descriptions: list[str] = []
-        inner_descriptions: list[str] = []
-        pending_logs: list[tuple[str, int, str, str, int | None]] = []
-        current_url = ""
-        current_title = ""
-
-        try:
-            driver.switch_to.default_content()
-        except WebDriverException:
-            pass
-
-        current_url = _safe_driver_value(driver, "current_url")
-        current_title = _safe_driver_value(driver, "title")
-
-        for xp in search_xpaths:
-            elems = _find_elements_immediate_in_current_context(driver, xp)
-            if elems:
-                matched_xpath = True
-                logger.info(
-                    "Pesquisar no Processo: %s encontrado no contexto principal.",
-                    element_name,
-                )
-                return elems[0]
-
-        state_here, _, _ = _detect_pesquisa_state_in_current_context(
-            driver,
-            search_xpaths=search_xpaths,
-            selectors=selectors,
-        )
-        context_state = _merge_search_state(context_state, state_here)
-
-        try:
-            root_iframes = driver.find_elements(By.TAG_NAME, "iframe")
-        except WebDriverException as exc:
-            root_iframes = []
-            last_error = exc
-
-        if not root_iframes:
-            _append_unique_context(tried_contexts, "default->iframe(nao encontrado)")
-        else:
-            for root_idx in range(len(root_iframes)):
-                try:
-                    driver.switch_to.default_content()
-                    root_iframes_now = driver.find_elements(By.TAG_NAME, "iframe")
-                    if root_idx >= len(root_iframes_now):
-                        _append_unique_context(tried_contexts, f"default->root[{root_idx}](stale)")
-                        continue
-
-                    root_frame = root_iframes_now[root_idx]
-                    root_id = _safe_get_attribute(root_frame, "id") or "-"
-                    root_name = _safe_get_attribute(root_frame, "name") or "-"
-                    root_src = _safe_get_attribute(root_frame, "src") or "-"
-                    root_descriptions.append(f"root[{root_idx}]({root_id},{root_name},{root_src})")
-                    pending_logs.append(("root", root_idx, root_id, root_name, None))
-
-                    driver.switch_to.frame(root_frame)
-                    _append_unique_context(tried_contexts, f"default->root[{root_idx}]")
-                except (NoSuchFrameException, StaleElementReferenceException, WebDriverException) as exc:
-                    _append_unique_context(tried_contexts, f"default->root[{root_idx}](erro switch)")
-                    last_error = exc
-                    continue
-
+        hint = get_ui_context_hint(driver, UI_HINT_PESQUISA_ANCHOR)
+        if hint is not None:
+            if switch_to_ui_context_hint(driver, hint):
                 for xp in search_xpaths:
                     elems = _find_elements_immediate_in_current_context(driver, xp)
                     if elems:
-                        matched_xpath = True
-                        logger.info(
-                            "Pesquisar no Processo: %s encontrado no iframe raiz #%d (id=%s, name=%s).",
-                            element_name,
-                            root_idx,
-                            root_id,
-                            root_name,
-                        )
                         return elems[0]
+            clear_ui_context_hint(driver, UI_HINT_PESQUISA_ANCHOR)
 
-                state_here, _, _ = _detect_pesquisa_state_in_current_context(
-                    driver,
-                    search_xpaths=search_xpaths,
-                    selectors=selectors,
-                    frame_src=root_src,
-                )
-                context_state = _merge_search_state(context_state, state_here)
+        while time.time() < deadline:
+            pass_number += 1
+            matched_xpath = False
+            context_state = PESQUISA_STATE_INACTIVE
+            root_descriptions: list[str] = []
+            inner_descriptions: list[str] = []
+            pending_logs: list[tuple[str, int, str, str, int | None]] = []
+            current_url = ""
+            current_title = ""
 
-                try:
-                    inner_iframes = driver.find_elements(By.TAG_NAME, "iframe")
-                except WebDriverException:
-                    inner_iframes = []
+            try:
+                driver.switch_to.default_content()
+            except WebDriverException:
+                pass
 
-                for inner_idx in range(len(inner_iframes)):
+            current_url = _safe_driver_value(driver, "current_url")
+            current_title = _safe_driver_value(driver, "title")
+
+            for xp in search_xpaths:
+                elems = _find_elements_immediate_in_current_context(driver, xp)
+                if elems:
+                    matched_xpath = True
+                    _remember_anchor_hint(driver, context_label="TOP")
+                    logger.info(
+                        "Pesquisar no Processo: %s encontrado no contexto principal.",
+                        element_name,
+                    )
+                    return elems[0]
+
+            state_here, _, _ = _detect_pesquisa_state_in_current_context(
+                driver,
+                search_xpaths=search_xpaths,
+                selectors=selectors,
+            )
+            context_state = _merge_search_state(context_state, state_here)
+
+            try:
+                root_iframes = driver.find_elements(By.TAG_NAME, "iframe")
+            except WebDriverException as exc:
+                root_iframes = []
+                last_error = exc
+
+            if not root_iframes:
+                _append_unique_context(tried_contexts, "default->iframe(nao encontrado)")
+            else:
+                for root_idx in range(len(root_iframes)):
                     try:
                         driver.switch_to.default_content()
                         root_iframes_now = driver.find_elements(By.TAG_NAME, "iframe")
                         if root_idx >= len(root_iframes_now):
-                            _append_unique_context(
-                                tried_contexts,
-                                f"default->root[{root_idx}](stale apos inner)",
-                            )
-                            break
+                            _append_unique_context(tried_contexts, f"default->root[{root_idx}](stale)")
+                            continue
 
                         root_frame = root_iframes_now[root_idx]
                         root_id = _safe_get_attribute(root_frame, "id") or "-"
                         root_name = _safe_get_attribute(root_frame, "name") or "-"
+                        root_src = _safe_get_attribute(root_frame, "src") or "-"
+                        root_descriptions.append(f"root[{root_idx}]({root_id},{root_name},{root_src})")
+                        pending_logs.append(("root", root_idx, root_id, root_name, None))
+
                         driver.switch_to.frame(root_frame)
-
-                        inner_iframes_now = driver.find_elements(By.TAG_NAME, "iframe")
-                        if inner_idx >= len(inner_iframes_now):
-                            _append_unique_context(tried_contexts, f"root[{root_idx}]->inner[{inner_idx}](stale)")
-                            continue
-
-                        inner_frame = inner_iframes_now[inner_idx]
-                        inner_id = _safe_get_attribute(inner_frame, "id") or "-"
-                        inner_name = _safe_get_attribute(inner_frame, "name") or "-"
-                        inner_src = _safe_get_attribute(inner_frame, "src") or "-"
-                        inner_descriptions.append(
-                            f"root[{root_idx}]->inner[{inner_idx}]({inner_id},{inner_name},{inner_src})"
-                        )
-                        pending_logs.append(("inner", inner_idx, inner_id, inner_name, root_idx))
-
-                        driver.switch_to.frame(inner_frame)
-                        _append_unique_context(tried_contexts, f"root[{root_idx}]->inner[{inner_idx}]")
+                        _append_unique_context(tried_contexts, f"default->root[{root_idx}]")
                     except (NoSuchFrameException, StaleElementReferenceException, WebDriverException) as exc:
-                        _append_unique_context(tried_contexts, f"root[{root_idx}]->inner[{inner_idx}](erro switch)")
+                        _append_unique_context(tried_contexts, f"default->root[{root_idx}](erro switch)")
                         last_error = exc
                         continue
 
@@ -544,15 +572,18 @@ def _find_first_in_pesquisa_context(
                         elems = _find_elements_immediate_in_current_context(driver, xp)
                         if elems:
                             matched_xpath = True
+                            _remember_anchor_hint(
+                                driver,
+                                context_label=f"root[{root_idx}]",
+                                root_frame=root_frame,
+                                root_frame_index=root_idx,
+                            )
                             logger.info(
-                                "Pesquisar no Processo: %s encontrado no inner iframe #%d do root #%d (root id=%s, root name=%s, inner id=%s, inner name=%s).",
+                                "Pesquisar no Processo: %s encontrado no iframe raiz #%d (id=%s, name=%s).",
                                 element_name,
-                                inner_idx,
                                 root_idx,
                                 root_id,
                                 root_name,
-                                inner_id,
-                                inner_name,
                             )
                             return elems[0]
 
@@ -560,81 +591,156 @@ def _find_first_in_pesquisa_context(
                         driver,
                         search_xpaths=search_xpaths,
                         selectors=selectors,
-                        frame_src=inner_src,
+                        frame_src=root_src,
                     )
                     context_state = _merge_search_state(context_state, state_here)
 
                     try:
-                        driver.switch_to.default_content()
+                        inner_iframes = driver.find_elements(By.TAG_NAME, "iframe")
                     except WebDriverException:
-                        pass
+                        inner_iframes = []
 
-        signature = _build_context_signature(
-            root_descriptions=root_descriptions,
-            inner_descriptions=inner_descriptions,
-            matched_xpath=matched_xpath,
-            context_state=context_state,
-            current_url=current_url,
-            current_title=current_title,
-        )
-        should_log_pass = pass_number == 1 or signature != last_signature
-        if should_log_pass:
-            for entry_type, index, frame_id, frame_name, root_idx in pending_logs:
-                if entry_type == "root":
-                    logger.info(
-                        "Pesquisar no Processo: testando iframe raiz #%d (id=%s, name=%s).",
-                        index,
-                        frame_id,
-                        frame_name,
-                    )
-                else:
-                    logger.info(
-                        "Pesquisar no Processo: testando inner iframe #%d do root #%d (id=%s, name=%s).",
-                        index,
-                        int(root_idx or 0),
-                        frame_id,
-                        frame_name,
-                    )
+                    for inner_idx in range(len(inner_iframes)):
+                        try:
+                            driver.switch_to.default_content()
+                            root_iframes_now = driver.find_elements(By.TAG_NAME, "iframe")
+                            if root_idx >= len(root_iframes_now):
+                                _append_unique_context(
+                                    tried_contexts,
+                                    f"default->root[{root_idx}](stale apos inner)",
+                                )
+                                break
 
-        now = time.time()
-        if signature == last_signature:
-            same_signature_passes += 1
-        else:
-            last_signature = signature
-            same_signature_passes = 1
-            signature_started_at = now
+                            root_frame = root_iframes_now[root_idx]
+                            root_id = _safe_get_attribute(root_frame, "id") or "-"
+                            root_name = _safe_get_attribute(root_frame, "name") or "-"
+                            driver.switch_to.frame(root_frame)
 
-        if (
-            context_state == PESQUISA_STATE_INACTIVE
-            and
-            same_signature_passes >= PESQUISA_CONTEXT_STAGNATION_PASSES
-            and signature_started_at is not None
-            and (now - signature_started_at) >= PESQUISA_CONTEXT_STAGNATION_MIN_SECONDS
-        ):
-            stagnated = True
-            break
+                            inner_iframes_now = driver.find_elements(By.TAG_NAME, "iframe")
+                            if inner_idx >= len(inner_iframes_now):
+                                _append_unique_context(tried_contexts, f"root[{root_idx}]->inner[{inner_idx}](stale)")
+                                continue
 
-        time.sleep(0.2)
+                            inner_frame = inner_iframes_now[inner_idx]
+                            inner_id = _safe_get_attribute(inner_frame, "id") or "-"
+                            inner_name = _safe_get_attribute(inner_frame, "name") or "-"
+                            inner_src = _safe_get_attribute(inner_frame, "src") or "-"
+                            inner_descriptions.append(
+                                f"root[{root_idx}]->inner[{inner_idx}]({inner_id},{inner_name},{inner_src})"
+                            )
+                            pending_logs.append(("inner", inner_idx, inner_id, inner_name, root_idx))
 
-    failure_reason = "estagnacao_do_contexto" if stagnated else "timeout"
-    if stagnated:
-        logger.warning(
-            "Pesquisar no Processo: varredura interrompida por estagnacao do contexto apos %d passada(s). estado=%s contextos_unicos=%s",
-            same_signature_passes,
+                            driver.switch_to.frame(inner_frame)
+                            _append_unique_context(tried_contexts, f"root[{root_idx}]->inner[{inner_idx}]")
+                        except (NoSuchFrameException, StaleElementReferenceException, WebDriverException) as exc:
+                            _append_unique_context(tried_contexts, f"root[{root_idx}]->inner[{inner_idx}](erro switch)")
+                            last_error = exc
+                            continue
+
+                        for xp in search_xpaths:
+                            elems = _find_elements_immediate_in_current_context(driver, xp)
+                            if elems:
+                                matched_xpath = True
+                                _remember_anchor_hint(
+                                    driver,
+                                    context_label=f"root[{root_idx}]->inner[{inner_idx}]",
+                                    root_frame=root_frame,
+                                    root_frame_index=root_idx,
+                                    inner_frame=inner_frame,
+                                    inner_frame_index=inner_idx,
+                                )
+                                logger.info(
+                                    "Pesquisar no Processo: %s encontrado no inner iframe #%d do root #%d (root id=%s, root name=%s, inner id=%s, inner name=%s).",
+                                    element_name,
+                                    inner_idx,
+                                    root_idx,
+                                    root_id,
+                                    root_name,
+                                    inner_id,
+                                    inner_name,
+                                )
+                                return elems[0]
+
+                        state_here, _, _ = _detect_pesquisa_state_in_current_context(
+                            driver,
+                            search_xpaths=search_xpaths,
+                            selectors=selectors,
+                            frame_src=inner_src,
+                        )
+                        context_state = _merge_search_state(context_state, state_here)
+
+                        try:
+                            driver.switch_to.default_content()
+                        except WebDriverException:
+                            pass
+
+            signature = _build_context_signature(
+                root_descriptions=root_descriptions,
+                inner_descriptions=inner_descriptions,
+                matched_xpath=matched_xpath,
+                context_state=context_state,
+                current_url=current_url,
+                current_title=current_title,
+            )
+            should_log_pass = pass_number == 1 or signature != last_signature
+            if should_log_pass:
+                for entry_type, index, frame_id, frame_name, root_idx in pending_logs:
+                    if entry_type == "root":
+                        logger.info(
+                            "Pesquisar no Processo: testando iframe raiz #%d (id=%s, name=%s).",
+                            index,
+                            frame_id,
+                            frame_name,
+                        )
+                    else:
+                        logger.info(
+                            "Pesquisar no Processo: testando inner iframe #%d do root #%d (id=%s, name=%s).",
+                            index,
+                            int(root_idx or 0),
+                            frame_id,
+                            frame_name,
+                        )
+
+            now = time.time()
+            if signature == last_signature:
+                same_signature_passes += 1
+            else:
+                last_signature = signature
+                same_signature_passes = 1
+                signature_started_at = now
+
+            if (
+                context_state == PESQUISA_STATE_INACTIVE
+                and
+                same_signature_passes >= PESQUISA_CONTEXT_STAGNATION_PASSES
+                and signature_started_at is not None
+                and (now - signature_started_at) >= PESQUISA_CONTEXT_STAGNATION_MIN_SECONDS
+            ):
+                stagnated = True
+                break
+
+            profiler_sleep(0.2)
+
+        failure_reason = "estagnacao_do_contexto" if stagnated else "timeout"
+        clear_ui_context_hint(driver, UI_HINT_PESQUISA_ANCHOR)
+        if stagnated:
+            logger.warning(
+                "Pesquisar no Processo: varredura interrompida por estagnacao do contexto apos %d passada(s). estado=%s contextos_unicos=%s",
+                same_signature_passes,
+                context_state,
+                tried_contexts,
+            )
+        logger.error(
+            "Pesquisar no Processo: elemento '%s' nao localizado. estado=%s contextos_unicos=%s motivo=%s",
+            element_name,
             context_state,
             tried_contexts,
+            failure_reason,
         )
-    logger.error(
-        "Pesquisar no Processo: elemento '%s' nao localizado. estado=%s contextos_unicos=%s motivo=%s",
-        element_name,
-        context_state,
-        tried_contexts,
-        failure_reason,
-    )
-    raise TimeoutException(
-        "Timeout aguardando elemento no contexto de pesquisa: "
-        f"elemento={element_name} timeout={timeout_seconds}s contextos={tried_contexts} estado={context_state} motivo={failure_reason}"
-    ) from last_error
+        raise TimeoutException(
+            "Timeout aguardando elemento no contexto de pesquisa: "
+            f"elemento={element_name} timeout={timeout_seconds}s contextos={tried_contexts} estado={context_state} motivo={failure_reason}"
+        ) from last_error
 
 
 def _switch_to_pesquisa_context(
@@ -642,65 +748,77 @@ def _switch_to_pesquisa_context(
     selectors: XPathSelectors,
     logger: Any,
     timeout_seconds: int,
+    *,
+    debug_logging: bool = False,
 ) -> None:
-    deduped = _get_anchor_xpaths(selectors)
-    current_state, _, _ = _detect_pesquisa_state_in_current_context(
-        driver,
-        search_xpaths=deduped,
-        selectors=selectors,
-    )
-    if current_state == PESQUISA_STATE_SEARCH_FORM:
-        logger.info("STATE SKIP: já em SEARCH_FORM → reutilizando contexto atual")
-        return
-    log_debug_pesquisa_state(
-        driver,
-        selectors,
-        logger,
-        ponto="_switch_to_pesquisa_context:start",
-    )
-    if current_state == PESQUISA_STATE_SEARCH_RESULTS:
-        search_button_xpaths = _dedupe_non_empty(
-            [
-                _selector_get(selectors, "pesquisar_processos.botao_pesquisar"),
-                "//input[@name='sbmPesquisar']",
-                "//button[@name='sbmPesquisar']",
-                "//input[@type='submit' and normalize-space(@value)='Pesquisar']",
-                "//button[normalize-space(.)='Pesquisar']",
-            ]
+    with target_span(driver, "infra:_switch_to_pesquisa_context"):
+        deduped = _get_anchor_xpaths(selectors)
+        current_state, _, _ = _detect_pesquisa_state_in_current_context(
+            driver,
+            search_xpaths=deduped,
+            selectors=selectors,
         )
-        search_button = None
-        for xp in search_button_xpaths:
-            elems = _find_elements_immediate_in_current_context(driver, xp)
-            if elems:
-                search_button = elems[0]
-                break
-        if search_button is not None:
-            logger.info("STATE FIX: SEARCH_RESULTS detectado → clicando em Pesquisar para voltar ao formulário")
-            _click_element(driver, search_button)
-            form_deadline = time.time() + max(1, int(timeout_seconds))
-            while time.time() < form_deadline:
-                state_after_click, _, _ = _detect_pesquisa_state_in_current_context(
-                    driver,
-                    search_xpaths=deduped,
-                    selectors=selectors,
-                )
-                if state_after_click == PESQUISA_STATE_SEARCH_FORM:
+        if current_state == PESQUISA_STATE_SEARCH_FORM:
+            logger.info("STATE SKIP: já em SEARCH_FORM → reutilizando contexto atual")
+            return
+        if debug_logging:
+            log_debug_pesquisa_state(
+                driver,
+                selectors,
+                logger,
+                ponto="_switch_to_pesquisa_context:start",
+            )
+        if current_state == PESQUISA_STATE_SEARCH_RESULTS:
+            search_button_xpaths = _dedupe_non_empty(
+                [
+                    _selector_get(selectors, "pesquisar_processos.botao_pesquisar"),
+                    "//input[@name='sbmPesquisar']",
+                    "//button[@name='sbmPesquisar']",
+                    "//input[@type='submit' and normalize-space(@value)='Pesquisar']",
+                    "//button[normalize-space(.)='Pesquisar']",
+                ]
+            )
+            search_button = None
+            for xp in search_button_xpaths:
+                elems = _find_elements_immediate_in_current_context(driver, xp)
+                if elems:
+                    search_button = elems[0]
                     break
-                time.sleep(0.2)
-    log_debug_pesquisa_state(
-        driver,
-        selectors,
-        logger,
-        ponto="_switch_to_pesquisa_context:before_find_first",
-    )
-    _find_first_in_pesquisa_context(
-        driver=driver,
-        logger=logger,
-        timeout_seconds=timeout_seconds,
-        search_xpaths=deduped,
-        element_name="anchor do filtro",
-        selectors=selectors,
-    )
+            if search_button is not None:
+                logger.info("STATE FIX: SEARCH_RESULTS detectado → clicando em Pesquisar para voltar ao formulário")
+                _click_element(driver, search_button)
+                try:
+                    # Prefer a state-based wait so we continue as soon as the form is usable again.
+                    WebDriverWait(
+                        driver,
+                        max(1, int(timeout_seconds)),
+                        poll_frequency=PESQUISA_SEARCH_FORM_WAIT_POLL_SECONDS,
+                    ).until(
+                        lambda _: _detect_pesquisa_state_in_current_context(
+                            driver,
+                            search_xpaths=deduped,
+                            selectors=selectors,
+                        )[0]
+                        == PESQUISA_STATE_SEARCH_FORM
+                    )
+                except TimeoutException:
+                    # Keep a short fallback so a late iframe repaint still gets one final settle pass.
+                    profiler_sleep(PESQUISA_SEARCH_FORM_FALLBACK_SLEEP_SECONDS)
+        if debug_logging:
+            log_debug_pesquisa_state(
+                driver,
+                selectors,
+                logger,
+                ponto="_switch_to_pesquisa_context:before_find_first",
+            )
+        _find_first_in_pesquisa_context(
+            driver=driver,
+            logger=logger,
+            timeout_seconds=timeout_seconds,
+            search_xpaths=deduped,
+            element_name="anchor do filtro",
+            selectors=selectors,
+        )
 
 
 def _get_first_by_xpath(driver: Any, xpath: str, timeout_seconds: int) -> Optional[Any]:
@@ -931,12 +1049,10 @@ def _dedupe_links(links: list[Any]) -> list[Any]:
     return deduped
 
 
-def _collect_result_links(
+def _collect_immediate_result_links(
     driver: Any,
     selectors: XPathSelectors,
-    timeout_seconds: int,
 ) -> list[Any]:
-    deadline = time.time() + max(1, int(timeout_seconds))
     primary_rows_xpath = _get_primary_result_rows_xpath(selectors)
     fallback_row_xpaths = _get_fallback_result_rows_xpaths(selectors)
     generic_link_xpaths = [
@@ -944,33 +1060,157 @@ def _collect_result_links(
         "//table[contains(@class,'pesquisaResultado')]//a[normalize-space(.)!='']",
     ]
 
-    while time.time() < deadline:
-        rows = _find_elements_immediate_in_current_context(driver, primary_rows_xpath)
-        if not rows:
-            for xpath in fallback_row_xpaths:
-                rows = _find_elements_immediate_in_current_context(driver, xpath)
-                if rows:
-                    break
-        if rows:
-            row_links: list[Any] = []
-            for row in rows:
-                try:
-                    links = row.find_elements(By.XPATH, ".//a[normalize-space(.)!='']")
-                except WebDriverException:
-                    links = []
-                if links:
-                    row_links.append(links[0])
-            deduped = _dedupe_links(row_links)
-            if deduped:
-                return deduped
+    rows = _find_elements_immediate_in_current_context(driver, primary_rows_xpath)
+    if not rows:
+        for xpath in fallback_row_xpaths:
+            rows = _find_elements_immediate_in_current_context(driver, xpath)
+            if rows:
+                break
+    if rows:
+        row_links: list[Any] = []
+        for row in rows:
+            try:
+                links = row.find_elements(By.XPATH, ".//a[normalize-space(.)!='']")
+            except WebDriverException:
+                links = []
+            if links:
+                row_links.append(links[0])
+        deduped = _dedupe_links(row_links)
+        if deduped:
+            return deduped
 
-        for xpath in generic_link_xpaths:
-            deduped = _dedupe_links(_find_elements_immediate_in_current_context(driver, xpath))
-            if deduped:
-                return deduped
+    for xpath in generic_link_xpaths:
+        deduped = _dedupe_links(_find_elements_immediate_in_current_context(driver, xpath))
+        if deduped:
+            return deduped
 
-        time.sleep(0.2)
     return []
+
+
+def _probe_search_results_in_current_context(
+    driver: Any,
+    selectors: XPathSelectors,
+) -> SearchProbeResult:
+    primary_result_count = _count_elements_immediate_in_current_context(
+        driver,
+        _get_primary_result_rows_xpath(selectors),
+    )
+    fallback_result_count = 0
+    for xpath in _get_fallback_result_rows_xpaths(selectors):
+        fallback_result_count = max(
+            fallback_result_count,
+            _count_elements_immediate_in_current_context(driver, xpath),
+        )
+
+    links = _collect_immediate_result_links(driver, selectors)
+    if links:
+        return SearchProbeResult(
+            state=PESQUISA_RESULT_HITS,
+            links=links,
+            primary_result_count=max(primary_result_count, len(links)),
+            fallback_result_count=fallback_result_count,
+        )
+
+    no_results = bool(_find_elements_immediate_in_current_context(driver, _get_no_results_xpath()))
+    state_here, detected_primary, detected_fallback = _detect_pesquisa_state_in_current_context(
+        driver,
+        search_xpaths=_get_anchor_xpaths(selectors),
+        selectors=selectors,
+    )
+    primary_result_count = max(primary_result_count, detected_primary)
+    fallback_result_count = max(fallback_result_count, detected_fallback)
+
+    if no_results:
+        return SearchProbeResult(
+            state=PESQUISA_RESULT_NO_RESULTS,
+            primary_result_count=primary_result_count,
+            fallback_result_count=fallback_result_count,
+        )
+
+    if state_here in {PESQUISA_STATE_SEARCH_FORM, PESQUISA_STATE_SEARCH_RESULTS}:
+        return SearchProbeResult(
+            state=PESQUISA_RESULT_LOADING,
+            primary_result_count=primary_result_count,
+            fallback_result_count=fallback_result_count,
+        )
+
+    return SearchProbeResult(
+        state=PESQUISA_RESULT_INACTIVE,
+        primary_result_count=primary_result_count,
+        fallback_result_count=fallback_result_count,
+    )
+
+
+def _wait_for_search_results(
+    driver: Any,
+    selectors: XPathSelectors,
+    timeout_seconds: int,
+) -> SearchProbeResult:
+    deadline = time.time() + max(1, int(timeout_seconds))
+    last_probe = SearchProbeResult(state=PESQUISA_RESULT_INACTIVE)
+    last_signature: tuple[str, int, int, int] | None = None
+    signature_started_at: float | None = None
+    same_signature_passes = 0
+
+    while time.time() < deadline:
+        probe = _probe_search_results_in_current_context(driver, selectors)
+        if probe.state in {PESQUISA_RESULT_HITS, PESQUISA_RESULT_NO_RESULTS}:
+            return probe
+
+        signature = (
+            probe.state,
+            probe.primary_result_count,
+            probe.fallback_result_count,
+            len(probe.links),
+        )
+        now = time.time()
+        if signature == last_signature:
+            same_signature_passes += 1
+        else:
+            last_signature = signature
+            same_signature_passes = 1
+            signature_started_at = now
+
+        if (
+            probe.state == PESQUISA_RESULT_INACTIVE
+            and same_signature_passes >= PESQUISA_RESULT_STAGNATION_PASSES
+            and signature_started_at is not None
+            and (now - signature_started_at) >= PESQUISA_RESULT_STAGNATION_MIN_SECONDS
+        ):
+            probe.state = PESQUISA_RESULT_STAGNATED
+            probe.reason = "estagnacao_dos_resultados"
+            return probe
+
+        last_probe = probe
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        profiler_sleep(min(PESQUISA_RESULT_POLL_SECONDS, remaining))
+
+    last_probe.timed_out = True
+    last_probe.reason = "timeout_dos_resultados"
+    return last_probe
+
+
+def _collect_result_links(
+    driver: Any,
+    selectors: XPathSelectors,
+    timeout_seconds: int,
+) -> list[Any]:
+    probe = _wait_for_search_results(
+        driver=driver,
+        selectors=selectors,
+        timeout_seconds=timeout_seconds,
+    )
+    if probe.state == PESQUISA_RESULT_HITS:
+        return probe.links
+    if probe.state == PESQUISA_RESULT_NO_RESULTS:
+        return []
+    reason = probe.reason or ("timeout_dos_resultados" if probe.timed_out else "resultado_indisponivel")
+    raise TimeoutException(
+        "Timeout aguardando resultados da pesquisa: "
+        f"timeout={timeout_seconds}s estado={probe.state} motivo={reason}"
+    )
 
 
 def _get_resultado_por_posicao(
@@ -1018,6 +1258,34 @@ def _contar_resultados(driver: Any, selectors: XPathSelectors) -> int:
     return max(primary_count, fallback_count)
 
 
+def _build_search_hits_from_current_search(
+    driver: Any,
+    selectors: XPathSelectors,
+    logger: Any,
+    termo: str,
+    timeout_seconds: int,
+) -> list[SearchHit]:
+    links = _collect_result_links(
+        driver=driver,
+        selectors=selectors,
+        timeout_seconds=timeout_seconds,
+    )
+    if not links:
+        logger.info("Nenhum resultado encontrado para tipo: %s", termo)
+        return []
+
+    total_resultados = max(_contar_resultados(driver, selectors), len(links))
+    hits = [_build_search_hit(link, index, total_resultados) for index, link in enumerate(links, start=1)]
+    logger.info(
+        "Busca por tipo '%s': total_resultados=%d candidatos=%d primeiro=%s",
+        termo,
+        total_resultados,
+        len(hits),
+        hits[0].protocolo,
+    )
+    return hits
+
+
 def buscar_por_tipo_e_abrir_mais_recente(
     driver: Any,
     selectors: XPathSelectors,
@@ -1043,11 +1311,23 @@ def buscar_por_tipo_e_abrir_mais_recente(
         if not pesquisou:
             return False
 
-        first_link = _get_primeiro_resultado(driver=driver, selectors=selectors, timeout_seconds=timeout_seconds)
-        if first_link is None:
-            logger.info("Nenhum resultado encontrado para tipo: %s", tipo_exato)
+        hits = _build_search_hits_from_current_search(
+            driver=driver,
+            selectors=selectors,
+            logger=logger,
+            termo=tipo_exato,
+            timeout_seconds=timeout_seconds,
+        )
+        if not hits:
             return False
 
+        first_link = _get_primeiro_resultado(
+            driver=driver,
+            selectors=selectors,
+            timeout_seconds=max(1, min(2, timeout_seconds)),
+        )
+        if first_link is None:
+            return False
         _click_element(driver, first_link)
         logger.info("Documento mais recente aberto para tipo exato: %s", tipo_exato)
         return True
@@ -1085,17 +1365,14 @@ def buscar_documento_mais_recente(
     if not pesquisou:
         return None
 
-    hits = listar_resultados_pesquisa(
+    hits = _build_search_hits_from_current_search(
         driver=driver,
         selectors=selectors,
         logger=logger,
         termo=termo,
         timeout_seconds=timeout_seconds,
     )
-    if not hits:
-        logger.info("Nenhum resultado encontrado para tipo: %s", termo)
-        return None
-    return hits[0]
+    return hits[0] if hits else None
 
 
 def listar_resultados_pesquisa(
@@ -1115,25 +1392,13 @@ def listar_resultados_pesquisa(
     if not pesquisou:
         return []
 
-    links = _collect_result_links(
+    return _build_search_hits_from_current_search(
         driver=driver,
         selectors=selectors,
+        logger=logger,
+        termo=termo,
         timeout_seconds=timeout_seconds,
     )
-    if not links:
-        logger.info("Nenhum resultado encontrado para tipo: %s", termo)
-        return []
-
-    total_resultados = max(_contar_resultados(driver, selectors), len(links))
-    hits = [_build_search_hit(link, index, total_resultados) for index, link in enumerate(links, start=1)]
-    logger.info(
-        "Busca por tipo '%s': total_resultados=%d candidatos=%d primeiro=%s",
-        termo,
-        total_resultados,
-        len(hits),
-        hits[0].protocolo,
-    )
-    return hits
 
 
 def abrir_documento_mais_recente(

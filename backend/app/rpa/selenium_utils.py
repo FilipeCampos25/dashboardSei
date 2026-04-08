@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import time
 from typing import Any, Dict, List, Optional
 
@@ -13,6 +14,126 @@ from selenium.common.exceptions import (
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
+
+from app.rpa.performance_profiler import profiler_sleep
+
+ELEMENT_LOOKUP_POLL_SECONDS = 0.25
+CLICK_RETRY_POLL_SECONDS = 0.15
+
+
+@dataclass(frozen=True)
+class UIContextHint:
+    context_label: str
+    window_handle: str = ""
+    root_frame_id: str = ""
+    root_frame_name: str = ""
+    root_frame_index: int | None = None
+    inner_frame_id: str = ""
+    inner_frame_name: str = ""
+    inner_frame_index: int | None = None
+
+
+def _safe_current_window_handle(driver: Any) -> str:
+    try:
+        return str(getattr(driver, "current_window_handle", "") or "")
+    except WebDriverException:
+        return ""
+
+
+def _ui_context_store(driver: Any) -> Dict[str, UIContextHint]:
+    store = getattr(driver, "_sei_ui_context_hints", None)
+    if isinstance(store, dict):
+        return store
+    store = {}
+    setattr(driver, "_sei_ui_context_hints", store)
+    return store
+
+
+def get_ui_context_hint(driver: Any, key: str) -> UIContextHint | None:
+    hint = _ui_context_store(driver).get(key)
+    if not isinstance(hint, UIContextHint):
+        return None
+    current_handle = _safe_current_window_handle(driver)
+    if hint.window_handle and current_handle and hint.window_handle != current_handle:
+        return None
+    return hint
+
+
+def remember_ui_context_hint(driver: Any, key: str, hint: UIContextHint) -> None:
+    _ui_context_store(driver)[key] = hint
+
+
+def clear_ui_context_hint(driver: Any, key: str) -> None:
+    _ui_context_store(driver).pop(key, None)
+
+
+def _find_frame_in_current_context(
+    driver: Any,
+    *,
+    frame_id: str = "",
+    frame_name: str = "",
+    frame_index: int | None = None,
+) -> Any | None:
+    for by, value in ((By.ID, frame_id), (By.NAME, frame_name)):
+        if not value:
+            continue
+        try:
+            return driver.find_element(by, value)
+        except WebDriverException:
+            continue
+
+    if frame_index is None or frame_index < 0:
+        return None
+
+    try:
+        frames = driver.find_elements(By.TAG_NAME, "iframe")
+    except WebDriverException:
+        return None
+    if frame_index >= len(frames):
+        return None
+    return frames[frame_index]
+
+
+def switch_to_ui_context_hint(driver: Any, hint: UIContextHint) -> bool:
+    try:
+        driver.switch_to.default_content()
+    except WebDriverException:
+        return False
+
+    if hint.context_label == "TOP":
+        return True
+
+    root_frame = _find_frame_in_current_context(
+        driver,
+        frame_id=hint.root_frame_id,
+        frame_name=hint.root_frame_name,
+        frame_index=hint.root_frame_index,
+    )
+    if root_frame is None:
+        return False
+
+    try:
+        driver.switch_to.frame(root_frame)
+    except (NoSuchFrameException, StaleElementReferenceException, WebDriverException):
+        return False
+
+    if not (hint.inner_frame_id or hint.inner_frame_name or hint.inner_frame_index is not None):
+        return True
+
+    inner_frame = _find_frame_in_current_context(
+        driver,
+        frame_id=hint.inner_frame_id,
+        frame_name=hint.inner_frame_name,
+        frame_index=hint.inner_frame_index,
+    )
+    if inner_frame is None:
+        return False
+
+    try:
+        driver.switch_to.frame(inner_frame)
+    except (NoSuchFrameException, StaleElementReferenceException, WebDriverException):
+        return False
+    return True
 
 
 def get_iframes_info(driver: Any) -> List[Dict[str, Any]]:
@@ -138,7 +259,8 @@ def wait_for_elements(
                     )
                     continue
 
-            time.sleep(min(0.5, max(0.0, deadline - time.time())))
+            # Reduce idle time between iframe scans without changing the overall timeout.
+            profiler_sleep(min(ELEMENT_LOOKUP_POLL_SECONDS, max(0.0, deadline - time.time())))
 
         frames = log_iframe_hint(driver, logger, f"wait_for_elements falhou ({tag})")
         logger.error(
@@ -218,7 +340,8 @@ def click_xpath_with_retry(
             except (StaleElementReferenceException, WebDriverException) as exc:
                 last_error = exc
                 continue
-        time.sleep(0.2)
+        # Shorter click retry polling keeps the same deadline while reducing fixed wait cost.
+        profiler_sleep(CLICK_RETRY_POLL_SECONDS)
 
     if last_error:
         raise RuntimeError(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import time
@@ -30,6 +31,7 @@ from app.documents.ted import build_ted_document_type
 from app.documents.types import DocumentTypeSpec
 from app.integrations.transferegov_client import consultar_ted, normalize_processo_sei
 from app.output import csv_writer
+from app.rpa.performance_profiler import PerformanceProfiler, profiler_sleep, set_active_profiler
 from app.rpa.sei import process_navigation
 from app.rpa.sei import toolbar_actions
 from app.rpa.sei import document_search
@@ -65,6 +67,10 @@ from app.rpa.selectors import load_xpath_selectors
 POST_LOGIN_REFRESH_SLEEP_SECONDS = 1.0
 UI_SETTLE_SLEEP_SECONDS = 0.35
 PAGINATION_SETTLE_SLEEP_SECONDS = 0.25
+OVERLAY_WAIT_POLL_SECONDS = 0.1
+OVERLAY_WAIT_FALLBACK_SLEEP_SECONDS = 0.1
+WINDOW_HANDLE_WAIT_POLL_SECONDS = 0.1
+WINDOW_HANDLE_WAIT_FALLBACK_SLEEP_SECONDS = 0.1
 TED_NUMERO_INSTRUMENTO_FIXO = "274752"
 
 
@@ -127,7 +133,7 @@ def _click_optional_popup(
         if remaining <= 0:
             return False
 
-        time.sleep(min(poll_interval_seconds, remaining))
+        profiler_sleep(min(poll_interval_seconds, remaining))
         try:
             candidates = driver.find_elements(By.XPATH, xpath)
         except WebDriverException:
@@ -203,7 +209,7 @@ def _wait_for_page_signature_change(
         remaining = deadline - time.time()
         if remaining <= 0:
             break
-        time.sleep(min(poll_interval_seconds, remaining))
+        profiler_sleep(min(poll_interval_seconds, remaining))
 
     return False
 
@@ -258,6 +264,9 @@ class SEIScraper:
         self._process_act_found: Dict[str, bool] = {}
         self._preview_records_by_processo: Dict[str, Dict[str, str]] = {}
         self._ted_api_results: Dict[str, Dict[str, Any]] = {}
+        self.performance_profiler = PerformanceProfiler()
+        self.driver._performance_profiler = self.performance_profiler
+        set_active_profiler(self.performance_profiler)
         self.total_candidatos_avaliados = 0
         self.candidatos_descartados_pre_abertura = 0
         self.logger.info(
@@ -303,86 +312,107 @@ class SEIScraper:
         max_processos_por_interno: Optional[int] = None,
         stop_at_filter: bool = True,
     ) -> List[str]:
-        if not self.base_url:
-            raise RuntimeError("Config ausente: sei_url / URL / SEI_URL")
+        self.performance_profiler = PerformanceProfiler()
+        self.driver._performance_profiler = self.performance_profiler
+        set_active_profiler(self.performance_profiler)
+        total_span_name = "run_full_flow"
+        execution_started_at = time.time()
+        self.performance_profiler.start_span(total_span_name)
 
-        self._reset_candidate_screening_stats()
-        self._prepare_output_dir_for_run()
+        try:
+            if not self.base_url:
+                raise RuntimeError("Config ausente: sei_url / URL / SEI_URL")
 
-        self.logger.info("Abrindo SEI em: %s", self.base_url)
-        self.driver.get(self.base_url)
+            self._reset_candidate_screening_stats()
+            self._prepare_output_dir_for_run()
 
-        if manual_login:
-            self._wait_for_manual_login()
-        else:
-            self._login_if_possible()
-        self._remember_main_window_handle(context="pos_login")
-        self.logger.info("=== START SCRAPING === %s", datetime.now().isoformat())
+            self.logger.info("Abrindo SEI em: %s", self.base_url)
+            self.driver.get(self.base_url)
 
-        self._close_popup_if_exists()
-        self._open_interno_menu()
-        selecionados = self._select_guided_internos_by_descricao()
-        if not selecionados:
-            self.logger.warning(
-                "Modo guiado: nenhum interno selecionado pelas descricoes configuradas."
-            )
+            if manual_login:
+                self._wait_for_manual_login()
+            else:
+                self._login_if_possible()
+            self._remember_main_window_handle(context="pos_login")
+            self.logger.info("=== START SCRAPING === %s", datetime.now().isoformat())
+
+            self._close_popup_if_exists()
+            self._open_interno_menu()
+            selecionados = self._select_guided_internos_by_descricao()
+            if not selecionados:
+                self.logger.warning(
+                    "Modo guiado: nenhum interno selecionado pelas descricoes configuradas."
+                )
+                self._finalize_document_runs()
+                self._log_candidate_screening_summary()
+                result = sorted(self.found)
+                self.logger.info("Itens unicos encontrados: %d", len(result))
+                print(result)
+                return result
+
+            if max_internos is not None:
+                self.logger.info("Limitando internos para %d", max_internos)
+                selecionados = selecionados[:max_internos]
+
+            if max_processos_por_interno is not None:
+                self.logger.info("Limitando processos por interno para %d", max_processos_por_interno)
+
+            for selecionado, selected_target, list_url in selecionados:
+                if not self._click_selected_interno(selecionado, selected_target, list_url):
+                    continue
+
+                self._collect_preview_if_parcerias_vigencias()
+                processos = self._list_processos()
+                if max_processos_por_interno is not None:
+                    processos = processos[:max_processos_por_interno]
+
+                for proc in processos:
+                    process_span_name = f"processo:{proc}"
+                    self.performance_profiler.start_span(process_span_name)
+                    try:
+                        self._clear_process_filter_state(proc)
+                        self._switch_to_main_window_context()
+                        self.logger.info("Abrindo processo %s", proc)
+                        self._open_processo(proc)
+                        self.logger.info("Processo %s: aguardando pagina pronta", proc)
+                        self._wait_page_ready_in_processo()
+                        self.logger.info("Processo %s: clicando Abrir todas as Pastas", proc)
+                        self._click_abrir_todas_as_pastas()
+                        for document_type in self._get_document_types_for_process():
+                            self._run_document_search_for_process(proc, document_type)
+
+                        if stop_at_filter:
+                            self.logger.info("Processo %s: fechando aba e voltando", proc)
+                            self._close_current_tab_and_back()
+                        else:
+                            self.logger.info(
+                                "Processo %s: mantendo aba aberta no filtro (--no-stop-at-filter); interrompendo loop.",
+                                proc,
+                            )
+                            self._finalize_document_runs()
+                            self._log_candidate_screening_summary()
+                            result = sorted(self.found)
+                            self.logger.info("Itens unicos encontrados: %d", len(result))
+                            print(result)
+                            return result
+                    finally:
+                        self.performance_profiler.end_span(process_span_name)
+
             self._finalize_document_runs()
             self._log_candidate_screening_summary()
             result = sorted(self.found)
             self.logger.info("Itens unicos encontrados: %d", len(result))
+            self.logger.info("=== END SCRAPING === %s", datetime.now().isoformat())
             print(result)
             return result
-
-        if max_internos is not None:
-            self.logger.info("Limitando internos para %d", max_internos)
-            selecionados = selecionados[:max_internos]
-
-        if max_processos_por_interno is not None:
-            self.logger.info("Limitando processos por interno para %d", max_processos_por_interno)
-
-        for selecionado, selected_target, list_url in selecionados:
-            if not self._click_selected_interno(selecionado, selected_target, list_url):
-                continue
-
-            self._collect_preview_if_parcerias_vigencias()
-            processos = self._list_processos()
-            if max_processos_por_interno is not None:
-                processos = processos[:max_processos_por_interno]
-
-            for proc in processos:
-                self._clear_process_filter_state(proc)
-                self._switch_to_main_window_context()
-                self.logger.info("Abrindo processo %s", proc)
-                self._open_processo(proc)
-                self.logger.info("Processo %s: aguardando pagina pronta", proc)
-                self._wait_page_ready_in_processo()
-                self.logger.info("Processo %s: clicando Abrir todas as Pastas", proc)
-                self._click_abrir_todas_as_pastas()
-                for document_type in self._get_document_types_for_process():
-                    self._run_document_search_for_process(proc, document_type)
-
-                if stop_at_filter:
-                    self.logger.info("Processo %s: fechando aba e voltando", proc)
-                    self._close_current_tab_and_back()
-                else:
-                    self.logger.info(
-                        "Processo %s: mantendo aba aberta no filtro (--no-stop-at-filter); interrompendo loop.",
-                        proc,
-                    )
-                    self._finalize_document_runs()
-                    self._log_candidate_screening_summary()
-                    result = sorted(self.found)
-                    self.logger.info("Itens unicos encontrados: %d", len(result))
-                    print(result)
-                    return result
-
-        self._finalize_document_runs()
-        self._log_candidate_screening_summary()
-        result = sorted(self.found)
-        self.logger.info("Itens unicos encontrados: %d", len(result))
-        self.logger.info("=== END SCRAPING === %s", datetime.now().isoformat())
-        print(result)
-        return result
+        finally:
+            self.performance_profiler.end_span(total_span_name)
+            try:
+                self._export_performance_analysis(time.time() - execution_started_at)
+            except Exception as exc:
+                self.logger.warning("Falha ao exportar analise de performance (%s).", exc)
+            finally:
+                set_active_profiler(None)
 
     # Utils wrappers (selenium_utils)
     def _wait_for_document_ready(self, timeout: int, tag: str) -> None:
@@ -479,14 +509,14 @@ class SEIScraper:
 
         while time.time() < deadline:
             if self._handle_login_alert():
-                time.sleep(UI_SETTLE_SLEEP_SECONDS)
+                profiler_sleep(UI_SETTLE_SLEEP_SECONDS)
                 continue
 
             try:
                 current_url = (self.driver.current_url or "").lower()
             except UnexpectedAlertPresentException as exc:
                 if self._handle_login_alert(exc):
-                    time.sleep(UI_SETTLE_SLEEP_SECONDS)
+                    profiler_sleep(UI_SETTLE_SLEEP_SECONDS)
                     continue
                 raise
 
@@ -524,7 +554,7 @@ class SEIScraper:
                         self.driver.refresh()
                     except WebDriverException as exc:
                         self.logger.warning("Falha ao recarregar pagina apos 504: %s", exc)
-                    time.sleep(POST_LOGIN_REFRESH_SLEEP_SECONDS)
+                    profiler_sleep(POST_LOGIN_REFRESH_SLEEP_SECONDS)
                     continue
 
                 raise RuntimeError(
@@ -532,7 +562,7 @@ class SEIScraper:
                     "Interrompendo execucao para evitar loop."
                 )
 
-            time.sleep(UI_SETTLE_SLEEP_SECONDS)
+            profiler_sleep(UI_SETTLE_SLEEP_SECONDS)
 
         final_state = self._describe_current_page_state()
         if gateway_timeout_hits:
@@ -636,11 +666,18 @@ class SEIScraper:
         timeout_seconds: float = 6.0,
         overlay_xpath: str = "//*[contains(@class,'sparkling-modal-overlay') or contains(@id,'InfraSparklingModalOverlay')]",
     ) -> bool:
-        deadline = time.time() + max(0.5, float(timeout_seconds))
-        while time.time() < deadline:
-            if not _is_overlay_displayed(self.driver, overlay_xpath):
-                return True
-            time.sleep(0.2)
+        effective_timeout = max(0.5, float(timeout_seconds))
+        try:
+            # Prefer a condition-based wait so we return as soon as the overlay disappears.
+            WebDriverWait(
+                self.driver,
+                effective_timeout,
+                poll_frequency=OVERLAY_WAIT_POLL_SECONDS,
+            ).until(lambda _: not _is_overlay_displayed(self.driver, overlay_xpath))
+            return True
+        except TimeoutException:
+            # Keep a short fixed fallback so late UI repaints still get one final settle pass.
+            profiler_sleep(min(OVERLAY_WAIT_FALLBACK_SLEEP_SECONDS, effective_timeout))
         return not _is_overlay_displayed(self.driver, overlay_xpath)
 
     # Helpers de seletores / clique
@@ -782,6 +819,10 @@ class SEIScraper:
 
         self.logger.info("Pesquisar no Processo: campo de busca limpo para reutilizar o filtro.")
 
+    def _should_log_pesquisa_debug(self) -> bool:
+        settings = getattr(self, "settings", None)
+        return bool(getattr(settings, "debug", False))
+
     def reset_search_context_light(self, processo: str, *, reason: str = "") -> None:
         timeout = min(5, max(1, self.timeout_seconds))
         try:
@@ -795,6 +836,7 @@ class SEIScraper:
                 self.selectors,
                 self.logger,
                 timeout_seconds=timeout,
+                debug_logging=self._should_log_pesquisa_debug(),
             )
         except (TimeoutException, RuntimeError, NoSuchElementException, StaleElementReferenceException, WebDriverException):
             try:
@@ -826,47 +868,53 @@ class SEIScraper:
         process_url: Optional[str] = None,
         reason: str = "",
     ) -> None:
-        if self._process_filter_degraded.get(processo):
-            self.logger.info(
-                "Processo %s: reload completo usado (fallback)%s.",
-                processo,
-                f" ({reason}; filtro degradado)" if reason else " (filtro degradado)",
-            )
-            self._restore_process_base_context(
-                processo,
-                process_url=process_url,
-                reason=reason,
-            )
-            self._ensure_document_search_open(processo, document_type)
-            return
-
+        span_name = "infra:_reset_search_context_with_fallback"
+        self.performance_profiler.start_span(span_name)
         try:
-            document_search.log_debug_pesquisa_state(
-                self.driver,
-                self.selectors,
-                self.logger,
-                processo=processo,
-                ponto="_reset_search_context_with_fallback:before_reset_search_context_light",
-            )
-            self.reset_search_context_light(processo, reason=reason)
-            return
-        except (TimeoutException, RuntimeError, NoSuchElementException, StaleElementReferenceException, WebDriverException) as exc:
-            if self._is_search_context_stagnation_timeout(exc):
-                self._process_filter_degraded[processo] = True
-            if not self._should_fallback_to_full_reload(exc):
-                raise
-            self.logger.warning(
-                "Processo %s: reload completo usado (fallback)%s. erro=%s",
-                processo,
-                f" ({reason})" if reason else "",
-                exc,
-            )
-            self._restore_process_base_context(
-                processo,
-                process_url=process_url,
-                reason=reason,
-            )
-            self._ensure_document_search_open(processo, document_type)
+            if self._process_filter_degraded.get(processo):
+                self.logger.info(
+                    "Processo %s: reload completo usado (fallback)%s.",
+                    processo,
+                    f" ({reason}; filtro degradado)" if reason else " (filtro degradado)",
+                )
+                self._restore_process_base_context(
+                    processo,
+                    process_url=process_url,
+                    reason=reason,
+                )
+                self._ensure_document_search_open(processo, document_type)
+                return
+
+            try:
+                if self._should_log_pesquisa_debug():
+                    document_search.log_debug_pesquisa_state(
+                        self.driver,
+                        self.selectors,
+                        self.logger,
+                        processo=processo,
+                        ponto="_reset_search_context_with_fallback:before_reset_search_context_light",
+                    )
+                self.reset_search_context_light(processo, reason=reason)
+                return
+            except (TimeoutException, RuntimeError, NoSuchElementException, StaleElementReferenceException, WebDriverException) as exc:
+                if self._is_search_context_stagnation_timeout(exc):
+                    self._process_filter_degraded[processo] = True
+                if not self._should_fallback_to_full_reload(exc):
+                    raise
+                self.logger.warning(
+                    "Processo %s: reload completo usado (fallback)%s. erro=%s",
+                    processo,
+                    f" ({reason})" if reason else "",
+                    exc,
+                )
+                self._restore_process_base_context(
+                    processo,
+                    process_url=process_url,
+                    reason=reason,
+                )
+                self._ensure_document_search_open(processo, document_type)
+        finally:
+            self.performance_profiler.end_span(span_name)
 
     def _clear_process_filter_state(self, processo: str) -> None:
         self._process_filter_degraded.pop(processo, None)
@@ -924,16 +972,38 @@ class SEIScraper:
         return True
 
     def _run_document_search_for_process(self, processo: str, document_type: DocumentTypeSpec) -> bool:
-        if not self._should_run_document_search(processo, document_type):
-            return False
-        if document_type.key == "ted":
-            ted_payload = self._process_ted_via_api(processo, document_type)
-            return ted_payload is not None
-        self._ensure_document_search_open(processo, document_type)
-        found = self._buscar_e_abrir_documento_mais_recente(processo, document_type)
-        if document_type.key == "act":
-            self._set_process_act_found(processo, found)
-        return found
+        span_prefix = None
+        if document_type.key == "pt":
+            span_prefix = "tipo:PT"
+        elif document_type.key == "act":
+            span_prefix = "tipo:ACT"
+        elif document_type.key == "memorando":
+            span_prefix = "tipo:Memorando"
+
+        if span_prefix is not None:
+            self.performance_profiler.start_span(f"{span_prefix}:total")
+        try:
+            if not self._should_run_document_search(processo, document_type):
+                return False
+            if document_type.key == "ted":
+                ted_payload = self._process_ted_via_api(processo, document_type)
+                return ted_payload is not None
+
+            if span_prefix is not None:
+                self.performance_profiler.start_span(f"{span_prefix}:busca")
+            try:
+                self._ensure_document_search_open(processo, document_type)
+                found = self._buscar_e_abrir_documento_mais_recente(processo, document_type)
+            finally:
+                if span_prefix is not None:
+                    self.performance_profiler.end_span(f"{span_prefix}:busca")
+
+            if document_type.key == "act":
+                self._set_process_act_found(processo, found)
+            return found
+        finally:
+            if span_prefix is not None:
+                self.performance_profiler.end_span(f"{span_prefix}:total")
 
     def _get_preview_record_for_processo(self, processo: str) -> Dict[str, str]:
         preview_records = getattr(self, "_preview_records_by_processo", None)
@@ -1062,13 +1132,14 @@ class SEIScraper:
         if document_type.key == "ted":
             self.logger.info("Processo %s: TED usa exclusivamente API; filtro Selenium ignorado.", processo)
             return
-        document_search.log_debug_pesquisa_state(
-            self.driver,
-            self.selectors,
-            self.logger,
-            processo=processo,
-            ponto="_ensure_document_search_open:entry",
-        )
+        if self._should_log_pesquisa_debug():
+            document_search.log_debug_pesquisa_state(
+                self.driver,
+                self.selectors,
+                self.logger,
+                processo=processo,
+                ponto="_ensure_document_search_open:entry",
+            )
         anchor_timeout = min(3, max(1, self.timeout_seconds))
         force_restore = bool(self._process_filter_degraded.get(processo))
         if force_restore:
@@ -1573,72 +1644,77 @@ class SEIScraper:
         self,
         document_type: DocumentTypeSpec,
     ) -> List[Dict[str, Any]]:
-        xpaths = self.selectors.get_many("processo.documentos_do_processo_links")
-
+        span_name = "infra:_find_document_candidates_in_tree"
+        self.performance_profiler.start_span(span_name)
         try:
-            self.driver.switch_to.default_content()
-            iframe = self.driver.find_element(By.XPATH, "//iframe[@id='ifrArvore' or @name='ifrArvore']")
-            self.driver.switch_to.frame(iframe)
-        except WebDriverException as exc:
-            self.logger.info(
-                "Fallback arvore %s: nao foi possivel entrar no ifrArvore (%s).",
-                document_type.log_label,
-                exc,
-            )
-            return []
+            xpaths = self.selectors.get_many("processo.documentos_do_processo_links")
 
-        candidates_by_text: Dict[str, Dict[str, Any]] = {}
-        for xpath in xpaths:
             try:
-                elems = self.driver.find_elements(By.XPATH, xpath)
-            except WebDriverException:
-                continue
-            for elem in elems:
+                self.driver.switch_to.default_content()
+                iframe = self.driver.find_element(By.XPATH, "//iframe[@id='ifrArvore' or @name='ifrArvore']")
+                self.driver.switch_to.frame(iframe)
+            except WebDriverException as exc:
+                self.logger.info(
+                    "Fallback arvore %s: nao foi possivel entrar no ifrArvore (%s).",
+                    document_type.log_label,
+                    exc,
+                )
+                return []
+
+            candidates_by_text: Dict[str, Dict[str, Any]] = {}
+            for xpath in xpaths:
                 try:
-                    raw_text = (elem.text or "").strip()
+                    elems = self.driver.find_elements(By.XPATH, xpath)
                 except WebDriverException:
                     continue
-                normalized = self._normalize_text(raw_text)
-                score, matched_terms = self._score_tree_candidate(document_type, raw_text)
-                if score <= 0:
-                    continue
-                detail = {
-                    "text": raw_text,
-                    "normalized_text": normalized,
-                    "score": score,
-                    "matched_terms": matched_terms,
-                }
-                current = candidates_by_text.get(normalized)
-                if current is None or int(current.get("score", 0)) < score:
-                    candidates_by_text[normalized] = detail
-            if candidates_by_text:
-                break
+                for elem in elems:
+                    try:
+                        raw_text = (elem.text or "").strip()
+                    except WebDriverException:
+                        continue
+                    normalized = self._normalize_text(raw_text)
+                    score, matched_terms = self._score_tree_candidate(document_type, raw_text)
+                    if score <= 0:
+                        continue
+                    detail = {
+                        "text": raw_text,
+                        "normalized_text": normalized,
+                        "score": score,
+                        "matched_terms": matched_terms,
+                    }
+                    current = candidates_by_text.get(normalized)
+                    if current is None or int(current.get("score", 0)) < score:
+                        candidates_by_text[normalized] = detail
+                if candidates_by_text:
+                    break
 
-        try:
-            self.driver.switch_to.default_content()
-        except WebDriverException:
-            pass
+            try:
+                self.driver.switch_to.default_content()
+            except WebDriverException:
+                pass
 
-        candidates = sorted(
-            candidates_by_text.values(),
-            key=lambda item: (-int(item.get("score", 0)), str(item.get("text", ""))),
-        )
-        if not candidates:
-            self.logger.info(
-                "Fallback arvore %s: nenhum documento correspondente encontrado na arvore.",
-                document_type.log_label,
+            candidates = sorted(
+                candidates_by_text.values(),
+                key=lambda item: (-int(item.get("score", 0)), str(item.get("text", ""))),
             )
-            return []
+            if not candidates:
+                self.logger.info(
+                    "Fallback arvore %s: nenhum documento correspondente encontrado na arvore.",
+                    document_type.log_label,
+                )
+                return []
 
-        self.logger.info(
-            "Fallback arvore %s: %d candidato(s) ranqueado(s); melhor candidato texto='%s' score=%d termos=%s.",
-            document_type.log_label,
-            len(candidates),
-            candidates[0]["text"],
-            candidates[0]["score"],
-            "|".join(candidates[0]["matched_terms"]),
-        )
-        return candidates
+            self.logger.info(
+                "Fallback arvore %s: %d candidato(s) ranqueado(s); melhor candidato texto='%s' score=%d termos=%s.",
+                document_type.log_label,
+                len(candidates),
+                candidates[0]["text"],
+                candidates[0]["score"],
+                "|".join(candidates[0]["matched_terms"]),
+            )
+            return candidates
+        finally:
+            self.performance_profiler.end_span(span_name)
 
     def _find_document_link_in_tree(self, document_type: DocumentTypeSpec) -> Optional[Tuple[Any, Dict[str, Any]]]:
         candidates = self._find_document_candidates_in_tree(document_type)
@@ -2146,20 +2222,38 @@ class SEIScraper:
         if not handles_before:
             return None
 
-        deadline = time.time() + max(1, timeout_seconds)
-        while time.time() < deadline:
+        effective_timeout = max(1, timeout_seconds)
+        new_handle: Optional[str] = None
+        try:
+            # Prefer a condition-based wait so we switch as soon as the browser exposes the new handle.
+            new_handle = WebDriverWait(
+                self.driver,
+                effective_timeout,
+                poll_frequency=WINDOW_HANDLE_WAIT_POLL_SECONDS,
+            ).until(
+                lambda _: next(
+                    (
+                        handle
+                        for handle in reversed(list(self.driver.window_handles))
+                        if handle not in handles_before
+                    ),
+                    False,
+                )
+            )
+        except TimeoutException:
+            # Keep a short fallback so a handle that appears at the timeout boundary is still captured.
+            profiler_sleep(min(WINDOW_HANDLE_WAIT_FALLBACK_SLEEP_SECONDS, float(effective_timeout)))
             try:
                 handles_now = set(self.driver.window_handles)
             except WebDriverException as exc:
                 self.logger.warning("Switch nova janela (%s): falha ao ler handles (%s).", reason, exc)
                 return None
-
             new_handles = [h for h in handles_now if h not in handles_before]
-            if not new_handles:
-                time.sleep(0.15)
-                continue
+            if new_handles:
+                new_handle = new_handles[-1]
 
-            target = new_handles[-1]
+        if new_handle is not None:
+            target = str(new_handle)
             try:
                 self.driver.switch_to.window(target)
                 self.logger.info(
@@ -2223,13 +2317,14 @@ class SEIScraper:
                 self.driver.switch_to.window(self.main_window_handle)
             elif remaining:
                 self.driver.switch_to.window(remaining[0])
-            document_search.log_debug_pesquisa_state(
-                self.driver,
-                self.selectors,
-                self.logger,
-                processo=processo,
-                ponto="_close_opened_doc_tabs:after_close",
-            )
+            if self._should_log_pesquisa_debug():
+                document_search.log_debug_pesquisa_state(
+                    self.driver,
+                    self.selectors,
+                    self.logger,
+                    processo=processo,
+                    ponto="_close_opened_doc_tabs:after_close",
+                )
             self.logger.info(
                 "Processo %s: fechamento de abas PT concluido. fechadas=%d falhas=%d handles_restantes=%d atual=%s",
                 processo,
@@ -2534,7 +2629,7 @@ class SEIScraper:
                         elem,
                     ):
                         return True
-                    time.sleep(PAGINATION_SETTLE_SLEEP_SECONDS)
+                    profiler_sleep(PAGINATION_SETTLE_SLEEP_SECONDS)
                     return True
                 except (StaleElementReferenceException, WebDriverException):
                     continue
@@ -3033,6 +3128,19 @@ class SEIScraper:
             output_dir = backend_root / output_dir
         return output_dir
 
+    def _export_performance_analysis(self, total_execution_time: float) -> None:
+        output_dir = self._resolve_preview_output_dir()
+        csv_writer.ensure_output_dir(output_dir)
+        summary = self.performance_profiler.get_summary()
+        run_full_flow_span = summary.get("spans", {}).get("run_full_flow", {})
+        payload = {
+            "total_execution_time": run_full_flow_span.get("total_seconds", total_execution_time),
+            "spans": summary.get("spans", {}),
+        }
+        output_path = output_dir / "performance_analysis.json"
+        with output_path.open("w", encoding="utf-8") as file:
+            json.dump(payload, file, ensure_ascii=False, indent=2)
+
     def _finalize_document_runs(self) -> None:
         output_dir = self._resolve_preview_output_dir()
         for document_type in self._get_document_types_for_outputs():
@@ -3188,98 +3296,112 @@ class SEIScraper:
         document_type: DocumentTypeSpec,
         collection_context: Optional[Dict[str, Any]] = None,
     ) -> bool:
+        snapshot_span_name = None
+        if document_type.key == "pt":
+            snapshot_span_name = "tipo:PT:snapshot"
+        elif document_type.key == "act":
+            snapshot_span_name = "tipo:ACT:snapshot"
+        elif document_type.key == "memorando":
+            snapshot_span_name = "tipo:Memorando:snapshot"
+
+        if snapshot_span_name is not None:
+            self.performance_profiler.start_span(snapshot_span_name)
         try:
-            iframe_info = get_iframes_info(self.driver)
-            self.logger.info(
-                "Processo %s: iniciando snapshot %s. contexto_pre_snapshot url=%s title=%s iframes=%d",
-                processo,
-                document_type.log_label,
-                self.driver.current_url,
-                self.driver.title,
-                len(iframe_info),
-            )
-            if iframe_info:
-                self.logger.info("Processo %s: iframes pre_snapshot=%s", processo, iframe_info)
-            snapshot = sanitize_snapshot(
-                document_text_extractor.extract_document_snapshot(
-                    self.driver,
-                    logger=self.logger,
-                )
-            )
-            is_valid, validation_reason, analysis = self._validate_snapshot_for_document_type(
-                processo,
-                document_type,
-                snapshot,
-                collection_context,
-            )
-            if not is_valid:
-                self.logger.warning(
-                    "Processo %s: snapshot rejeitado para %s. motivo=%s titulo=%s url=%s texto_preview=%s",
+            try:
+                iframe_info = get_iframes_info(self.driver)
+                self.logger.info(
+                    "Processo %s: iniciando snapshot %s. contexto_pre_snapshot url=%s title=%s iframes=%d",
                     processo,
                     document_type.log_label,
-                    validation_reason,
-                    snapshot.get("title", ""),
-                    snapshot.get("url", ""),
-                    _compact_text(str(snapshot.get("text", "") or ""))[:280],
+                    self.driver.current_url,
+                    self.driver.title,
+                    len(iframe_info),
+                )
+                if iframe_info:
+                    self.logger.info("Processo %s: iframes pre_snapshot=%s", processo, iframe_info)
+                snapshot = sanitize_snapshot(
+                    document_text_extractor.extract_document_snapshot(
+                        self.driver,
+                        logger=self.logger,
+                    )
+                )
+                is_valid, validation_reason, analysis = self._validate_snapshot_for_document_type(
+                    processo,
+                    document_type,
+                    snapshot,
+                    collection_context,
+                )
+                if not is_valid:
+                    self.logger.warning(
+                        "Processo %s: snapshot rejeitado para %s. motivo=%s titulo=%s url=%s texto_preview=%s",
+                        processo,
+                        document_type.log_label,
+                        validation_reason,
+                        snapshot.get("title", ""),
+                        snapshot.get("url", ""),
+                        _compact_text(str(snapshot.get("text", "") or ""))[:280],
+                    )
+                    return False
+                output_path = document_type.handler.process_snapshot(
+                    spec=document_type,
+                    processo=processo,
+                    protocolo_documento=protocolo_documento,
+                    snapshot=snapshot,
+                    collection_context=collection_context,
+                    analysis=analysis,
+                    output_dir=self._resolve_preview_output_dir(),
+                    logger=self.logger,
+                    settings=self.settings,
+                )
+                if output_path:
+                    self.logger.info(
+                        "Processo %s: JSON do documento %s salvo em %s",
+                        processo,
+                        document_type.log_label,
+                        output_path,
+                    )
+                if document_type.key in {"act", "memorando"}:
+                    is_canonical = bool((analysis or {}).get("validation_status") == VALIDATION_STATUS_VALID)
+                    if not is_canonical:
+                        self.logger.warning(
+                            "Processo %s: snapshot de %s retido apenas na silver. doc_class=%s motivo=%s",
+                            processo,
+                            document_type.log_label,
+                            (analysis or {}).get("doc_class", ""),
+                            (analysis or {}).get("classification_reason", validation_reason),
+                        )
+                    return is_canonical
+                if document_type.key == "pt":
+                    is_canonical = bool((analysis or {}).get("is_canonical_candidate", True))
+                    if not is_canonical:
+                        self.logger.warning(
+                            "Processo %s: snapshot de %s retido apenas na silver. doc_class=%s motivo=%s",
+                            processo,
+                            document_type.log_label,
+                            (analysis or {}).get("doc_class", ""),
+                            (analysis or {}).get("classification_reason", validation_reason),
+                        )
+                    return is_canonical
+                return True
+            except Exception as exc:
+                failure_context = dict(collection_context or {})
+                failure_context["captured_at"] = datetime.now().isoformat(timespec="seconds")
+                failure_context["extraction_error"] = str(exc)
+                self._record_document_extraction_failure(
+                    processo=processo,
+                    protocolo_documento=protocolo_documento,
+                    document_type=document_type,
+                    collection_context=failure_context,
+                )
+                self.logger.warning(
+                    "Processo %s: falha resiliente na extracao do documento aberto (%s).",
+                    processo,
+                    exc,
                 )
                 return False
-            output_path = document_type.handler.process_snapshot(
-                spec=document_type,
-                processo=processo,
-                protocolo_documento=protocolo_documento,
-                snapshot=snapshot,
-                collection_context=collection_context,
-                analysis=analysis,
-                output_dir=self._resolve_preview_output_dir(),
-                logger=self.logger,
-                settings=self.settings,
-            )
-            if output_path:
-                self.logger.info(
-                    "Processo %s: JSON do documento %s salvo em %s",
-                    processo,
-                    document_type.log_label,
-                    output_path,
-                )
-            if document_type.key in {"act", "memorando"}:
-                is_canonical = bool((analysis or {}).get("validation_status") == VALIDATION_STATUS_VALID)
-                if not is_canonical:
-                    self.logger.warning(
-                        "Processo %s: snapshot de %s retido apenas na silver. doc_class=%s motivo=%s",
-                        processo,
-                        document_type.log_label,
-                        (analysis or {}).get("doc_class", ""),
-                        (analysis or {}).get("classification_reason", validation_reason),
-                    )
-                return is_canonical
-            if document_type.key == "pt":
-                is_canonical = bool((analysis or {}).get("is_canonical_candidate", True))
-                if not is_canonical:
-                    self.logger.warning(
-                        "Processo %s: snapshot de %s retido apenas na silver. doc_class=%s motivo=%s",
-                        processo,
-                        document_type.log_label,
-                        (analysis or {}).get("doc_class", ""),
-                        (analysis or {}).get("classification_reason", validation_reason),
-                    )
-                return is_canonical
-            return True
-        except Exception as exc:
-            failure_context = dict(collection_context or {})
-            failure_context["captured_at"] = datetime.now().isoformat(timespec="seconds")
-            failure_context["extraction_error"] = str(exc)
-            self._record_document_extraction_failure(
-                processo=processo,
-                protocolo_documento=protocolo_documento,
-                document_type=document_type,
-                collection_context=failure_context,
-            )
-            self.logger.warning(
-                "Processo %s: falha resiliente na extracao do documento aberto (%s).",
-                processo,
-                exc,
-            )
-            return False
+        finally:
+            if snapshot_span_name is not None:
+                self.performance_profiler.end_span(snapshot_span_name)
 
     def _extract_and_save_plano_trabalho_snapshot(
         self,

@@ -16,6 +16,8 @@ from urllib.parse import urljoin
 from selenium.common.exceptions import NoSuchFrameException, WebDriverException
 from selenium.webdriver.common.by import By
 
+from app.rpa.performance_profiler import profiler_sleep, target_span
+
 SNAPSHOT_STAGNANT_READS_FOR_EARLY_FALLBACK = 3
 SNAPSHOT_EARLY_FALLBACK_TEXT_THRESHOLD = 120
 
@@ -255,7 +257,7 @@ def _switch_to_visualizacao_iframe_once(
                         )
                     if inner_candidates:
                         break
-                    time.sleep(0.15)
+                    profiler_sleep(0.15)
                 if inner_candidates:
                     driver.switch_to.frame(inner_candidates[0])
                     inner_description = _describe_iframe(inner_candidates[0], 0)
@@ -305,7 +307,7 @@ def _switch_to_visualizacao_iframe(
             if attempt > 1:
                 _log(logger, "info", "Visualizacao: switch concluido apos %d tentativa(s).", attempt)
             return True
-        time.sleep(0.25)
+        profiler_sleep(0.25)
 
     _log(logger, "warning", "Visualizacao: nao foi possivel entrar no iframe de visualizacao em %.1fs.", timeout_seconds)
     return False
@@ -674,7 +676,8 @@ def _extract_pdf_text_via_anchor_fallback(
     resolved_url = urljoin(str(getattr(driver, "current_url", "") or ""), href)
     _log(logger, "info", "Fallback PDF: tentando download via link do anexo.")
 
-    downloaded = _download_pdf_with_session(driver, resolved_url, logger=logger)
+    with target_span(driver, "snapshot:pdf_fallback_download"):
+        downloaded = _download_pdf_with_session(driver, resolved_url, logger=logger)
     if not downloaded:
         return {}
 
@@ -758,7 +761,8 @@ def _extract_pdf_text_via_anchor_fallback(
     except Exception as exc:
         _log(logger, "warning", "Fallback PDF: falha ao materializar arquivo temporario (%s).", exc)
 
-    text_native = _extract_text_from_pdf_native(bytes(pdf_content), logger=logger).strip()
+    with target_span(driver, "snapshot:pdf_fallback_native"):
+        text_native = _extract_text_from_pdf_native(bytes(pdf_content), logger=logger).strip()
     if len(text_native) >= 120:
         _log(
             logger,
@@ -778,7 +782,8 @@ def _extract_pdf_text_via_anchor_fallback(
             "source_hint": source_hint,
         }
 
-    text_ocr = _extract_text_from_pdf_ocr(bytes(pdf_content), logger=logger, ocr_dpi=ocr_dpi).strip()
+    with target_span(driver, "snapshot:pdf_fallback_ocr"):
+        text_ocr = _extract_text_from_pdf_ocr(bytes(pdf_content), logger=logger, ocr_dpi=ocr_dpi).strip()
     if temp_pdf_path:
         try:
             os.remove(temp_pdf_path)
@@ -847,7 +852,7 @@ def extract_document_snapshot(driver: Any, logger: Any = None) -> Dict[str, Any]
                     remaining = refresh_deadline - time.time()
                     if remaining <= 0:
                         break
-                    time.sleep(min(0.2, remaining))
+                    profiler_sleep(min(0.2, remaining))
                     continue
 
                 snapshot.update(_read_visualizacao_state(driver))
@@ -881,7 +886,7 @@ def extract_document_snapshot(driver: Any, logger: Any = None) -> Dict[str, Any]
                 remaining = refresh_deadline - time.time()
                 if remaining <= 0:
                     break
-                time.sleep(min(0.2, remaining))
+                profiler_sleep(min(0.2, remaining))
 
         if (
             should_force_file_fallback

@@ -12,7 +12,20 @@ from selenium.common.exceptions import (
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 
-from app.rpa.selenium_utils import click_xpath_with_retry
+from app.rpa.performance_profiler import profiler_sleep, target_span
+from app.rpa.selenium_utils import (
+    UIContextHint,
+    clear_ui_context_hint,
+    click_xpath_with_retry,
+    get_ui_context_hint,
+    remember_ui_context_hint,
+    switch_to_ui_context_hint,
+)
+
+
+UI_HINT_ABRIR_PASTAS = "processo.abrir_todas_as_pastas"
+UI_HINT_PESQUISAR_PROCESSO = "processo.pesquisar_no_processo"
+UI_HINT_PESQUISA_ANCHOR = "processo.pesquisa_anchor"
 
 
 def _resolve_timeout(driver: Any, timeout: int | float | None) -> float:
@@ -21,9 +34,51 @@ def _resolve_timeout(driver: Any, timeout: int | float | None) -> float:
     return max(10.0, float(getattr(driver, "_sei_timeout_seconds", 10)))
 
 
+def _resolve_probe_timeout(driver: Any, timeout: int | float | None) -> float:
+    if timeout is not None:
+        return max(0.5, float(timeout))
+    return max(10.0, min(20.0, _resolve_timeout(driver, None)))
+
+
 def _get_selector_candidates(selectors: Any, path: str) -> List[str]:
     candidates = selectors.get_many(path)
     return [str(xpath) for xpath in candidates if str(xpath).strip()]
+
+
+def _safe_window_handle(driver: Any) -> str:
+    try:
+        return str(getattr(driver, "current_window_handle", "") or "")
+    except WebDriverException:
+        return ""
+
+
+def _build_context_hint(
+    driver: Any,
+    *,
+    context_label: str,
+    root_frame: Any | None = None,
+    root_frame_index: int | None = None,
+    inner_frame: Any | None = None,
+    inner_frame_index: int | None = None,
+) -> UIContextHint:
+    def _attr(elem: Any | None, name: str) -> str:
+        if elem is None:
+            return ""
+        try:
+            return str(elem.get_attribute(name) or "")
+        except WebDriverException:
+            return ""
+
+    return UIContextHint(
+        context_label=context_label,
+        window_handle=_safe_window_handle(driver),
+        root_frame_id=_attr(root_frame, "id"),
+        root_frame_name=_attr(root_frame, "name"),
+        root_frame_index=root_frame_index,
+        inner_frame_id=_attr(inner_frame, "id"),
+        inner_frame_name=_attr(inner_frame, "name"),
+        inner_frame_index=inner_frame_index,
+    )
 
 
 def _switch_to_ifr_arvore_if_present(driver: Any) -> bool:
@@ -84,259 +139,361 @@ def click_abrir_todas_as_pastas(
     raise_on_fail: bool = True,
 ) -> bool:
     """
-    O SEI varia onde renderiza o botão/ícone "Abrir todas as Pastas" (às vezes no TOP, às vezes em iframe).
-    Além disso, o id costuma ser dinâmico (iconAP<ID_PROCEDIMENTO>), então não dá pra depender de um id fixo.
+    O SEI varia onde renderiza o bot?o/?cone "Abrir todas as Pastas" (?s vezes no TOP, ?s vezes em iframe).
+    Al?m disso, o id costuma ser din?mico (iconAP<ID_PROCEDIMENTO>), ent?o n?o d? pra depender de um id fixo.
     """
-    base_xpaths = _get_selector_candidates(selectors, "processo.abrir_todas_as_pastas")
+    with target_span(driver, "infra:click_abrir_todas_as_pastas"):
+        base_xpaths = _get_selector_candidates(selectors, "processo.abrir_todas_as_pastas")
 
-    # Fallbacks robustos (não altera arquivo de selectors; só reforça aqui)
-    extra_xpaths = [
-        # id dinâmico (iconAP<numero>) + title
-        "//img[starts-with(@id,'iconAP') and contains(@title,'Abrir todas as Pastas')]",
-        # só pelo alt/title (caso mude o id)
-        "//img[contains(@alt,'Abrir todas as Pastas') or contains(@title,'Abrir todas as Pastas')]",
-    ]
+        # Fallbacks robustos (n?o altera arquivo de selectors; s? refor?a aqui)
+        extra_xpaths = [
+            # id din?mico (iconAP<numero>) + title
+            "//img[starts-with(@id,'iconAP') and contains(@title,'Abrir todas as Pastas')]",
+            # s? pelo alt/title (caso mude o id)
+            "//img[contains(@alt,'Abrir todas as Pastas') or contains(@title,'Abrir todas as Pastas')]",
+        ]
 
-    xpaths = list(dict.fromkeys(base_xpaths + extra_xpaths))  # preserva ordem e remove duplicados
+        xpaths = list(dict.fromkeys(base_xpaths + extra_xpaths))  # preserva ordem e remove duplicados
 
-    def _safe_default() -> None:
-        try:
-            driver.switch_to.default_content()
-        except WebDriverException:
-            pass
-
-    def _safe_switch_frame_by_id_or_name(frame_id: str) -> bool:
-        for by, value in ((By.ID, frame_id), (By.NAME, frame_id)):
+        def _safe_default() -> None:
             try:
-                _safe_default()
-                iframe = driver.find_element(by, value)
-                driver.switch_to.frame(iframe)
-                return True
+                driver.switch_to.default_content()
             except WebDriverException:
-                continue
-        return False
+                pass
 
-    def _attempt_click_in_current_context(context_label: str, timeout_seconds: float) -> bool:
-        try:
-            clicked_xpath = click_xpath_with_retry(
-                driver,
-                xpaths,
-                "processo.abrir_todas_as_pastas",
-                default_timeout_seconds=int(max(1, _resolve_timeout(driver, None))),
-                timeout_seconds=timeout_seconds,
-            )
-            logger.info("Abrir todas as Pastas: clique realizado (%s) [contexto=%s]", clicked_xpath, context_label)
-            return True
-        except TimeoutException:
-            return False
-
-    tried_contexts: List[str] = []
-    last_timeout: TimeoutException | None = None
-
-    # 1) TOP
-    _safe_default()
-    try:
-        if _attempt_click_in_current_context("TOP", timeout_seconds=2.5):
-            return True
-        tried_contexts.append("TOP")
-    except TimeoutException as e:
-        last_timeout = e
-        tried_contexts.append("TOP")
-
-    # 2) ifrArvore (muito comum para botões ligados à árvore/pastas)
-    _safe_default()
-    try:
-        if _safe_switch_frame_by_id_or_name("ifrArvore"):
-            if _attempt_click_in_current_context("ifrArvore", timeout_seconds=3.5):
-                _safe_default()
-                return True
-            tried_contexts.append("ifrArvore")
-        else:
-            tried_contexts.append("ifrArvore(não encontrado)")
-    except TimeoutException as e:
-        last_timeout = e
-        tried_contexts.append("ifrArvore(timeout)")
-    finally:
-        _safe_default()
-
-    # 3) ifrConteudoVisualizacao (algumas variações colocam o botão no conteúdo)
-    _safe_default()
-    try:
-        if _safe_switch_frame_by_id_or_name("ifrConteudoVisualizacao"):
-            if _attempt_click_in_current_context("ifrConteudoVisualizacao", timeout_seconds=3.5):
-                _safe_default()
-                return True
-            tried_contexts.append("ifrConteudoVisualizacao")
-        else:
-            tried_contexts.append("ifrConteudoVisualizacao(não encontrado)")
-    except TimeoutException as e:
-        last_timeout = e
-        tried_contexts.append("ifrConteudoVisualizacao(timeout)")
-    finally:
-        _safe_default()
-
-    # 4) Iframes internos dentro de ifrConteudoVisualizacao (1 nível)
-    _safe_default()
-    try:
-        if _safe_switch_frame_by_id_or_name("ifrConteudoVisualizacao"):
-            inner_iframes = driver.find_elements(By.TAG_NAME, "iframe")
-            for idx in range(min(len(inner_iframes), 10)):
+        def _safe_switch_frame_by_id_or_name(frame_id: str) -> Any | None:
+            for by, value in ((By.ID, frame_id), (By.NAME, frame_id)):
                 try:
                     _safe_default()
-                    if not _safe_switch_frame_by_id_or_name("ifrConteudoVisualizacao"):
-                        break
-                    inner_iframes2 = driver.find_elements(By.TAG_NAME, "iframe")
-                    if idx >= len(inner_iframes2):
-                        break
-                    driver.switch_to.frame(inner_iframes2[idx])
-
-                    if _attempt_click_in_current_context(f"ifrConteudoVisualizacao->inner[{idx}]", timeout_seconds=2.5):
-                        _safe_default()
-                        return True
-                    tried_contexts.append(f"ifrConteudoVisualizacao->inner[{idx}]")
-                except (StaleElementReferenceException, WebDriverException):
-                    tried_contexts.append(f"ifrConteudoVisualizacao->inner[{idx}](stale/erro)")
+                    iframe = driver.find_element(by, value)
+                    driver.switch_to.frame(iframe)
+                    return iframe
+                except WebDriverException:
                     continue
-    except TimeoutException as e:
-        last_timeout = e
-    finally:
+            return None
+
+        def _attempt_click_in_current_context(context_label: str, timeout_seconds: float) -> bool:
+            try:
+                clicked_xpath = click_xpath_with_retry(
+                    driver,
+                    xpaths,
+                    "processo.abrir_todas_as_pastas",
+                    default_timeout_seconds=int(max(1, _resolve_timeout(driver, None))),
+                    timeout_seconds=timeout_seconds,
+                )
+                logger.info("Abrir todas as Pastas: clique realizado (%s) [contexto=%s]", clicked_xpath, context_label)
+                return True
+            except TimeoutException:
+                return False
+
+        tried_contexts: List[str] = []
+        last_timeout: TimeoutException | None = None
+
+        hint = get_ui_context_hint(driver, UI_HINT_ABRIR_PASTAS)
+        if hint is not None:
+            _safe_default()
+            if switch_to_ui_context_hint(driver, hint) and _attempt_click_in_current_context(
+                hint.context_label,
+                timeout_seconds=1.5,
+            ):
+                _safe_default()
+                return True
+            clear_ui_context_hint(driver, UI_HINT_ABRIR_PASTAS)
+
+        # 1) TOP
         _safe_default()
+        try:
+            if _attempt_click_in_current_context("TOP", timeout_seconds=2.5):
+                remember_ui_context_hint(
+                    driver,
+                    UI_HINT_ABRIR_PASTAS,
+                    _build_context_hint(driver, context_label="TOP"),
+                )
+                return True
+            tried_contexts.append("TOP")
+        except TimeoutException as e:
+            last_timeout = e
+            tried_contexts.append("TOP")
 
-    msg = (
-        f"Timeout ao localizar 'processo.abrir_todas_as_pastas' em nenhum contexto. "
-        f"Contextos tentados={tried_contexts}. XPaths={xpaths}"
-    )
-    if raise_on_fail:
-        raise TimeoutException(msg) from last_timeout
+        # 2) ifrArvore (muito comum para bot?es ligados ? ?rvore/pastas)
+        _safe_default()
+        try:
+            root_frame = _safe_switch_frame_by_id_or_name("ifrArvore")
+            if root_frame is not None:
+                if _attempt_click_in_current_context("ifrArvore", timeout_seconds=3.5):
+                    remember_ui_context_hint(
+                        driver,
+                        UI_HINT_ABRIR_PASTAS,
+                        _build_context_hint(
+                            driver,
+                            context_label="ifrArvore",
+                            root_frame=root_frame,
+                        ),
+                    )
+                    _safe_default()
+                    return True
+                tried_contexts.append("ifrArvore")
+            else:
+                tried_contexts.append("ifrArvore(n?o encontrado)")
+        except TimeoutException as e:
+            last_timeout = e
+            tried_contexts.append("ifrArvore(timeout)")
+        finally:
+            _safe_default()
 
-    logger.info(
-        "Abrir todas as Pastas: botão não encontrado neste processo (seguindo sem expandir)."
-    )
-    return False
+        # 3) ifrConteudoVisualizacao (algumas varia??es colocam o bot?o no conte?do)
+        _safe_default()
+        try:
+            root_frame = _safe_switch_frame_by_id_or_name("ifrConteudoVisualizacao")
+            if root_frame is not None:
+                if _attempt_click_in_current_context("ifrConteudoVisualizacao", timeout_seconds=3.5):
+                    remember_ui_context_hint(
+                        driver,
+                        UI_HINT_ABRIR_PASTAS,
+                        _build_context_hint(
+                            driver,
+                            context_label="ifrConteudoVisualizacao",
+                            root_frame=root_frame,
+                        ),
+                    )
+                    _safe_default()
+                    return True
+                tried_contexts.append("ifrConteudoVisualizacao")
+            else:
+                tried_contexts.append("ifrConteudoVisualizacao(n?o encontrado)")
+        except TimeoutException as e:
+            last_timeout = e
+            tried_contexts.append("ifrConteudoVisualizacao(timeout)")
+        finally:
+            _safe_default()
+
+        # 4) Iframes internos dentro de ifrConteudoVisualizacao (1 n?vel)
+        _safe_default()
+        try:
+            root_frame = _safe_switch_frame_by_id_or_name("ifrConteudoVisualizacao")
+            if root_frame is not None:
+                inner_iframes = driver.find_elements(By.TAG_NAME, "iframe")
+                for idx in range(min(len(inner_iframes), 10)):
+                    try:
+                        _safe_default()
+                        root_frame = _safe_switch_frame_by_id_or_name("ifrConteudoVisualizacao")
+                        if root_frame is None:
+                            break
+                        inner_iframes2 = driver.find_elements(By.TAG_NAME, "iframe")
+                        if idx >= len(inner_iframes2):
+                            break
+                        inner_frame = inner_iframes2[idx]
+                        driver.switch_to.frame(inner_frame)
+
+                        if _attempt_click_in_current_context(f"ifrConteudoVisualizacao->inner[{idx}]", timeout_seconds=2.5):
+                            remember_ui_context_hint(
+                                driver,
+                                UI_HINT_ABRIR_PASTAS,
+                                _build_context_hint(
+                                    driver,
+                                    context_label=f"ifrConteudoVisualizacao->inner[{idx}]",
+                                    root_frame=root_frame,
+                                    inner_frame=inner_frame,
+                                    inner_frame_index=idx,
+                                ),
+                            )
+                            _safe_default()
+                            return True
+                        tried_contexts.append(f"ifrConteudoVisualizacao->inner[{idx}]")
+                    except (StaleElementReferenceException, WebDriverException):
+                        tried_contexts.append(f"ifrConteudoVisualizacao->inner[{idx}](stale/erro)")
+                        continue
+        except TimeoutException as e:
+            last_timeout = e
+        finally:
+            _safe_default()
+
+        msg = (
+            f"Timeout ao localizar 'processo.abrir_todas_as_pastas' em nenhum contexto. "
+            f"Contextos tentados={tried_contexts}. XPaths={xpaths}"
+        )
+        if raise_on_fail:
+            raise TimeoutException(msg) from last_timeout
+
+        logger.info(
+            "Abrir todas as Pastas: bot?o n?o encontrado neste processo (seguindo sem expandir)."
+        )
+        return False
 
 
 def click_pesquisar_no_processo(driver: Any, selectors: Any, logger: Any) -> None:
     """
-    Em algumas variações do SEI, o botão/link "Pesquisar no Processo" não está no TOP.
-    Esta função tenta clicar em múltiplos contextos (TOP, ifrConteudoVisualizacao,
+    Em algumas varia??es do SEI, o bot?o/link "Pesquisar no Processo" n?o est? no TOP.
+    Esta fun??o tenta clicar em m?ltiplos contextos (TOP, ifrConteudoVisualizacao,
     iframes internos e, por fim, ifrArvore) antes de falhar.
     """
-    xpaths = _get_selector_candidates(selectors, "processo.pesquisar_no_processo")
+    with target_span(driver, "infra:click_pesquisar_no_processo"):
+        xpaths = _get_selector_candidates(selectors, "processo.pesquisar_no_processo")
 
-    def _safe_default() -> None:
-        try:
-            driver.switch_to.default_content()
-        except WebDriverException:
-            pass
-
-    def _safe_switch_frame_by_id_or_name(frame_id: str) -> bool:
-        for by, value in ((By.ID, frame_id), (By.NAME, frame_id)):
+        def _safe_default() -> None:
             try:
-                _safe_default()
-                iframe = driver.find_element(by, value)
-                driver.switch_to.frame(iframe)
-                return True
+                driver.switch_to.default_content()
             except WebDriverException:
-                continue
-        return False
+                pass
 
-    def _attempt_click_in_current_context(context_label: str, timeout_seconds: float) -> bool:
-        """
-        Tenta clicar no contexto atual. Retorna True se clicou, False se não achou.
-        """
-        try:
-            clicked_xpath = click_xpath_with_retry(
-                driver,
-                xpaths,
-                "processo.pesquisar_no_processo",
-                default_timeout_seconds=int(max(1, _resolve_timeout(driver, None))),
-                timeout_seconds=timeout_seconds,
-            )
-            logger.info(
-                "Pesquisar no Processo: clique realizado (%s) [contexto=%s]",
-                clicked_xpath,
-                context_label,
-            )
-            return True
-        except TimeoutException:
-            return False
-
-    tried_contexts: List[str] = []
-    last_timeout: TimeoutException | None = None
-
-    # 1) TOP
-    _safe_default()
-    try:
-        if _attempt_click_in_current_context("TOP", timeout_seconds=2.5):
-            return
-        tried_contexts.append("TOP")
-    except TimeoutException as e:
-        last_timeout = e
-        tried_contexts.append("TOP")
-
-    # 2) Iframe principal de conteúdo: ifrConteudoVisualizacao
-    _safe_default()
-    try:
-        if _safe_switch_frame_by_id_or_name("ifrConteudoVisualizacao"):
-            if _attempt_click_in_current_context("ifrConteudoVisualizacao", timeout_seconds=3.5):
-                _safe_default()
-                return
-            tried_contexts.append("ifrConteudoVisualizacao")
-        else:
-            tried_contexts.append("ifrConteudoVisualizacao(não encontrado)")
-    except TimeoutException as e:
-        last_timeout = e
-        tried_contexts.append("ifrConteudoVisualizacao(timeout)")
-
-    # 3) Iframes internos dentro de ifrConteudoVisualizacao (variações de layout do SEI)
-    _safe_default()
-    try:
-        if _safe_switch_frame_by_id_or_name("ifrConteudoVisualizacao"):
-            inner_iframes = driver.find_elements(By.TAG_NAME, "iframe")
-            # limita a varredura pra não virar algo pesado/infinito
-            for idx in range(min(len(inner_iframes), 10)):
+        def _safe_switch_frame_by_id_or_name(frame_id: str) -> Any | None:
+            for by, value in ((By.ID, frame_id), (By.NAME, frame_id)):
                 try:
                     _safe_default()
-                    if not _safe_switch_frame_by_id_or_name("ifrConteudoVisualizacao"):
-                        break
-                    inner_iframes2 = driver.find_elements(By.TAG_NAME, "iframe")
-                    if idx >= len(inner_iframes2):
-                        break
-
-                    driver.switch_to.frame(inner_iframes2[idx])
-                    if _attempt_click_in_current_context(f"ifrConteudoVisualizacao->inner[{idx}]", timeout_seconds=2.5):
-                        _safe_default()
-                        return
-                    tried_contexts.append(f"ifrConteudoVisualizacao->inner[{idx}]")
-                except (StaleElementReferenceException, WebDriverException):
-                    tried_contexts.append(f"ifrConteudoVisualizacao->inner[{idx}](stale/erro)")
+                    iframe = driver.find_element(by, value)
+                    driver.switch_to.frame(iframe)
+                    return iframe
+                except WebDriverException:
                     continue
-    except TimeoutException as e:
-        last_timeout = e
+            return None
 
-    # 4) Fallback: ifrArvore (menos comum para toolbar, mas pode variar por perfil/layout)
-    _safe_default()
-    try:
-        if _safe_switch_frame_by_id_or_name("ifrArvore"):
-            if _attempt_click_in_current_context("ifrArvore", timeout_seconds=2.5):
+        def _attempt_click_in_current_context(context_label: str, timeout_seconds: float) -> bool:
+            """
+            Tenta clicar no contexto atual. Retorna True se clicou, False se n?o achou.
+            """
+            try:
+                clicked_xpath = click_xpath_with_retry(
+                    driver,
+                    xpaths,
+                    "processo.pesquisar_no_processo",
+                    default_timeout_seconds=int(max(1, _resolve_timeout(driver, None))),
+                    timeout_seconds=timeout_seconds,
+                )
+                logger.info(
+                    "Pesquisar no Processo: clique realizado (%s) [contexto=%s]",
+                    clicked_xpath,
+                    context_label,
+                )
+                return True
+            except TimeoutException:
+                return False
+
+        tried_contexts: List[str] = []
+        last_timeout: TimeoutException | None = None
+
+        hint = get_ui_context_hint(driver, UI_HINT_PESQUISAR_PROCESSO)
+        if hint is not None:
+            _safe_default()
+            if switch_to_ui_context_hint(driver, hint) and _attempt_click_in_current_context(
+                hint.context_label,
+                timeout_seconds=1.5,
+            ):
                 _safe_default()
                 return
-            tried_contexts.append("ifrArvore")
-        else:
-            tried_contexts.append("ifrArvore(não encontrado)")
-    except TimeoutException as e:
-        last_timeout = e
-        tried_contexts.append("ifrArvore(timeout)")
-    finally:
-        _safe_default()
+            clear_ui_context_hint(driver, UI_HINT_PESQUISAR_PROCESSO)
 
-    # Se chegou aqui, não encontrou em nenhum contexto.
-    # Mantém a mensagem original (XPaths tentados) e adiciona contextos.
-    msg = (
-        f"Timeout ao localizar 'processo.pesquisar_no_processo' em nenhum contexto. "
-        f"Contextos tentados={tried_contexts}. XPaths={xpaths}"
-    )
-    raise TimeoutException(msg) from last_timeout
+        # 1) TOP
+        _safe_default()
+        try:
+            if _attempt_click_in_current_context("TOP", timeout_seconds=2.5):
+                remember_ui_context_hint(
+                    driver,
+                    UI_HINT_PESQUISAR_PROCESSO,
+                    _build_context_hint(driver, context_label="TOP"),
+                )
+                return
+            tried_contexts.append("TOP")
+        except TimeoutException as e:
+            last_timeout = e
+            tried_contexts.append("TOP")
+
+        # 2) Iframe principal de conte?do: ifrConteudoVisualizacao
+        _safe_default()
+        try:
+            root_frame = _safe_switch_frame_by_id_or_name("ifrConteudoVisualizacao")
+            if root_frame is not None:
+                if _attempt_click_in_current_context("ifrConteudoVisualizacao", timeout_seconds=3.5):
+                    remember_ui_context_hint(
+                        driver,
+                        UI_HINT_PESQUISAR_PROCESSO,
+                        _build_context_hint(
+                            driver,
+                            context_label="ifrConteudoVisualizacao",
+                            root_frame=root_frame,
+                        ),
+                    )
+                    _safe_default()
+                    return
+                tried_contexts.append("ifrConteudoVisualizacao")
+            else:
+                tried_contexts.append("ifrConteudoVisualizacao(n?o encontrado)")
+        except TimeoutException as e:
+            last_timeout = e
+            tried_contexts.append("ifrConteudoVisualizacao(timeout)")
+
+        # 3) Iframes internos dentro de ifrConteudoVisualizacao (varia??es de layout do SEI)
+        _safe_default()
+        try:
+            root_frame = _safe_switch_frame_by_id_or_name("ifrConteudoVisualizacao")
+            if root_frame is not None:
+                inner_iframes = driver.find_elements(By.TAG_NAME, "iframe")
+                # limita a varredura pra n?o virar algo pesado/infinito
+                for idx in range(min(len(inner_iframes), 10)):
+                    try:
+                        _safe_default()
+                        root_frame = _safe_switch_frame_by_id_or_name("ifrConteudoVisualizacao")
+                        if root_frame is None:
+                            break
+                        inner_iframes2 = driver.find_elements(By.TAG_NAME, "iframe")
+                        if idx >= len(inner_iframes2):
+                            break
+
+                        inner_frame = inner_iframes2[idx]
+                        driver.switch_to.frame(inner_frame)
+                        if _attempt_click_in_current_context(f"ifrConteudoVisualizacao->inner[{idx}]", timeout_seconds=2.5):
+                            remember_ui_context_hint(
+                                driver,
+                                UI_HINT_PESQUISAR_PROCESSO,
+                                _build_context_hint(
+                                    driver,
+                                    context_label=f"ifrConteudoVisualizacao->inner[{idx}]",
+                                    root_frame=root_frame,
+                                    inner_frame=inner_frame,
+                                    inner_frame_index=idx,
+                                ),
+                            )
+                            _safe_default()
+                            return
+                        tried_contexts.append(f"ifrConteudoVisualizacao->inner[{idx}]")
+                    except (StaleElementReferenceException, WebDriverException):
+                        tried_contexts.append(f"ifrConteudoVisualizacao->inner[{idx}](stale/erro)")
+                        continue
+        except TimeoutException as e:
+            last_timeout = e
+
+        # 4) Fallback: ifrArvore (menos comum para toolbar, mas pode variar por perfil/layout)
+        _safe_default()
+        try:
+            root_frame = _safe_switch_frame_by_id_or_name("ifrArvore")
+            if root_frame is not None:
+                if _attempt_click_in_current_context("ifrArvore", timeout_seconds=2.5):
+                    remember_ui_context_hint(
+                        driver,
+                        UI_HINT_PESQUISAR_PROCESSO,
+                        _build_context_hint(
+                            driver,
+                            context_label="ifrArvore",
+                            root_frame=root_frame,
+                        ),
+                    )
+                    _safe_default()
+                    return
+                tried_contexts.append("ifrArvore")
+            else:
+                tried_contexts.append("ifrArvore(n?o encontrado)")
+        except TimeoutException as e:
+            last_timeout = e
+            tried_contexts.append("ifrArvore(timeout)")
+        finally:
+            _safe_default()
+
+        # Se chegou aqui, n?o encontrou em nenhum contexto.
+        # Mant?m a mensagem original (XPaths tentados) e adiciona contextos.
+        msg = (
+            f"Timeout ao localizar 'processo.pesquisar_no_processo' em nenhum contexto. "
+            f"Contextos tentados={tried_contexts}. XPaths={xpaths}"
+        )
+        raise TimeoutException(msg) from last_timeout
 
 
 def wait_pesquisa_anchor(
@@ -347,7 +504,7 @@ def wait_pesquisa_anchor(
 ) -> None:
     x_iframe_visualizacao = selectors.get("processo.iframe_visualizacao")
     x_pesquisa_anchor = str(selectors.require("processo.pesquisa_anchor"))
-    timeout_seconds = max(10.0, min(20.0, _resolve_timeout(driver, timeout)))
+    timeout_seconds = _resolve_probe_timeout(driver, timeout)
 
     def _safe_default() -> None:
         try:
@@ -355,13 +512,47 @@ def wait_pesquisa_anchor(
         except WebDriverException:
             pass
 
+    def _remember_anchor_hint(
+        *,
+        context_label: str,
+        root_frame: Any | None = None,
+        root_frame_index: int | None = None,
+        inner_frame: Any | None = None,
+        inner_frame_index: int | None = None,
+    ) -> None:
+        remember_ui_context_hint(
+            driver,
+            UI_HINT_PESQUISA_ANCHOR,
+            _build_context_hint(
+                driver,
+                context_label=context_label,
+                root_frame=root_frame,
+                root_frame_index=root_frame_index,
+                inner_frame=inner_frame,
+                inner_frame_index=inner_frame_index,
+            ),
+        )
+
     deadline = time.time() + timeout_seconds
+    hint = get_ui_context_hint(driver, UI_HINT_PESQUISA_ANCHOR)
+    if hint is not None:
+        _safe_default()
+        if switch_to_ui_context_hint(driver, hint):
+            try:
+                if driver.find_elements(By.XPATH, x_pesquisa_anchor):
+                    _safe_default()
+                    return
+            except WebDriverException:
+                pass
+        clear_ui_context_hint(driver, UI_HINT_PESQUISA_ANCHOR)
+
     while time.time() < deadline:
         _safe_default()
 
         # 1) Se por algum motivo abriu fora de iframe (raro), a URL confirma
         try:
             if "procedimento_pesquisar" in (driver.current_url or ""):
+                _remember_anchor_hint(context_label="TOP")
                 logger.info("filtro aberto (anchor ok: url)")
                 return
         except WebDriverException:
@@ -370,6 +561,7 @@ def wait_pesquisa_anchor(
         # 2) Se o anchor existir no TOP (algumas variações), confirma
         try:
             if driver.find_elements(By.XPATH, x_pesquisa_anchor):
+                _remember_anchor_hint(context_label="TOP")
                 logger.info("filtro aberto (anchor ok: top)")
                 return
         except WebDriverException:
@@ -399,6 +591,10 @@ def wait_pesquisa_anchor(
                     iframe_src = ""
 
                 if "procedimento_pesquisar" in iframe_src:
+                    _remember_anchor_hint(
+                        context_label="iframe",
+                        root_frame=iframe_elem,
+                    )
                     logger.info("filtro aberto (anchor ok: iframe src)")
                     return
 
@@ -410,6 +606,10 @@ def wait_pesquisa_anchor(
 
                 try:
                     if driver.find_elements(By.XPATH, x_pesquisa_anchor):
+                        _remember_anchor_hint(
+                            context_label="iframe",
+                            root_frame=iframe_elem,
+                        )
                         logger.info("filtro aberto (anchor ok: dentro do iframe)")
                         return
                 except WebDriverException:
@@ -429,6 +629,11 @@ def wait_pesquisa_anchor(
                             inner_src = ""
 
                         if "procedimento_pesquisar" in inner_src:
+                            _remember_anchor_hint(
+                                context_label="inner_iframe",
+                                root_frame=iframe_elem,
+                                inner_frame=inner,
+                            )
                             logger.info("filtro aberto (anchor ok: inner iframe src)")
                             return
 
@@ -444,6 +649,11 @@ def wait_pesquisa_anchor(
 
                         try:
                             if driver.find_elements(By.XPATH, x_pesquisa_anchor):
+                                _remember_anchor_hint(
+                                    context_label="inner_iframe",
+                                    root_frame=iframe_elem,
+                                    inner_frame=inner,
+                                )
                                 logger.info("filtro aberto (anchor ok: dentro do inner iframe)")
                                 return
                         except WebDriverException:
@@ -460,6 +670,6 @@ def wait_pesquisa_anchor(
             finally:
                 _safe_default()
 
-        time.sleep(0.2)
+        profiler_sleep(0.2)
 
     raise RuntimeError("Tela de filtro/pesquisa nao confirmou abertura (anchor/url)")
