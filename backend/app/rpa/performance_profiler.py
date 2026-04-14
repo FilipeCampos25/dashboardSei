@@ -87,6 +87,12 @@ def end_target_span(target: Any, name: str) -> None:
         profiler.end_span(name)
 
 
+def count_target_event(target: Any, name: str) -> None:
+    profiler = get_profiler_from_target(target)
+    if profiler is not None:
+        profiler.add_time(name, 0.0)
+
+
 @contextmanager
 def target_span(target: Any, name: str):
     start_target_span(target, name)

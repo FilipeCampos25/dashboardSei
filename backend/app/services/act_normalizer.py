@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import unicodedata
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -518,6 +519,31 @@ def classify_act_snapshot(
 
 def _read_json(path: Path) -> Dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _sanitize_filename_part(value: str, fallback: str = "sem_id") -> str:
+    cleaned = re.sub(r"[^\w.-]+", "_", (value or "").strip()).strip("_")
+    return (cleaned or fallback)[:80]
+
+
+def _act_alias_path(output_dir: Path, processo: str) -> Path:
+    return output_dir / f"{SNAPSHOT_PREFIX_ACT}_{_sanitize_filename_part(processo)}.json"
+
+
+def _collect_act_snapshot_paths(output_dir: Path) -> List[Path]:
+    candidate_dir = output_dir / "candidates"
+    candidate_paths = sorted(candidate_dir.glob(f"{SNAPSHOT_PREFIX_ACT}_*.json"))
+    if candidate_paths:
+        return candidate_paths
+    return sorted(output_dir.glob(f"{SNAPSHOT_PREFIX_ACT}_*.json"))
+
+
+def _publish_act_alias(output_dir: Path, source_path: Path, processo: str) -> Path:
+    alias_path = _act_alias_path(output_dir, processo)
+    if source_path.resolve() != alias_path.resolve():
+        alias_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source_path, alias_path)
+    return alias_path
 
 
 def _normalize_date_token(token: str) -> str:
@@ -1083,6 +1109,7 @@ def build_normalized_record(payload: Dict[str, Any], json_path: Path) -> Dict[st
         "document_processos": " | ".join(document_processos),
         "snapshot_mode": _clean_spaces(str(snapshot.get("extraction_mode", "") or "")),
         "text_chars": len(str(snapshot.get("text", "") or "")),
+        "candidate_json_path": str(json_path),
         "json_path": str(json_path),
         "canonical_score": 0,
     }
@@ -1092,7 +1119,7 @@ def build_normalized_record(payload: Dict[str, Any], json_path: Path) -> Dict[st
 
 def export_normalized_csv(output_dir: Path, logger: Any = None) -> Dict[str, Any]:
     csv_writer.ensure_output_dir(output_dir)
-    json_paths = sorted(output_dir.glob(f"{SNAPSHOT_PREFIX_ACT}_*.json"))
+    json_paths = _collect_act_snapshot_paths(output_dir)
     if not json_paths:
         _log(logger, "info", "Normalizador ACT: nenhum JSON encontrado em %s.", output_dir)
         return {"records": 0, "csv_path": None, "audit_path": None}
@@ -1117,6 +1144,12 @@ def export_normalized_csv(output_dir: Path, logger: Any = None) -> Dict[str, Any
             and record.get("validation_status") == VALIDATION_STATUS_VALID
         ]
         if not canonical_candidates:
+            alias_path = _act_alias_path(output_dir, processo)
+            if alias_path.exists() and any(Path(str(record.get("json_path", ""))).parent.name == "candidates" for record in records):
+                try:
+                    alias_path.unlink()
+                except OSError as exc:
+                    _log(logger, "warning", "Normalizador ACT: falha ao remover alias nao canonico %s (%s).", alias_path, exc)
             for record in records:
                 record["normalization_status"] = "descartado_nao_canonico"
                 record["publication_status"] = PUBLICATION_STATUS_SILVER
@@ -1139,6 +1172,9 @@ def export_normalized_csv(output_dir: Path, logger: Any = None) -> Dict[str, Any
         )
         for record in records:
             if record is canonical:
+                source_path = Path(str(record.get("candidate_json_path", "") or record.get("json_path", "")))
+                alias_path = _publish_act_alias(output_dir, source_path, processo)
+                record["json_path"] = str(alias_path)
                 record["normalization_status"] = "publicado_canonico"
                 record["publication_status"] = PUBLICATION_STATUS_GOLD
                 record["discard_reason"] = ""
@@ -1194,6 +1230,7 @@ def export_normalized_csv(output_dir: Path, logger: Any = None) -> Dict[str, Any
         "snapshot_mode",
         "text_chars",
         "canonical_score",
+        "candidate_json_path",
         "json_path",
     ]
     audit_path = output_dir / "act_classificacao_latest.csv"

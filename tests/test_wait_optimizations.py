@@ -256,9 +256,16 @@ class FakeSearchDriver:
     def __init__(self, clock: FakeClock) -> None:
         self.clock = clock
         self.context: tuple[str, ...] = ()
+        self.current_window_handle = "proc-1"
         self.switch_to = FakeSwitchTo(self)
-        self.root_frame = FakeFrame("root", src="https://sei.defesa.gov.br/root")
-        self.inner_frame = FakeFrame("inner", src="https://sei.defesa.gov.br/inner")
+        self.root_frame = FakeFrame(
+            "ifrConteudoVisualizacao",
+            src="https://sei.defesa.gov.br/root",
+        )
+        self.inner_frame = FakeFrame(
+            "ifrVisualizacao",
+            src="https://sei.defesa.gov.br/inner",
+        )
         self.target = FakeSearchElement()
         self.current_url = "https://sei.defesa.gov.br/processo"
         self.title = "SEI - Processo"
@@ -267,21 +274,28 @@ class FakeSearchDriver:
         if by == By.TAG_NAME and value == "iframe":
             if self.context == ():
                 return [self.root_frame]
-            if self.context == ("root",):
+            if self.context == ("ifrConteudoVisualizacao",):
                 return [self.inner_frame]
             return []
 
         if by == By.XPATH and value == "//target":
-            if self.context == ("root", "inner") and self.clock.time() >= 0.2:
+            if self.context == ("ifrConteudoVisualizacao", "ifrVisualizacao") and self.clock.time() >= 0.2:
                 return [self.target]
             return []
 
         return []
 
+    def find_element(self, by: Any, value: str) -> Any:
+        elems = self.find_elements(by, value)
+        if not elems:
+            raise WebDriverException(f"not found: by={by} value={value}")
+        return elems[0]
+
 
 class StagnantSearchDriver:
     def __init__(self) -> None:
         self.context: tuple[str, ...] = ()
+        self.current_window_handle = "proc-1"
         self.switch_to = FakeSwitchTo(self)
         self.root_frames = [
             FakeFrame("ifrArvore", src="https://sei.defesa.gov.br/arvore"),
@@ -310,6 +324,12 @@ class StagnantSearchDriver:
                 return self.content_inner
             return []
         return []
+
+    def find_element(self, by: Any, value: str) -> Any:
+        elems = self.find_elements(by, value)
+        if not elems:
+            raise WebDriverException(f"not found: by={by} value={value}")
+        return elems[0]
 
 
 class ChangingSearchDriver(StagnantSearchDriver):
@@ -1090,6 +1110,92 @@ class WaitOptimizationTests(unittest.TestCase):
         fallback_mock.assert_called_once()
         self.assertLess(clock.time(), 2.0)
 
+    def test_extract_document_snapshot_short_circuits_immediately_when_placeholder_has_download_anchor(self) -> None:
+        clock = FakeClock()
+        driver = FakeDriverSwitchOnly()
+        logger = DummyLogger()
+        placeholder_state = {
+            "url": "https://sei.defesa.gov.br/visualizacao",
+            "title": "Documento",
+            "text": "Clique aqui para visualizar o conteudo deste documento em uma nova janela.",
+        }
+
+        with patch(
+            "app.rpa.sei.document_text_extractor._switch_to_visualizacao_iframe",
+            return_value=True,
+        ), patch(
+            "app.rpa.sei.document_text_extractor._read_visualizacao_state",
+            return_value=placeholder_state,
+        ), patch(
+            "app.rpa.sei.document_text_extractor._find_download_anchor_url",
+            return_value="https://sei.defesa.gov.br/documento.pdf",
+        ), patch(
+            "app.rpa.sei.document_text_extractor._extract_pdf_text_via_anchor_fallback",
+            return_value={
+                "text": "conteudo pdf extraido",
+                "mode": "pdf_native",
+                "source_url": "https://sei.defesa.gov.br/documento.pdf",
+            },
+        ) as fallback_mock, patch(
+            "app.rpa.sei.document_text_extractor._extract_tables_in_current_context",
+            return_value=[],
+        ), patch(
+            "app.rpa.sei.document_text_extractor.time.time",
+            side_effect=clock.time,
+        ), patch(
+            "app.rpa.sei.document_text_extractor.time.sleep",
+            side_effect=clock.sleep,
+        ):
+            snapshot = document_text_extractor.extract_document_snapshot(driver, logger=logger)
+
+        self.assertEqual(snapshot["extraction_mode"], "pdf_native")
+        self.assertEqual(snapshot["text"], "conteudo pdf extraido")
+        fallback_mock.assert_called_once()
+        self.assertLess(clock.time(), 0.2)
+
+    def test_extract_document_snapshot_short_circuits_immediately_when_about_blank_has_download_anchor(self) -> None:
+        clock = FakeClock()
+        driver = FakeDriverSwitchOnly()
+        logger = DummyLogger()
+        blank_state = {
+            "url": "about:blank",
+            "title": "Documento",
+            "text": "",
+        }
+
+        with patch(
+            "app.rpa.sei.document_text_extractor._switch_to_visualizacao_iframe",
+            return_value=True,
+        ), patch(
+            "app.rpa.sei.document_text_extractor._read_visualizacao_state",
+            return_value=blank_state,
+        ), patch(
+            "app.rpa.sei.document_text_extractor._find_download_anchor_url",
+            return_value="https://sei.defesa.gov.br/documento.pdf",
+        ), patch(
+            "app.rpa.sei.document_text_extractor._extract_pdf_text_via_anchor_fallback",
+            return_value={
+                "text": "conteudo pdf extraido",
+                "mode": "pdf_native",
+                "source_url": "https://sei.defesa.gov.br/documento.pdf",
+            },
+        ) as fallback_mock, patch(
+            "app.rpa.sei.document_text_extractor._extract_tables_in_current_context",
+            return_value=[],
+        ), patch(
+            "app.rpa.sei.document_text_extractor.time.time",
+            side_effect=clock.time,
+        ), patch(
+            "app.rpa.sei.document_text_extractor.time.sleep",
+            side_effect=clock.sleep,
+        ):
+            snapshot = document_text_extractor.extract_document_snapshot(driver, logger=logger)
+
+        self.assertEqual(snapshot["extraction_mode"], "pdf_native")
+        self.assertEqual(snapshot["text"], "conteudo pdf extraido")
+        fallback_mock.assert_called_once()
+        self.assertLess(clock.time(), 0.2)
+
     def test_extract_document_snapshot_keeps_html_path_when_content_progresses(self) -> None:
         clock = FakeClock()
         driver = FakeDriverSwitchOnly()
@@ -1283,6 +1389,56 @@ class WaitOptimizationTests(unittest.TestCase):
             any(
                 "reload completo usado (fallback)" in str(call.args[0])
                 for call in scraper.logger.warning.call_args_list
+            )
+        )
+
+    def test_reset_search_context_with_fallback_logs_download_interstitial_recovery(self) -> None:
+        scraper = scraping.SEIScraper.__new__(scraping.SEIScraper)
+        scraper.logger = Mock()
+        scraper.timeout_seconds = 20
+        scraper.driver = FakeScraperDriver()
+        scraper.performance_profiler = Mock(start_span=Mock(), end_span=Mock())
+        scraper.selectors = {}
+        scraper._process_filter_degraded = {}
+        scraper._process_filter_recovery_attempts = {}
+        scraper.reset_search_context_light = Mock(side_effect=StaleElementReferenceException("iframe stale"))
+        scraper._restore_process_base_context = Mock()
+        scraper._ensure_document_search_open = Mock()
+        scraper._should_fallback_to_full_reload = Mock(return_value=True)
+        scraper._inspect_document_view_state = Mock(
+            return_value={
+                "is_document_view": True,
+                "is_interstitial_download": True,
+                "reason": "placeholder_download_anchor",
+                "detail": "state=inactive url=https://sei.defesa.gov.br/processo title=SEI - Processo",
+            }
+        )
+        document_type = make_document_type("act", "Acordo de Cooperacao Tecnica")
+
+        scraping.SEIScraper._reset_search_context_with_fallback(
+            scraper,
+            "60090.001393/2025-03",
+            document_type,
+            process_url="https://sei.defesa.gov.br/processo",
+            reason="novo candidato do filtro ACT rank=2",
+        )
+
+        self.assertTrue(
+            any(
+                "filter_interstitial_download" in str(call.args[0])
+                for call in scraper.logger.warning.call_args_list
+            )
+        )
+        self.assertTrue(
+            any(
+                "filter_reopen_error_after_document_view" in str(call.args[0])
+                for call in scraper.logger.warning.call_args_list
+            )
+        )
+        self.assertTrue(
+            any(
+                "context_recovered_after_download" in str(call.args[0])
+                for call in scraper.logger.info.call_args_list
             )
         )
 
@@ -1809,7 +1965,7 @@ class WaitOptimizationTests(unittest.TestCase):
         scraper._open_document_via_tree.assert_called_once()
         scraper._record_document_search_outcome.assert_not_called()
 
-    def test_busca_act_limita_abertura_do_filtro_ao_top_2(self) -> None:
+    def test_busca_act_respeita_limite_configurado_de_abertura_do_filtro(self) -> None:
         scraper = scraping.SEIScraper.__new__(scraping.SEIScraper)
         scraper.logger = Mock()
         scraper.timeout_seconds = 20
@@ -1900,6 +2056,105 @@ class WaitOptimizationTests(unittest.TestCase):
             2,
             "Acordo de Cooperação Técnica",
         )
+
+    def test_busca_act_pode_pular_relacionados_e_abrir_candidato_posterior(self) -> None:
+        scraper = scraping.SEIScraper.__new__(scraping.SEIScraper)
+        scraper.logger = Mock()
+        scraper.timeout_seconds = 20
+        scraper.driver = FakeScraperDriver()
+        scraper._process_filter_degraded = {}
+        scraper._process_filter_recovery_attempts = {}
+        scraper._normalize_text = scraping.SEIScraper._normalize_text.__get__(scraper, scraping.SEIScraper)
+        scraper._iter_unique_filter_terms = scraping.SEIScraper._iter_unique_filter_terms.__get__(
+            scraper,
+            scraping.SEIScraper,
+        )
+        scraper._build_collection_context = scraping.SEIScraper._build_collection_context.__get__(
+            scraper,
+            scraping.SEIScraper,
+        )
+        scraper._get_ordered_filter_hits_for_opening = scraping.SEIScraper._get_ordered_filter_hits_for_opening.__get__(
+            scraper,
+            scraping.SEIScraper,
+        )
+        scraper._log_valid_candidate_early_stop = scraping.SEIScraper._log_valid_candidate_early_stop.__get__(
+            scraper,
+            scraping.SEIScraper,
+        )
+        scraper._search_document_in_filter = Mock(
+            return_value=(
+                [
+                    document_search.SearchHit(
+                        protocolo="08650.063489/2021-11",
+                        row_text="Termo Aditivo ACT PRF",
+                        total_resultados=6,
+                        selected_position=1,
+                    ),
+                    document_search.SearchHit(
+                        protocolo="08650.063489/2021-11",
+                        row_text="Extrato de Publicacao ACT PRF",
+                        total_resultados=6,
+                        selected_position=2,
+                    ),
+                    document_search.SearchHit(
+                        protocolo="08650.063489/2021-11",
+                        row_text="Acordo de Cooperacao Tecnica 2 PRF",
+                        total_resultados=6,
+                        selected_position=3,
+                    ),
+                ],
+                scraper._build_collection_context(
+                    found=True,
+                    found_in="filter",
+                    search_term="Acordo de Cooperacao Tecnica",
+                    results_count=6,
+                    chosen_documento="08650.063489/2021-11",
+                    selection_reason="resultado_ranqueado_por_data",
+                    selection_detail="position=1 total=6",
+                ),
+            )
+        )
+        scraper._record_document_search_outcome = Mock()
+        scraper._close_opened_doc_tabs = lambda *args, **kwargs: None
+        scraper._open_document_via_tree = Mock(return_value=False)
+        scraper._extract_and_process_document_snapshot = Mock(return_value=True)
+        scraper._reset_search_context_with_fallback = Mock()
+        scraper._restore_process_base_context = Mock()
+        scraper._ensure_document_search_open = Mock()
+        scraper._should_skip_candidate_pre_open = scraping.SEIScraper._should_skip_candidate_pre_open.__get__(
+            scraper,
+            scraping.SEIScraper,
+        )
+        scraper._reset_candidate_screening_stats = scraping.SEIScraper._reset_candidate_screening_stats.__get__(
+            scraper,
+            scraping.SEIScraper,
+        )
+        scraper._reset_candidate_screening_stats()
+        scraper._try_restore_filter_results_session = Mock(return_value=True)
+        scraper.abrir_documento_no_filtro = Mock()
+        scraper._switch_to_newly_opened_window = lambda *args, **kwargs: None
+        document_type = DocumentTypeSpec(
+            key="act",
+            display_name="Acordo de Cooperacao Tecnica",
+            search_terms=("Acordo de Cooperacao Tecnica",),
+            tree_match_terms=("act",),
+            snapshot_prefix="act",
+            log_label="ACT",
+            cleanup_patterns=(),
+            handler=DummyHandler(),
+            max_filter_candidates=5,
+        )
+
+        result = scraping.SEIScraper._buscar_e_abrir_documento_mais_recente(
+            scraper,
+            "08650.063489/2021-11",
+            document_type,
+        )
+
+        self.assertTrue(result)
+        opened_positions = [call.kwargs["position"] for call in scraper.abrir_documento_no_filtro.call_args_list]
+        self.assertEqual(opened_positions, [3])
+        self.assertEqual(scraper.candidatos_descartados_pre_abertura, 2)
 
     def test_busca_act_registra_early_stop_apos_primeiro_snapshot_valido(self) -> None:
         scraper = scraping.SEIScraper.__new__(scraping.SEIScraper)
@@ -2048,6 +2303,31 @@ class WaitOptimizationTests(unittest.TestCase):
         self.assertEqual(scraper._buscar_e_abrir_documento_mais_recente.call_count, 1)
         scraper._process_ted_via_api.assert_called_once_with("60093.000015/2020-60", ted_document_type)
 
+    def test_process_ted_via_api_skips_when_no_instrument_number_is_linked(self) -> None:
+        scraper = scraping.SEIScraper.__new__(scraping.SEIScraper)
+        scraper.logger = Mock()
+        scraper._preview_records_by_processo = {}
+        scraper._build_collection_context = scraping.SEIScraper._build_collection_context.__get__(
+            scraper,
+            scraping.SEIScraper,
+        )
+        scraper._record_document_search_outcome = Mock()
+        document_type = make_document_type("ted", "TED - Termo de Execucao Descentralizada")
+
+        with patch("app.rpa.scraping.consultar_ted") as consultar_ted:
+            result = scraping.SEIScraper._process_ted_via_api(
+                scraper,
+                "60093.000015/2020-60",
+                document_type,
+            )
+
+        self.assertIsNone(result)
+        consultar_ted.assert_not_called()
+        scraper._record_document_search_outcome.assert_called_once()
+        outcome = scraper._record_document_search_outcome.call_args.args[2]
+        self.assertEqual(outcome["selection_reason"], "skipped_no_instrument_number")
+        self.assertEqual(outcome["selection_detail"], "TED skip: sem numero de instrumento vinculado ao processo")
+
     def test_validate_snapshot_rejeita_email_para_act(self) -> None:
         scraper = scraping.SEIScraper.__new__(scraping.SEIScraper)
         scraper._normalize_text = scraping.SEIScraper._normalize_text.__get__(scraper, scraping.SEIScraper)
@@ -2080,6 +2360,334 @@ class WaitOptimizationTests(unittest.TestCase):
         self.assertIsNotNone(analysis)
         self.assertEqual(analysis["doc_class"], "email_outro")
         self.assertEqual(analysis["validation_status"], "rejected_snapshot")
+
+    def test_switch_to_pesquisa_context_reabre_form_when_current_state_is_search_results(self) -> None:
+        logger = Mock()
+        driver = SearchResultsRecoveryDriver()
+        selectors = SimpleSelectors(
+            {
+                "pesquisar_processos": {
+                    "dropdown_tipos": "//tipo",
+                }
+            }
+        )
+
+        document_search._switch_to_pesquisa_context(
+            driver=driver,
+            selectors=selectors,
+            logger=logger,
+            timeout_seconds=1,
+        )
+
+        self.assertEqual(driver.mode, "form")
+        self.assertEqual(driver.button.clicks, 1)
+        self.assertTrue(
+            any(
+                call.args
+                and "STATE FIX: SEARCH_RESULTS detectado" in str(call.args[0])
+                for call in logger.info.call_args_list
+            )
+        )
+
+    def test_switch_to_pesquisa_context_reuses_current_context_when_already_in_search_form(self) -> None:
+        logger = Mock()
+        driver = SearchFormDriver()
+        selectors = SimpleSelectors(
+            {
+                "pesquisar_processos": {
+                    "dropdown_tipos": "//tipo",
+                }
+            }
+        )
+
+        with patch("app.rpa.sei.document_search._find_first_in_pesquisa_context") as find_first_mock:
+            document_search._switch_to_pesquisa_context(
+                driver=driver,
+                selectors=selectors,
+                logger=logger,
+                timeout_seconds=1,
+            )
+
+        find_first_mock.assert_not_called()
+        self.assertTrue(
+            any(
+                call.args
+                and "STATE SKIP:" in str(call.args[0])
+                and "SEARCH_FORM" in str(call.args[0])
+                for call in logger.info.call_args_list
+            )
+        )
+
+    def test_switch_to_pesquisa_context_uses_hint_for_search_results_without_full_scan(self) -> None:
+        class HintedSearchResultsButton:
+            def __init__(self, driver: Any) -> None:
+                self.driver = driver
+                self.clicks = 0
+
+            def click(self) -> None:
+                self.clicks += 1
+                self.driver.mode = "form"
+
+        class HintedSearchResultsDriver:
+            def __init__(self) -> None:
+                self.mode = "results"
+                self.context: tuple[str, ...] = ()
+                self.current_window_handle = "proc-1"
+                self.current_url = "https://sei.defesa.gov.br/controlador.php?acao=procedimento_trabalhar"
+                self.title = "SEI - Processo"
+                self.switch_to = ToolbarActionSwitchTo(self)
+                self.ifr_conteudo = FakeFrame(
+                    "ifrConteudoVisualizacao",
+                    src="https://sei.defesa.gov.br/visualizacao",
+                )
+                self.ifr_visualizacao = FakeFrame(
+                    "ifrVisualizacao",
+                    src="https://sei.defesa.gov.br/controlador.php?acao=procedimento_pesquisar",
+                )
+                self.button = HintedSearchResultsButton(self)
+                self.anchor = object()
+
+            def find_element(self, by: Any, value: str) -> Any:
+                elems = self.find_elements(by, value)
+                if not elems:
+                    raise WebDriverException(f"not found: by={by} value={value}")
+                return elems[0]
+
+            def find_elements(self, by: Any, value: str) -> list[Any]:
+                if by == By.TAG_NAME and value == "iframe":
+                    if self.context == ():
+                        return [self.ifr_conteudo]
+                    if self.context == ("ifrConteudoVisualizacao",):
+                        return [self.ifr_visualizacao]
+                    return []
+
+                if by in {By.ID, By.NAME}:
+                    if self.context == () and value == "ifrConteudoVisualizacao":
+                        return [self.ifr_conteudo]
+                    if self.context == ("ifrConteudoVisualizacao",) and value == "ifrVisualizacao":
+                        return [self.ifr_visualizacao]
+                    return []
+
+                if by != By.XPATH:
+                    return []
+
+                normalized = value.replace('"', "'")
+                if self.context != ("ifrConteudoVisualizacao", "ifrVisualizacao"):
+                    return []
+                if self.mode == "results":
+                    if "pesquisaResultado" in value:
+                        return [object()]
+                    if "@name='sbmPesquisar'" in normalized:
+                        return [self.button]
+                    if "normalize-space(@value)='Pesquisar'" in normalized:
+                        return [self.button]
+                    if "normalize-space(.)='Pesquisar'" in normalized:
+                        return [self.button]
+                    return []
+                if value == "//tipo":
+                    return [self.anchor]
+                return []
+
+        logger = Mock()
+        driver = HintedSearchResultsDriver()
+        selectors = SimpleSelectors({"pesquisar_processos": {"dropdown_tipos": "//tipo"}})
+        document_search._remember_anchor_hint(
+            driver,
+            context_label="root[0]->inner[0]",
+            root_frame=driver.ifr_conteudo,
+            root_frame_index=0,
+            inner_frame=driver.ifr_visualizacao,
+            inner_frame_index=0,
+        )
+
+        with patch("app.rpa.sei.document_search._resolve_pesquisa_context_by_full_scan") as full_scan_mock:
+            document_search._switch_to_pesquisa_context(
+                driver=driver,
+                selectors=selectors,
+                logger=logger,
+                timeout_seconds=1,
+            )
+
+        self.assertEqual(driver.mode, "form")
+        self.assertEqual(driver.button.clicks, 1)
+        full_scan_mock.assert_not_called()
+
+    def test_busca_reutiliza_resultados_do_mesmo_termo_sem_reset(self) -> None:
+        scraper = scraping.SEIScraper.__new__(scraping.SEIScraper)
+        scraper.logger = Mock()
+        scraper.timeout_seconds = 20
+        scraper.driver = FakeScraperDriver()
+        scraper.selectors = {}
+        scraper._process_filter_degraded = {}
+        scraper._process_filter_sessions = {}
+        scraper._normalize_text = scraping.SEIScraper._normalize_text.__get__(scraper, scraping.SEIScraper)
+        scraper._iter_unique_filter_terms = scraping.SEIScraper._iter_unique_filter_terms.__get__(
+            scraper,
+            scraping.SEIScraper,
+        )
+        scraper._get_ordered_filter_hits_for_opening = scraping.SEIScraper._get_ordered_filter_hits_for_opening.__get__(
+            scraper,
+            scraping.SEIScraper,
+        )
+        scraper._build_collection_context = scraping.SEIScraper._build_collection_context.__get__(
+            scraper,
+            scraping.SEIScraper,
+        )
+        scraper._record_document_search_outcome = Mock()
+        scraper._close_opened_doc_tabs = lambda *args, **kwargs: None
+        scraper._open_document_via_tree = Mock(return_value=False)
+        scraper._extract_and_process_document_snapshot = Mock(side_effect=[False, True])
+        scraper._switch_to_newly_opened_window = Mock(return_value=None)
+        scraper._should_skip_candidate_pre_open = lambda *args, **kwargs: False
+        scraper.abrir_documento_no_filtro = Mock()
+        document_type = DocumentTypeSpec(
+            key="act",
+            display_name="Acordo de Cooperacao Tecnica",
+            search_terms=("Memorando de Entendimentos",),
+            tree_match_terms=("memorando de entendimentos", "act"),
+            snapshot_prefix="act",
+            log_label="ACT",
+            cleanup_patterns=(),
+            handler=DummyHandler(),
+        )
+        hits = [
+            document_search.SearchHit(protocolo="MEMO-1", total_resultados=2, selected_position=1),
+            document_search.SearchHit(protocolo="MEMO-2", total_resultados=2, selected_position=2),
+        ]
+
+        with patch.object(
+            scraper,
+            "_search_document_in_filter",
+            return_value=(
+                hits,
+                scraper._build_collection_context(
+                    found=True,
+                    found_in="filter",
+                    search_term="Memorando de Entendimentos",
+                    results_count=2,
+                    chosen_documento="MEMO-1",
+                    selection_reason="primeiro_resultado_mais_recente",
+                    selection_detail="position=1 total=2",
+                ),
+            ),
+        ), patch.object(
+            scraper,
+            "_reset_search_context_with_fallback",
+        ) as reset_mock, patch.object(
+            scraper,
+            "_try_restore_filter_results_session",
+            return_value=True,
+        ) as reuse_mock:
+            result = scraping.SEIScraper._buscar_e_abrir_documento_mais_recente(
+                scraper,
+                "60091.000060/2023-87",
+                document_type,
+            )
+
+        self.assertTrue(result)
+        reset_mock.assert_not_called()
+        reuse_mock.assert_called_once_with(
+            "60091.000060/2023-87",
+            termo="Memorando de Entendimentos",
+            expected_position=2,
+        )
+
+    def test_ensure_document_search_open_reuses_validated_session_before_waiting(self) -> None:
+        scraper = scraping.SEIScraper.__new__(scraping.SEIScraper)
+        scraper.logger = DummyLogger()
+        scraper.timeout_seconds = 20
+        scraper.driver = FakeScraperDriver()
+        scraper.selectors = {}
+        scraper._process_filter_degraded = {}
+        scraper._process_filter_sessions = {
+            ("60093.000015/2020-60", "main"): scraping.PesquisaFilterSession(
+                state=document_search.PESQUISA_STATE_SEARCH_RESULTS,
+                last_term="ACT",
+                results_signature=("hits", "1", "ACT"),
+                degraded=False,
+                last_validated_at=1.0,
+            )
+        }
+        scraper._process_filter_recovery_attempts = {}
+        document_type = make_document_type("act", "Acordo de Cooperacao Tecnica")
+
+        with patch.object(
+            scraper,
+            "_try_restore_process_filter_session",
+            return_value=True,
+        ) as restore_mock, patch(
+            "app.rpa.scraping.toolbar_actions.wait_pesquisa_anchor",
+        ) as wait_mock, patch.object(
+            scraper,
+            "_click_pesquisar_no_processo",
+        ) as click_mock:
+            scraping.SEIScraper._ensure_document_search_open(
+                scraper,
+                "60093.000015/2020-60",
+                document_type,
+            )
+
+        restore_mock.assert_called_once()
+        wait_mock.assert_not_called()
+        click_mock.assert_not_called()
+
+    def test_try_restore_filter_results_session_invalidates_stale_session(self) -> None:
+        scraper = scraping.SEIScraper.__new__(scraping.SEIScraper)
+        scraper.logger = DummyLogger()
+        scraper.driver = FakeScraperDriver()
+        scraper.selectors = {}
+        scraper._process_filter_degraded = {}
+        scraper._process_filter_sessions = {
+            ("60093.000015/2020-60", "main"): scraping.PesquisaFilterSession(
+                state=document_search.PESQUISA_STATE_SEARCH_RESULTS,
+                last_term="ACT",
+                results_signature=("hits", "2", "ACT-1"),
+                degraded=False,
+                last_validated_at=1.0,
+            )
+        }
+        scraper._normalize_text = scraping.SEIScraper._normalize_text.__get__(scraper, scraping.SEIScraper)
+
+        with patch(
+            "app.rpa.scraping.document_search.resolve_pesquisa_context",
+            return_value=document_search.PesquisaContextResolution(
+                state=document_search.PESQUISA_STATE_INACTIVE,
+                source="current_context",
+            ),
+        ):
+            restored = scraping.SEIScraper._try_restore_filter_results_session(
+                scraper,
+                "60093.000015/2020-60",
+                termo="ACT",
+                expected_position=2,
+            )
+
+        self.assertFalse(restored)
+        self.assertIsNone(scraper._get_process_filter_session("60093.000015/2020-60"))
+
+    def test_find_first_in_pesquisa_context_uses_outer_deadline_without_inner_polling(self) -> None:
+        clock = FakeClock()
+        driver = FakeSearchDriver(clock)
+        logger = DummyLogger()
+
+        with patch(
+            "app.rpa.sei.document_search._find_elements_in_current_context"
+        ) as waited_lookup_mock, patch(
+            "app.rpa.sei.document_search.time.time", side_effect=clock.time
+        ), patch(
+            "app.rpa.sei.document_search.time.sleep", side_effect=clock.sleep
+        ):
+            result = document_search._find_first_in_pesquisa_context(
+                driver=driver,
+                logger=logger,
+                timeout_seconds=1,
+                search_xpaths=["//target"],
+                element_name="target",
+            )
+
+        self.assertIs(result, driver.target)
+        waited_lookup_mock.assert_not_called()
+        self.assertEqual(clock.time(), 0.3)
 
 
 if __name__ == "__main__":

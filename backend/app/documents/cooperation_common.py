@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -48,14 +50,24 @@ class CooperationDocumentHandler:
         analysis = analysis or classify_cooperation_snapshot(snapshot, spec.key, collection_context, processo=processo)
         resolved_document_type = analysis.get("resolved_document_type", "")
         snapshot_prefix = analysis.get("requested_snapshot_prefix", spec.snapshot_prefix)
+        snapshot_output_dir = output_dir
+        filename_suffix = None
+        if spec.key == "act":
+            snapshot_output_dir = output_dir / "candidates"
+            filename_suffix = self._build_act_candidate_filename_suffix(
+                snapshot=snapshot,
+                collection_context=collection_context,
+                analysis=analysis,
+            )
         output_path = save_snapshot_json(
             spec=spec,
             processo=processo,
             protocolo_documento=protocolo_documento,
             snapshot=snapshot,
-            output_dir=output_dir,
+            output_dir=snapshot_output_dir,
             logger=logger,
             snapshot_prefix_override=snapshot_prefix,
+            filename_suffix=filename_suffix,
             extra_payload={
                 "document_family": "cooperacao",
                 "resolved_document_type": resolved_document_type,
@@ -97,6 +109,48 @@ class CooperationDocumentHandler:
             analysis.get("doc_class", ""),
         )
         return output_path
+
+    def _build_act_candidate_filename_suffix(
+        self,
+        *,
+        snapshot: Dict[str, Any],
+        collection_context: Optional[Dict[str, Any]],
+        analysis: Dict[str, Any],
+    ) -> str:
+        context = collection_context or {}
+        found_in = str(context.get("found_in", "") or "unknown")
+        selection_detail = str(context.get("selection_detail", "") or "")
+        rank = ""
+        for pattern in (r"\bposition=(\d+)", r"\brank=(\d+)"):
+            match = re.search(pattern, selection_detail)
+            if match:
+                rank = match.group(1).zfill(3)
+                break
+        if not rank:
+            rank = "000"
+
+        url = str(snapshot.get("url", "") or "")
+        document_id = ""
+        for key in ("id_documento", "id_anexo", "id_procedimento"):
+            match = re.search(rf"[?&]{key}=([^&]+)", url)
+            if match and match.group(1):
+                document_id = f"{key}_{match.group(1)}"
+                break
+        if not document_id:
+            digest_source = "|".join(
+                str(part or "")
+                for part in (
+                    found_in,
+                    selection_detail,
+                    context.get("chosen_documento", ""),
+                    snapshot.get("title", ""),
+                    url,
+                )
+            )
+            document_id = hashlib.sha1(digest_source.encode("utf-8", errors="ignore")).hexdigest()[:10]
+
+        doc_class = str(analysis.get("doc_class", "") or "unknown")
+        return f"{found_in}_rank_{rank}_{document_id}_{doc_class}"
 
     def record_search_outcome(
         self,

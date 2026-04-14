@@ -215,10 +215,22 @@ class DashboardExporterTests(unittest.TestCase):
             # Duplicidades operacionais que nao podem contaminar o dataset final.
             _write_csv(
                 output_dir / "act_status_execucao_latest.csv",
-                ["processo", "found"],
+                ["processo", "found", "publication_status", "doc_class", "classification_reason"],
                 [
-                    {"processo": "60090.000001/2026-01", "found": True},
-                    {"processo": "60090.000001/2026-01", "found": True},
+                    {
+                        "processo": "60090.000001/2026-01",
+                        "found": True,
+                        "publication_status": "retained_silver",
+                        "doc_class": "extrato",
+                        "classification_reason": "cabecalho_extrato",
+                    },
+                    {
+                        "processo": "60090.000001/2026-01",
+                        "found": True,
+                        "publication_status": "published_gold",
+                        "doc_class": "act_final",
+                        "classification_reason": "cabecalho_act_tecnica_contratual",
+                    },
                 ],
             )
             _write_csv(
@@ -227,6 +239,17 @@ class DashboardExporterTests(unittest.TestCase):
                 [
                     {"processo": "60090.000001/2026-01", "found": True},
                     {"processo": "60090.000001/2026-01", "found": True},
+                ],
+            )
+            _write_csv(
+                output_dir / "ted_status_execucao_latest.csv",
+                ["processo", "selection_reason", "selection_detail"],
+                [
+                    {
+                        "processo": "60090.000002/2026-02",
+                        "selection_reason": "skipped_no_instrument_number",
+                        "selection_detail": "TED skip: sem numero de instrumento vinculado ao processo",
+                    },
                 ],
             )
 
@@ -250,11 +273,14 @@ class DashboardExporterTests(unittest.TestCase):
             self.assertEqual(row_1["act_objeto"], "Objeto preview 1")
             self.assertEqual(row_1["source_act_objeto"], "preview_fallback")
             self.assertEqual(row_1["act_quality"], "gold_partial")
+            self.assertEqual(row_1["act_attempts_count"], "2")
+            self.assertIn("extrato:cabecalho_extrato(1)", row_1["act_rejection_summary"])
 
             row_2 = next(row for row in rows if row["processo"] == "60090.000002/2026-02")
             self.assertEqual(row_2["act_gold"], "False")
             self.assertEqual(row_2["act_numero_acordo"], "")
             self.assertEqual(row_2["act_quality"], "silver_only")
+            self.assertEqual(row_2["ted_quality"], "skipped_no_instrument_number")
             self.assertEqual(row_2["quality_status"], "low")
 
             row_3 = next(row for row in rows if row["processo"] == "60090.000003/2026-03")
@@ -269,6 +295,16 @@ class DashboardExporterTests(unittest.TestCase):
             self.assertEqual(row_4["ted_situacao"], "Em execucao")
             self.assertEqual(row_4["ted_uf"], "DF")
             self.assertEqual(row_4["quality_status"], "medium")
+
+            divergence_path = output_dir / "divergence_matrix_latest.csv"
+            self.assertTrue(divergence_path.exists())
+            with divergence_path.open("r", encoding="utf-8-sig", newline="") as file_obj:
+                divergence_rows = list(csv.DictReader(file_obj))
+            self.assertEqual(len(divergence_rows), 22)
+            divergence_1 = next(row for row in divergence_rows if row["processo"] == "60090.000001/2026-01")
+            self.assertEqual(divergence_1["act_attempts_count"], "2")
+            self.assertIn("extrato:cabecalho_extrato(1)", divergence_1["act_rejection_summary"])
+            self.assertIn("data_inicio_vigencia", divergence_1["act_missing_fields"])
         finally:
             shutil.rmtree(output_dir, ignore_errors=True)
 

@@ -31,16 +31,25 @@ from app.documents.ted import build_ted_document_type
 from app.documents.types import DocumentTypeSpec
 from app.integrations.transferegov_client import consultar_ted, normalize_processo_sei
 from app.output import csv_writer
-from app.rpa.performance_profiler import PerformanceProfiler, profiler_sleep, set_active_profiler
+from app.rpa.performance_profiler import (
+    PerformanceProfiler,
+    count_target_event,
+    profiler_sleep,
+    set_active_profiler,
+)
 from app.rpa.sei import process_navigation
 from app.rpa.sei import toolbar_actions
 from app.rpa.sei import document_search
 from app.rpa.sei import document_text_extractor
 from app.services.act_normalizer import (
     DOC_CLASS_ACT_FINAL,
+    DOC_CLASS_EXTRATO,
     DOC_CLASS_EMAIL_OUTRO,
     DOC_CLASS_MEMORANDO,
+    DOC_CLASS_MINUTA,
     DOC_CLASS_STUB,
+    DOC_CLASS_TERMO_ADESAO,
+    DOC_CLASS_TERMO_ADITIVO,
     TREE_PENALTY_MARKERS,
     VALIDATION_STATUS_VALID,
     classify_cooperation_snapshot,
@@ -71,7 +80,7 @@ OVERLAY_WAIT_POLL_SECONDS = 0.1
 OVERLAY_WAIT_FALLBACK_SLEEP_SECONDS = 0.1
 WINDOW_HANDLE_WAIT_POLL_SECONDS = 0.1
 WINDOW_HANDLE_WAIT_FALLBACK_SLEEP_SECONDS = 0.1
-TED_NUMERO_INSTRUMENTO_FIXO = "274752"
+PESQUISA_SESSION_UNSET = object()
 
 
 @dataclass
@@ -87,6 +96,15 @@ class InternoRow:
     link: Any
     page: int
     row_index: int
+
+
+@dataclass
+class PesquisaFilterSession:
+    state: str = document_search.PESQUISA_STATE_INACTIVE
+    last_term: str = ""
+    results_signature: tuple[str, ...] | None = None
+    degraded: bool = False
+    last_validated_at: float = 0.0
 
 
 def _compact_text(value: str) -> str:
@@ -260,6 +278,7 @@ class SEIScraper:
         self.document_types_by_key = {spec.key: spec for spec in self.document_types}
         self.document_types_by_key[self.ted_api_document_type.key] = self.ted_api_document_type
         self._process_filter_degraded: Dict[str, bool] = {}
+        self._process_filter_sessions: Dict[Tuple[str, str], PesquisaFilterSession] = {}
         self._process_filter_recovery_attempts: Dict[Tuple[str, str], int] = {}
         self._process_act_found: Dict[str, bool] = {}
         self._preview_records_by_processo: Dict[str, Dict[str, str]] = {}
@@ -288,7 +307,11 @@ class SEIScraper:
         output_dir = self._resolve_preview_output_dir()
         csv_writer.ensure_output_dir(output_dir)
 
-        cleanup_patterns = {"parcerias_vigentes_latest.csv", "dashboard_ready_latest.csv"}
+        cleanup_patterns = {
+            "parcerias_vigentes_latest.csv",
+            "dashboard_ready_latest.csv",
+            "divergence_matrix_latest.csv",
+        }
         for document_type in self._get_document_types_for_outputs():
             document_type.handler.reset_run()
             cleanup_patterns.update(document_type.cleanup_patterns)
@@ -774,6 +797,7 @@ class SEIScraper:
             self.driver.switch_to.default_content()
         except WebDriverException:
             pass
+        self._invalidate_process_filter_session(processo, clear_hint=True)
 
         self.logger.info(
             "Processo %s: restaurando contexto base do processo%s via reload da URL.",
@@ -823,6 +847,257 @@ class SEIScraper:
         settings = getattr(self, "settings", None)
         return bool(getattr(settings, "debug", False))
 
+    def _ensure_process_filter_sessions(self) -> Dict[Tuple[str, str], PesquisaFilterSession]:
+        sessions = getattr(self, "_process_filter_sessions", None)
+        if isinstance(sessions, dict):
+            return sessions
+        sessions = {}
+        self._process_filter_sessions = sessions
+        return sessions
+
+    def _ensure_process_filter_degraded_store(self) -> Dict[str, bool]:
+        degraded = getattr(self, "_process_filter_degraded", None)
+        if isinstance(degraded, dict):
+            return degraded
+        degraded = {}
+        self._process_filter_degraded = degraded
+        return degraded
+
+    def _get_process_filter_session_key(
+        self,
+        processo: str,
+        *,
+        window_handle: Optional[str] = None,
+    ) -> Optional[Tuple[str, str]]:
+        handle = (window_handle or getattr(self.driver, "current_window_handle", "") or "").strip()
+        if not handle:
+            return None
+        return (processo, handle)
+
+    def _get_process_filter_session(self, processo: str) -> Optional[PesquisaFilterSession]:
+        key = self._get_process_filter_session_key(processo)
+        if key is None:
+            return None
+        return self._ensure_process_filter_sessions().get(key)
+
+    def _set_process_filter_session(
+        self,
+        processo: str,
+        *,
+        state: Optional[str] = None,
+        last_term: Optional[str] = None,
+        results_signature: tuple[str, ...] | None | object = PESQUISA_SESSION_UNSET,
+        degraded: Optional[bool] = None,
+    ) -> Optional[PesquisaFilterSession]:
+        key = self._get_process_filter_session_key(processo)
+        if key is None:
+            return None
+
+        sessions = self._ensure_process_filter_sessions()
+        session = sessions.get(key)
+        if not isinstance(session, PesquisaFilterSession):
+            session = PesquisaFilterSession()
+            sessions[key] = session
+
+        if state is not None:
+            session.state = state
+        if last_term is not None:
+            session.last_term = last_term
+        if results_signature is not PESQUISA_SESSION_UNSET:
+            session.results_signature = results_signature
+        if degraded is not None:
+            session.degraded = bool(degraded)
+        session.last_validated_at = time.time()
+        return session
+
+    def _invalidate_process_filter_session(
+        self,
+        processo: str,
+        *,
+        window_handle: Optional[str] = None,
+        clear_hint: bool = False,
+    ) -> None:
+        sessions = self._ensure_process_filter_sessions()
+        if window_handle:
+            sessions.pop((processo, window_handle), None)
+        else:
+            stale_keys = [key for key in sessions if key[0] == processo]
+            for key in stale_keys:
+                sessions.pop(key, None)
+
+        if clear_hint:
+            document_search.clear_pesquisa_context_hint(self.driver)
+
+    def _set_process_filter_degraded_state(self, processo: str, degraded: bool) -> None:
+        degraded_store = self._ensure_process_filter_degraded_store()
+        if degraded:
+            degraded_store[processo] = True
+        else:
+            degraded_store.pop(processo, None)
+
+        sessions = self._ensure_process_filter_sessions()
+        for key, session in sessions.items():
+            if key[0] != processo or not isinstance(session, PesquisaFilterSession):
+                continue
+            session.degraded = bool(degraded)
+            session.last_validated_at = time.time()
+
+    def _capture_process_filter_session(
+        self,
+        processo: str,
+        *,
+        last_term: Optional[str] = None,
+        results_signature: tuple[str, ...] | None | object = PESQUISA_SESSION_UNSET,
+    ) -> Optional[PesquisaFilterSession]:
+        selectors = getattr(self, "selectors", {})
+        degraded_store = self._ensure_process_filter_degraded_store()
+        try:
+            resolution = document_search.resolve_pesquisa_context(
+                self.driver,
+                selectors,
+                allow_full_scan=False,
+                degraded=bool(degraded_store.get(processo)),
+            )
+        except Exception:
+            return None
+        if resolution.state == document_search.PESQUISA_STATE_INACTIVE:
+            self._invalidate_process_filter_session(processo, clear_hint=True)
+            return None
+
+        current_results_signature: tuple[str, ...] | None | object = results_signature
+        if current_results_signature is PESQUISA_SESSION_UNSET:
+            if resolution.state == document_search.PESQUISA_STATE_SEARCH_RESULTS:
+                current_results_signature = document_search.get_current_results_signature(
+                    self.driver,
+                    selectors,
+                )
+            else:
+                current_results_signature = None
+
+        return self._set_process_filter_session(
+            processo,
+            state=resolution.state,
+            last_term=last_term,
+            results_signature=current_results_signature,
+            degraded=bool(degraded_store.get(processo)),
+        )
+
+    def _try_restore_process_filter_session(
+        self,
+        processo: str,
+        *,
+        accepted_states: Set[str],
+        allow_full_scan: bool = False,
+    ) -> bool:
+        session = self._get_process_filter_session(processo)
+        if session is None or session.degraded:
+            return False
+
+        selectors = getattr(self, "selectors", {})
+        try:
+            resolution = document_search.resolve_pesquisa_context(
+                self.driver,
+                selectors,
+                allow_full_scan=allow_full_scan,
+                degraded=session.degraded,
+            )
+        except Exception:
+            return False
+        if resolution.state not in accepted_states:
+            if resolution.state == document_search.PESQUISA_STATE_INACTIVE:
+                self._invalidate_process_filter_session(processo, clear_hint=True)
+            return False
+
+        results_signature: tuple[str, ...] | None = None
+        if resolution.state == document_search.PESQUISA_STATE_SEARCH_RESULTS:
+            try:
+                results_signature = document_search.get_current_results_signature(
+                    self.driver,
+                    selectors,
+                )
+            except Exception:
+                results_signature = None
+
+        self._set_process_filter_session(
+            processo,
+            state=resolution.state,
+            results_signature=results_signature,
+            degraded=False,
+        )
+        return True
+
+    def _results_signature_total(self, signature: tuple[str, ...] | None) -> int:
+        if not signature or len(signature) < 2:
+            return 0
+        try:
+            return max(0, int(signature[1]))
+        except (TypeError, ValueError):
+            return 0
+
+    def _try_restore_filter_results_session(
+        self,
+        processo: str,
+        *,
+        termo: str,
+        expected_position: int,
+    ) -> bool:
+        session = self._get_process_filter_session(processo)
+        if session is None or session.degraded:
+            count_target_event(self.driver, "pesquisa_results_reuse_fallback")
+            return False
+        if session.state != document_search.PESQUISA_STATE_SEARCH_RESULTS:
+            count_target_event(self.driver, "pesquisa_results_reuse_fallback")
+            return False
+        if self._normalize_text(session.last_term) != self._normalize_text(termo):
+            count_target_event(self.driver, "pesquisa_results_reuse_fallback")
+            return False
+
+        selectors = getattr(self, "selectors", {})
+        try:
+            resolution = document_search.resolve_pesquisa_context(
+                self.driver,
+                selectors,
+                allow_full_scan=False,
+                degraded=session.degraded,
+            )
+        except Exception:
+            count_target_event(self.driver, "pesquisa_results_reuse_fallback")
+            return False
+        if resolution.state != document_search.PESQUISA_STATE_SEARCH_RESULTS:
+            if resolution.state == document_search.PESQUISA_STATE_INACTIVE:
+                self._invalidate_process_filter_session(processo, clear_hint=True)
+            count_target_event(self.driver, "pesquisa_results_reuse_fallback")
+            return False
+
+        try:
+            current_signature = document_search.get_current_results_signature(
+                self.driver,
+                selectors,
+            )
+        except Exception:
+            current_signature = None
+        if current_signature is None:
+            self._invalidate_process_filter_session(processo, clear_hint=True)
+            count_target_event(self.driver, "pesquisa_results_reuse_fallback")
+            return False
+        if session.results_signature is None or current_signature != session.results_signature:
+            self._invalidate_process_filter_session(processo, clear_hint=True)
+            count_target_event(self.driver, "pesquisa_results_reuse_fallback")
+            return False
+        if self._results_signature_total(current_signature) < expected_position:
+            count_target_event(self.driver, "pesquisa_results_reuse_fallback")
+            return False
+
+        self._set_process_filter_session(
+            processo,
+            state=document_search.PESQUISA_STATE_SEARCH_RESULTS,
+            last_term=termo,
+            results_signature=current_signature,
+            degraded=False,
+        )
+        count_target_event(self.driver, "pesquisa_results_reuse_hit")
+        return True
+
     def reset_search_context_light(self, processo: str, *, reason: str = "") -> None:
         timeout = min(5, max(1, self.timeout_seconds))
         try:
@@ -838,14 +1113,22 @@ class SEIScraper:
                 timeout_seconds=timeout,
                 debug_logging=self._should_log_pesquisa_debug(),
             )
+            self._capture_process_filter_session(processo)
         except (TimeoutException, RuntimeError, NoSuchElementException, StaleElementReferenceException, WebDriverException):
             try:
                 self.driver.switch_to.default_content()
             except WebDriverException:
                 pass
             self._click_pesquisar_no_processo()
+            self._capture_process_filter_session(processo)
 
         self._clear_search_input_if_present()
+        self._set_process_filter_session(
+            processo,
+            state=document_search.PESQUISA_STATE_SEARCH_FORM,
+            results_signature=None,
+            degraded=bool(self._ensure_process_filter_degraded_store().get(processo)),
+        )
         self.logger.info(
             "Processo %s: reset_context_light usado%s.",
             processo,
@@ -871,7 +1154,7 @@ class SEIScraper:
         span_name = "infra:_reset_search_context_with_fallback"
         self.performance_profiler.start_span(span_name)
         try:
-            if self._process_filter_degraded.get(processo):
+            if self._ensure_process_filter_degraded_store().get(processo):
                 self.logger.info(
                     "Processo %s: reload completo usado (fallback)%s.",
                     processo,
@@ -898,9 +1181,27 @@ class SEIScraper:
                 return
             except (TimeoutException, RuntimeError, NoSuchElementException, StaleElementReferenceException, WebDriverException) as exc:
                 if self._is_search_context_stagnation_timeout(exc):
-                    self._process_filter_degraded[processo] = True
+                    self._set_process_filter_degraded_state(processo, True)
+                    self._invalidate_process_filter_session(processo, clear_hint=True)
                 if not self._should_fallback_to_full_reload(exc):
                     raise
+                inspection = self._inspect_document_view_state()
+                if inspection.get("is_interstitial_download"):
+                    self.logger.warning(
+                        "Processo %s: filter_interstitial_download tipo=%s motivo=%s %s",
+                        processo,
+                        document_type.log_label,
+                        inspection.get("reason", ""),
+                        inspection.get("detail", ""),
+                    )
+                if inspection.get("is_document_view"):
+                    self.logger.warning(
+                        "Processo %s: filter_reopen_error_after_document_view tipo=%s %s erro=%s",
+                        processo,
+                        document_type.log_label,
+                        inspection.get("detail", ""),
+                        exc,
+                    )
                 self.logger.warning(
                     "Processo %s: reload completo usado (fallback)%s. erro=%s",
                     processo,
@@ -913,11 +1214,19 @@ class SEIScraper:
                     reason=reason,
                 )
                 self._ensure_document_search_open(processo, document_type)
+                if inspection.get("is_interstitial_download"):
+                    self.logger.info(
+                        "Processo %s: context_recovered_after_download tipo=%s motivo=%s",
+                        processo,
+                        document_type.log_label,
+                        inspection.get("reason", ""),
+                    )
         finally:
             self.performance_profiler.end_span(span_name)
 
     def _clear_process_filter_state(self, processo: str) -> None:
-        self._process_filter_degraded.pop(processo, None)
+        self._set_process_filter_degraded_state(processo, False)
+        self._invalidate_process_filter_session(processo, clear_hint=True)
         stale_keys = [
             key for key in self._process_filter_recovery_attempts if key[0] == processo
         ]
@@ -1013,7 +1322,17 @@ class SEIScraper:
         return record if isinstance(record, dict) else {}
 
     def _get_ted_numero_instrumento(self, processo: str) -> str:
-        return TED_NUMERO_INSTRUMENTO_FIXO
+        preview_record = self._get_preview_record_for_processo(processo)
+        for key in (
+            "numero_ted",
+            "numero_instrumento_ted",
+            "numero_instrumento",
+            "instrumento_ted",
+        ):
+            value = str(preview_record.get(key, "") or "").strip()
+            if value:
+                return value
+        return ""
 
     def _process_ted_via_api(
         self,
@@ -1037,6 +1356,18 @@ class SEIScraper:
             return None
 
         numero_instrumento = self._get_ted_numero_instrumento(processo)
+        if not numero_instrumento:
+            collection_context = self._build_collection_context(
+                found=False,
+                found_in="api",
+                search_term="transferegov_api",
+                selection_reason="skipped_no_instrument_number",
+                selection_detail="TED skip: sem numero de instrumento vinculado ao processo",
+            )
+            self._record_document_search_outcome(processo, document_type, collection_context)
+            self.logger.info("Processo %s: TED skip: sem numero de instrumento vinculado ao processo", processo)
+            return None
+
         ted_json = consultar_ted(
             numero_processo=numero_processo,
             numero_instrumento=numero_instrumento,
@@ -1141,7 +1472,7 @@ class SEIScraper:
                 ponto="_ensure_document_search_open:entry",
             )
         anchor_timeout = min(3, max(1, self.timeout_seconds))
-        force_restore = bool(self._process_filter_degraded.get(processo))
+        force_restore = bool(self._ensure_process_filter_degraded_store().get(processo))
         if force_restore:
             self.logger.info(
                 "Processo %s: filtro marcado como degradado; restaurando contexto antes de %s.",
@@ -1149,6 +1480,20 @@ class SEIScraper:
                 document_type.display_name,
             )
         else:
+            if self._try_restore_process_filter_session(
+                processo,
+                accepted_states={
+                    document_search.PESQUISA_STATE_SEARCH_FORM,
+                    document_search.PESQUISA_STATE_SEARCH_RESULTS,
+                },
+                allow_full_scan=False,
+            ):
+                self.logger.info(
+                    "Processo %s: filtro reutilizado da sessao validada para %s.",
+                    processo,
+                    document_type.display_name,
+                )
+                return
             try:
                 toolbar_actions.wait_pesquisa_anchor(
                     self.driver,
@@ -1156,6 +1501,7 @@ class SEIScraper:
                     self.logger,
                     timeout=anchor_timeout,
                 )
+                self._capture_process_filter_session(processo)
                 self.logger.info(
                     "Processo %s: filtro ja estava aberto para %s.",
                     processo,
@@ -1194,7 +1540,8 @@ class SEIScraper:
             )
             try:
                 self._click_pesquisar_no_processo()
-                self._process_filter_degraded.pop(processo, None)
+                self._set_process_filter_degraded_state(processo, False)
+                self._capture_process_filter_session(processo)
                 self.logger.info(
                     "Processo %s: filtro aberto (anchor ok) para %s.",
                     processo,
@@ -1204,7 +1551,8 @@ class SEIScraper:
             except (TimeoutException, RuntimeError) as exc:
                 last_exc = exc
                 if self._is_search_context_stagnation_timeout(exc):
-                    self._process_filter_degraded[processo] = True
+                    self._set_process_filter_degraded_state(processo, True)
+                    self._invalidate_process_filter_session(processo, clear_hint=True)
                     self.logger.warning(
                         "Processo %s: filtro entrou em estagnacao para %s; contexto sera restaurado antes da proxima tentativa.",
                         processo,
@@ -1342,6 +1690,89 @@ class SEIScraper:
             fallback_count=int(diagnostics.get("fallback_result_count", 0) or 0),
         )
 
+    def _looks_like_document_view_context(self, diagnostics: Dict[str, Any]) -> bool:
+        marker = self._normalize_text(
+            " ".join(
+                str(diagnostics.get(key, "") or "")
+                for key in (
+                    "current_url",
+                    "current_title",
+                    "ifrConteudoVisualizacao_src",
+                    "ifrVisualizacao_src",
+                )
+            )
+        )
+        return any(
+            token in marker
+            for token in (
+                "DOCUMENTO_VISUALIZAR",
+                "VISUALIZACAO",
+                "ABOUT:BLANK",
+                "DOCUMENTO_DOWNLOAD_ANEXO",
+            )
+        )
+
+    def _inspect_document_view_state(self) -> Dict[str, Any]:
+        diagnostics = self._collect_pesquisa_diagnostics()
+        detail = self._format_pesquisa_diagnostics(diagnostics)
+        inspection: Dict[str, Any] = {
+            "diagnostics": diagnostics,
+            "detail": detail,
+            "is_document_view": self._looks_like_document_view_context(diagnostics),
+            "is_interstitial_download": False,
+            "reason": "",
+            "visualizacao_url": "",
+            "visualizacao_title": "",
+            "has_download_anchor": False,
+        }
+
+        try:
+            if not document_text_extractor._switch_to_visualizacao_iframe(
+                self.driver,
+                logger=None,
+                timeout_seconds=1.5,
+                log_state={},
+            ):
+                return inspection
+
+            visualizacao_state = document_text_extractor._read_visualizacao_state(self.driver)
+            anchor_url = document_text_extractor._find_download_anchor_url(self.driver, logger=None)
+            visualizacao_url = str(visualizacao_state.get("url", "") or "")
+            visualizacao_title = str(visualizacao_state.get("title", "") or "")
+            visualizacao_text = str(visualizacao_state.get("text", "") or "")
+            has_anchor = bool(anchor_url)
+            is_placeholder = document_text_extractor._looks_like_placeholder_text(visualizacao_text)
+            is_about_blank = visualizacao_url.strip().lower().startswith("about:blank")
+
+            inspection.update(
+                {
+                    "visualizacao_url": visualizacao_url,
+                    "visualizacao_title": visualizacao_title,
+                    "has_download_anchor": has_anchor,
+                    "is_document_view": bool(
+                        inspection["is_document_view"]
+                        or visualizacao_url
+                        or visualizacao_title
+                        or visualizacao_text
+                        or has_anchor
+                    ),
+                }
+            )
+            if has_anchor and (is_placeholder or is_about_blank):
+                inspection["is_interstitial_download"] = True
+                inspection["reason"] = (
+                    "placeholder_download_anchor" if is_placeholder else "about_blank_download_anchor"
+                )
+        except Exception:
+            return inspection
+        finally:
+            try:
+                self.driver.switch_to.default_content()
+            except WebDriverException:
+                pass
+
+        return inspection
+
     def _log_filter_diagnostics(
         self,
         processo: str,
@@ -1447,7 +1878,8 @@ class SEIScraper:
         except (TimeoutException, NoSuchElementException) as exc:
             stagnated = self._is_search_context_stagnation_timeout(exc)
             if stagnated:
-                self._process_filter_degraded[processo] = True
+                self._set_process_filter_degraded_state(processo, True)
+                self._invalidate_process_filter_session(processo, clear_hint=True)
             detail = self._log_filter_diagnostics(
                 processo,
                 document_type,
@@ -1469,6 +1901,14 @@ class SEIScraper:
             )
 
         if not hits:
+            no_results_signature = document_search.build_results_signature_from_hits([])
+            self._set_process_filter_session(
+                processo,
+                state=document_search.PESQUISA_STATE_SEARCH_RESULTS,
+                last_term=termo,
+                results_signature=no_results_signature,
+                degraded=bool(self._ensure_process_filter_degraded_store().get(processo)),
+            )
             detail = self._log_filter_diagnostics(
                 processo,
                 document_type,
@@ -1488,6 +1928,13 @@ class SEIScraper:
             )
 
         first_hit = hits[0]
+        self._set_process_filter_session(
+            processo,
+            state=document_search.PESQUISA_STATE_SEARCH_RESULTS,
+            last_term=termo,
+            results_signature=document_search.build_results_signature_from_hits(hits),
+            degraded=bool(self._ensure_process_filter_degraded_store().get(processo)),
+        )
         return (
             hits,
             self._build_collection_context(
@@ -1536,7 +1983,8 @@ class SEIScraper:
                 except (TimeoutException, RuntimeError, NoSuchElementException, WebDriverException) as exc:
                     stagnated = self._is_search_context_stagnation_timeout(exc)
                     if stagnated:
-                        self._process_filter_degraded[processo] = True
+                        self._set_process_filter_degraded_state(processo, True)
+                        self._invalidate_process_filter_session(processo, clear_hint=True)
                     detail = self._log_filter_diagnostics(
                         processo,
                         document_type,
@@ -1786,6 +2234,12 @@ class SEIScraper:
         for attempt_index, candidate in enumerate(candidates, start=1):
             candidate_text = str(candidate.get("text", "") or "")
             if self._should_skip_candidate_pre_open(candidate_text):
+                self._log_related_candidate_skip(
+                    processo,
+                    document_type,
+                    candidate_text=candidate_text,
+                    source="tree",
+                )
                 continue
 
             if attempt_index > 1:
@@ -1958,7 +2412,8 @@ class SEIScraper:
                     except (TimeoutException, RuntimeError, NoSuchElementException, WebDriverException) as exc:
                         stagnated = self._is_search_context_stagnation_timeout(exc)
                         if stagnated:
-                            self._process_filter_degraded[processo] = True
+                            self._set_process_filter_degraded_state(processo, True)
+                            self._invalidate_process_filter_session(processo, clear_hint=True)
                         detail = self._log_filter_diagnostics(
                             processo,
                             document_type,
@@ -2006,8 +2461,21 @@ class SEIScraper:
                     hits,
                 )
                 for hit in hits_to_open:
-                    candidate_text = str(hit.protocolo or "")
+                    candidate_text = " ".join(
+                        part
+                        for part in (
+                            str(hit.protocolo or ""),
+                            str(getattr(hit, "row_text", "") or ""),
+                        )
+                        if part
+                    )
                     if self._should_skip_candidate_pre_open(candidate_text):
+                        self._log_related_candidate_skip(
+                            processo,
+                            document_type,
+                            candidate_text=candidate_text,
+                            source="filter",
+                        )
                         continue
 
                     attempt_opened_doc_handles: Set[str] = set()
@@ -2020,44 +2488,74 @@ class SEIScraper:
                         selection_reason=hit.selection_reason,
                         selection_detail=f"position={hit.selected_position} total={hit.total_resultados}",
                     )
+                    if getattr(hit, "row_text", ""):
+                        attempt_context["candidate_row_text"] = str(getattr(hit, "row_text", "") or "")
                     try:
-                        if term_index > 0 or hit.selected_position > 1:
-                            self._reset_search_context_with_fallback(
+                        if hit.selected_position > 1:
+                            reused_results = self._try_restore_filter_results_session(
                                 processo,
-                                document_type,
-                                process_url=process_url,
-                                reason=(
-                                    f"novo candidato do filtro {document_type.log_label} "
-                                    f"rank={hit.selected_position}"
-                                ),
-                            )
-                            refreshed_hits, refreshed_context = self._search_document_in_filter(
-                                processo=processo,
-                                document_type=document_type,
                                 termo=termo,
+                                expected_position=hit.selected_position,
                             )
-                            if len(refreshed_hits) < hit.selected_position:
-                                self.logger.warning(
-                                    "Processo %s: candidato #%d do filtro para %s nao reapareceu apos reabrir os resultados.",
+                            if reused_results:
+                                self.logger.info(
+                                    "Processo %s: reutilizando resultados atuais do filtro para %s rank=%d.",
                                     processo,
-                                    hit.selected_position,
                                     document_type.log_label,
+                                    hit.selected_position,
                                 )
-                                collection_context = refreshed_context
-                                continue
-                            hit = refreshed_hits[hit.selected_position - 1]
-                            candidate_text = str(hit.protocolo or "")
-                            if self._should_skip_candidate_pre_open(candidate_text):
-                                continue
-                            attempt_context = self._build_collection_context(
-                                found=True,
-                                found_in="filter",
-                                search_term=termo,
-                                results_count=hit.total_resultados,
-                                chosen_documento=hit.protocolo,
-                                selection_reason=hit.selection_reason,
-                                selection_detail=f"position={hit.selected_position} total={hit.total_resultados}",
-                            )
+                            else:
+                                self._reset_search_context_with_fallback(
+                                    processo,
+                                    document_type,
+                                    process_url=process_url,
+                                    reason=(
+                                        f"novo candidato do filtro {document_type.log_label} "
+                                        f"rank={hit.selected_position}"
+                                    ),
+                                )
+                                refreshed_hits, refreshed_context = self._search_document_in_filter(
+                                    processo=processo,
+                                    document_type=document_type,
+                                    termo=termo,
+                                )
+                                if len(refreshed_hits) < hit.selected_position:
+                                    self.logger.warning(
+                                        "Processo %s: candidato #%d do filtro para %s nao reapareceu apos reabrir os resultados.",
+                                        processo,
+                                        hit.selected_position,
+                                        document_type.log_label,
+                                    )
+                                    collection_context = refreshed_context
+                                    continue
+                                hit = refreshed_hits[hit.selected_position - 1]
+                                candidate_text = " ".join(
+                                    part
+                                    for part in (
+                                        str(hit.protocolo or ""),
+                                        str(getattr(hit, "row_text", "") or ""),
+                                    )
+                                    if part
+                                )
+                                if self._should_skip_candidate_pre_open(candidate_text):
+                                    self._log_related_candidate_skip(
+                                        processo,
+                                        document_type,
+                                        candidate_text=candidate_text,
+                                        source="filter",
+                                    )
+                                    continue
+                                attempt_context = self._build_collection_context(
+                                    found=True,
+                                    found_in="filter",
+                                    search_term=termo,
+                                    results_count=hit.total_resultados,
+                                    chosen_documento=hit.protocolo,
+                                    selection_reason=hit.selection_reason,
+                                    selection_detail=f"position={hit.selected_position} total={hit.total_resultados}",
+                                )
+                                if getattr(hit, "row_text", ""):
+                                    attempt_context["candidate_row_text"] = str(getattr(hit, "row_text", "") or "")
 
                         self.logger.info(
                             "Processo %s: abrindo candidato do filtro %d/%d para %s (%s).",
@@ -2163,7 +2661,8 @@ class SEIScraper:
             return False
         except (TimeoutException, NoSuchElementException) as exc:
             if self._is_search_context_stagnation_timeout(exc):
-                self._process_filter_degraded[processo] = True
+                self._set_process_filter_degraded_state(processo, True)
+                self._invalidate_process_filter_session(processo, clear_hint=True)
                 self.logger.warning(
                     "Processo %s: busca do filtro para %s entrou em estagnacao; o contexto do processo foi marcado como degradado.",
                     processo,
@@ -2317,6 +2816,7 @@ class SEIScraper:
                 self.driver.switch_to.window(self.main_window_handle)
             elif remaining:
                 self.driver.switch_to.window(remaining[0])
+            self._capture_process_filter_session(processo)
             if self._should_log_pesquisa_debug():
                 document_search.log_debug_pesquisa_state(
                     self.driver,
@@ -3163,6 +3663,40 @@ class SEIScraper:
         self.logger.info("candidato_descartado_pre_abertura: %s", candidate_text)
         return True
 
+    def _log_related_candidate_skip(
+        self,
+        processo: str,
+        document_type: DocumentTypeSpec,
+        *,
+        candidate_text: str,
+        source: str,
+    ) -> None:
+        if document_type.key != "act":
+            return
+        self.logger.info(
+            "Processo %s: candidate_mislabeled_related source=%s tipo=%s candidato='%s'",
+            processo,
+            source,
+            document_type.log_label,
+            candidate_text,
+        )
+
+    def _describe_candidate_for_logs(
+        self,
+        protocolo_documento: str,
+        collection_context: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        parts: List[str] = []
+        for raw in (
+            (collection_context or {}).get("chosen_documento", ""),
+            (collection_context or {}).get("candidate_row_text", ""),
+            protocolo_documento,
+        ):
+            value = str(raw or "").strip()
+            if value and value not in parts:
+                parts.append(value)
+        return " | ".join(parts)
+
     def _log_candidate_screening_summary(self) -> None:
         total = self.total_candidatos_avaliados
         discarded = self.candidatos_descartados_pre_abertura
@@ -3363,13 +3897,46 @@ class SEIScraper:
                 if document_type.key in {"act", "memorando"}:
                     is_canonical = bool((analysis or {}).get("validation_status") == VALIDATION_STATUS_VALID)
                     if not is_canonical:
+                        candidate_detail = self._describe_candidate_for_logs(
+                            protocolo_documento,
+                            collection_context,
+                        )
+                        doc_class = str((analysis or {}).get("doc_class", "") or "")
+                        discard_reason = str(
+                            (analysis or {}).get("classification_reason", validation_reason) or validation_reason
+                        )
                         self.logger.warning(
                             "Processo %s: snapshot de %s retido apenas na silver. doc_class=%s motivo=%s",
                             processo,
                             document_type.log_label,
-                            (analysis or {}).get("doc_class", ""),
-                            (analysis or {}).get("classification_reason", validation_reason),
+                            doc_class,
+                            discard_reason,
                         )
+                        self.logger.warning(
+                            "Processo %s: candidate_valid_discard_noncanonical tipo=%s candidato='%s' doc_class=%s motivo=%s",
+                            processo,
+                            document_type.log_label,
+                            candidate_detail,
+                            doc_class,
+                            discard_reason,
+                        )
+                        if document_type.key == "act" and doc_class in {
+                            DOC_CLASS_EXTRATO,
+                            DOC_CLASS_MINUTA,
+                            DOC_CLASS_TERMO_ADITIVO,
+                            DOC_CLASS_TERMO_ADESAO,
+                            DOC_CLASS_EMAIL_OUTRO,
+                            DOC_CLASS_STUB,
+                        }:
+                            self.logger.warning(
+                                "Processo %s: candidate_mislabeled_related source=%s tipo=%s candidato='%s' doc_class=%s motivo=%s",
+                                processo,
+                                str((collection_context or {}).get("found_in", "") or "snapshot"),
+                                document_type.log_label,
+                                candidate_detail,
+                                doc_class,
+                                discard_reason,
+                            )
                     return is_canonical
                 if document_type.key == "pt":
                     is_canonical = bool((analysis or {}).get("is_canonical_candidate", True))

@@ -7,6 +7,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 
 from app.documents.act import build_act_document_type
+from app.documents.document_utils import should_skip_candidate
 from app.documents.memorando import build_memorando_document_type
 from app.documents.registry import resolve_document_types
 from app.documents.ted import build_ted_document_type
@@ -36,6 +37,7 @@ class DocumentTypesTests(unittest.TestCase):
         self.assertEqual(spec.accepted_doc_classes, ("act_final",))
         self.assertEqual(len(spec.filter_type_aliases), 2)
         self.assertTrue(all("Acordo de Coopera" in alias for alias in spec.filter_type_aliases))
+        self.assertEqual(spec.max_filter_candidates, 5)
 
         memorando = build_memorando_document_type()
         self.assertIn("Memorando de Entendimentos", memorando.search_terms)
@@ -51,6 +53,21 @@ class DocumentTypesTests(unittest.TestCase):
     def test_unknown_document_type_falls_back_to_pt(self) -> None:
         specs = resolve_document_types("foo")
         self.assertEqual([spec.key for spec in specs], ["pt"])
+
+    def test_candidate_skip_normalizes_accents_and_case(self) -> None:
+        skipped = (
+            "Termo de Adesão ao ACT 109/2022",
+            "termo de adesao ao ACT 109/2022",
+            "Extrato de Publicação",
+            "Minuta Acordo de Cooperação Técnica",
+            "E-mail de encaminhamento",
+            "Acordo de Cooperação Técnica Proposta de Termo Aditivo ACT PRF (8707829)",
+            "Documentação de apoio ao ACT",
+            "Publicação do acordo",
+        )
+        for candidate in skipped:
+            with self.subTest(candidate=candidate):
+                self.assertTrue(should_skip_candidate(candidate))
 
 
 if __name__ == "__main__":

@@ -344,6 +344,31 @@ def _read_visualizacao_state(driver: Any) -> Dict[str, str]:
     }
 
 
+def _detect_immediate_file_fallback_reason(
+    driver: Any,
+    snapshot: Dict[str, Any],
+    logger: Any = None,
+) -> str:
+    text = str(snapshot.get("text") or "")
+    url = str(snapshot.get("url") or "").strip().lower()
+    has_placeholder_text = _looks_like_placeholder_text(text)
+    is_about_blank = url.startswith("about:blank")
+
+    if not has_placeholder_text and not is_about_blank:
+        return ""
+
+    try:
+        anchor_url = _find_download_anchor_url(driver, logger=logger)
+    except Exception:
+        return ""
+    if not anchor_url:
+        return ""
+
+    if has_placeholder_text:
+        return "placeholder_download_anchor"
+    return "about_blank_download_anchor"
+
+
 def extract_body_text_from_visualizacao(driver: Any, logger: Any = None) -> str:
     text = ""
     try:
@@ -832,7 +857,21 @@ def extract_document_snapshot(driver: Any, logger: Any = None) -> Dict[str, Any]
 
         snapshot.update(_read_visualizacao_state(driver))
         should_force_file_fallback = False
-        if not _snapshot_text_is_ready(snapshot["text"]):
+        immediate_fallback_reason = _detect_immediate_file_fallback_reason(
+            driver,
+            snapshot,
+            logger=logger,
+        )
+        if immediate_fallback_reason:
+            should_force_file_fallback = True
+            _log(
+                logger,
+                "info",
+                "Snapshot PT: assinatura de download/intersticial detectada (%s); antecipando fallback de arquivo.",
+                immediate_fallback_reason,
+            )
+
+        if not should_force_file_fallback and not _snapshot_text_is_ready(snapshot["text"]):
             _log(
                 logger,
                 "info",
@@ -862,6 +901,21 @@ def extract_document_snapshot(driver: Any, logger: Any = None) -> Dict[str, Any]
                         "info",
                         "Snapshot PT: renderizacao final detectada apos espera (chars=%d).",
                         len(snapshot["text"]),
+                    )
+                    break
+
+                immediate_fallback_reason = _detect_immediate_file_fallback_reason(
+                    driver,
+                    snapshot,
+                    logger=logger,
+                )
+                if immediate_fallback_reason:
+                    should_force_file_fallback = True
+                    _log(
+                        logger,
+                        "info",
+                        "Snapshot PT: assinatura de download/intersticial detectada apos espera (%s); antecipando fallback de arquivo.",
+                        immediate_fallback_reason,
                     )
                     break
 

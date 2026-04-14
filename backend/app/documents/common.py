@@ -91,10 +91,12 @@ def save_snapshot_json(
     logger: Any,
     extra_payload: Optional[dict[str, Any]] = None,
     snapshot_prefix_override: Optional[str] = None,
+    filename_suffix: Optional[str] = None,
 ) -> Optional[Path]:
     processo_id = sanitize_filename_part(processo, fallback="sem_processo")
     snapshot_prefix = snapshot_prefix_override or spec.snapshot_prefix
-    filename = f"{snapshot_prefix}_{processo_id}.json"
+    suffix = sanitize_filename_part(filename_suffix, fallback="").strip("_") if filename_suffix else ""
+    filename = f"{snapshot_prefix}_{processo_id}{'_' + suffix if suffix else ''}.json"
     filepath = output_dir / filename
     sanitized_snapshot = sanitize_snapshot(snapshot)
     payload: Dict[str, Any] = {
@@ -109,6 +111,7 @@ def save_snapshot_json(
         if isinstance(sanitized_extra_payload, dict):
             payload.update(sanitized_extra_payload)
     try:
+        filepath.parent.mkdir(parents=True, exist_ok=True)
         filepath.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2),
             encoding="utf-8",

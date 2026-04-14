@@ -154,6 +154,49 @@ def _act_quality(row: Dict[str, str]) -> str:
     return "gold_partial" if missing else "gold_complete"
 
 
+def _act_missing_fields(row: Dict[str, str]) -> List[str]:
+    if not row or row.get("publication_status", "") != ACT_PUBLICATION_STATUS_GOLD:
+        return []
+    return [
+        field
+        for field in ("numero_acordo", "data_inicio_vigencia", "data_fim_vigencia", "orgao_convenente", "objeto")
+        if not _clean_spaces(row.get(field, ""))
+    ]
+
+
+def _ted_quality(ted_row: Dict[str, str], status_rows: List[Dict[str, str]]) -> str:
+    if ted_row.get("json_path", ""):
+        return "gold"
+    if status_rows:
+        reason = _clean_spaces(status_rows[0].get("selection_reason", ""))
+        return reason or "not_found"
+    return "not_found"
+
+
+def _summarize_act_rejections(rows: List[Dict[str, str]]) -> str:
+    counts: Dict[str, int] = {}
+    for row in rows:
+        if row.get("publication_status", "") == ACT_PUBLICATION_STATUS_GOLD:
+            continue
+        label = (
+            _clean_spaces(row.get("doc_class", ""))
+            or _clean_spaces(row.get("selection_reason", ""))
+            or "unknown"
+        )
+        reason = _clean_spaces(row.get("classification_reason", "")) or _clean_spaces(row.get("discard_reason", ""))
+        key = f"{label}:{reason}" if reason else label
+        counts[key] = counts.get(key, 0) + 1
+    return " | ".join(f"{key}({count})" for key, count in sorted(counts.items()))
+
+
+def _period_label(row: Dict[str, str]) -> str:
+    start = _clean_spaces(row.get("vigencia_inicio", "") or row.get("data_inicio_vigencia", ""))
+    end = _clean_spaces(row.get("vigencia_fim", "") or row.get("data_fim_vigencia", ""))
+    if start or end:
+        return f"{start}..{end}"
+    return ""
+
+
 def _has_process_mismatch(act_row: Dict[str, str]) -> bool:
     warning = _clean_spaces(act_row.get("validation_warning", ""))
     return "processo_divergente_documento=" in warning or "processo_referencia_externa_documento=" in warning
@@ -183,25 +226,33 @@ def export_dashboard_ready_csv(output_dir: Path, logger: Any = None) -> Dict[str
 
     pt_grouped = _group_rows(_read_csv_rows(output_dir / "pt_auditoria_latest.csv", logger=logger))
     act_grouped = _group_rows(_read_csv_rows(output_dir / "act_classificacao_latest.csv", logger=logger))
+    act_status_grouped = _group_rows(_read_csv_rows(output_dir / "act_status_execucao_latest.csv", logger=logger))
     memorando_grouped = _group_rows(_read_csv_rows(output_dir / "memorando_normalizado_latest.csv", logger=logger))
     ted_grouped = _group_rows(_read_csv_rows(output_dir / "ted_normalizado_latest.csv", logger=logger))
+    ted_status_grouped = _group_rows(_read_csv_rows(output_dir / "ted_status_execucao_latest.csv", logger=logger))
 
     rows: List[Dict[str, Any]] = []
+    divergence_rows: List[Dict[str, Any]] = []
     for preview in preview_rows:
         processo = _clean_spaces(preview.get("processo", ""))
         pt_row = _best_pt_row(pt_grouped.get(processo, [])) if pt_grouped.get(processo) else {}
         act_row = _best_act_row(act_grouped.get(processo, [])) if act_grouped.get(processo) else {}
+        act_attempt_rows = act_status_grouped.get(processo, [])
         memorando_row = _first_row(memorando_grouped.get(processo, []))
         ted_row = _first_row(ted_grouped.get(processo, []))
+        ted_status_rows = ted_status_grouped.get(processo, [])
         ted_api_payload = _ted_payload(ted_row, output_dir, logger=logger) if ted_row else {}
 
         pt_quality = _pt_quality(pt_row)
         act_quality = _act_quality(act_row)
+        ted_quality = _ted_quality(ted_row, ted_status_rows)
         pt_gold = pt_row.get("publication_status", "") == PT_PUBLICATION_STATUS_GOLD
         act_gold = act_row.get("publication_status", "") == ACT_PUBLICATION_STATUS_GOLD
         memorando_gold = bool(memorando_row.get("json_path", ""))
         ted_gold = bool(ted_row.get("json_path", ""))
         has_process_mismatch = _has_process_mismatch(act_row)
+        act_missing = _act_missing_fields(act_row)
+        act_rejection_summary = _summarize_act_rejections(act_attempt_rows)
 
         act_orgao = _clean_spaces(act_row.get("orgao_convenente", "")) if act_gold else ""
         preview_partner = _clean_spaces(preview.get("parceiro", ""))
@@ -220,20 +271,23 @@ def export_dashboard_ready_csv(output_dir: Path, logger: Any = None) -> Dict[str
             notes.append(f"act={act_quality}")
         if pt_quality != "gold":
             notes.append(f"pt={pt_quality}")
+        if ted_quality != "gold":
+            notes.append(f"ted={ted_quality}")
         if has_process_mismatch:
             notes.append(_clean_spaces(act_row.get("validation_warning", "")))
         if act_gold and act_quality == "gold_partial":
-            missing = [
-                field
-                for field in ("numero_acordo", "data_inicio_vigencia", "data_fim_vigencia", "orgao_convenente", "objeto")
-                if not _clean_spaces(act_row.get(field, ""))
-            ]
-            if missing:
-                notes.append(f"act_missing={','.join(missing)}")
+            if act_missing:
+                notes.append(f"act_missing={','.join(act_missing)}")
+        if source_act_objeto == "preview_fallback":
+            notes.append("act_objeto=preview_fallback")
+        if source_act_parceiro == "preview_fallback":
+            notes.append("act_parceiro=preview_fallback")
+        if pt_quality == "silver_only" and _period_label(pt_row):
+            notes.append(f"pt_silver_vigencia={_period_label(pt_row)}")
         if ted_gold:
             notes.append("ted=gold")
 
-        rows.append(
+        dashboard_row = (
             {
                 "processo": processo,
                 "preview_parceiro": preview_partner,
@@ -258,6 +312,7 @@ def export_dashboard_ready_csv(output_dir: Path, logger: Any = None) -> Dict[str
                 "source_act_parceiro": source_act_parceiro,
                 "memorando_gold": memorando_gold,
                 "memorando_json_path": memorando_row.get("json_path", "") if memorando_gold else "",
+                "ted_quality": ted_quality,
                 "ted_gold": ted_gold,
                 "ted_json_path": ted_row.get("json_path", "") if ted_gold else "",
                 "ted_objeto": _clean_spaces(str(ted_api_payload.get("objeto", "") or "")) if ted_gold else "",
@@ -272,6 +327,30 @@ def export_dashboard_ready_csv(output_dir: Path, logger: Any = None) -> Dict[str
                     has_process_mismatch=has_process_mismatch,
                 ),
                 "quality_notes": "; ".join(note for note in notes if note),
+                "act_attempts_count": len(act_attempt_rows),
+                "act_rejection_summary": act_rejection_summary,
+            }
+        )
+        rows.append(dashboard_row)
+        divergence_rows.append(
+            {
+                "processo": processo,
+                "quality_status": dashboard_row["quality_status"],
+                "pt_quality": pt_quality,
+                "act_quality": act_quality,
+                "ted_quality": ted_quality,
+                "act_chosen_documento": act_row.get("candidate_json_path", "") or act_row.get("json_path", ""),
+                "act_attempts_count": len(act_attempt_rows),
+                "act_rejection_summary": act_rejection_summary,
+                "act_missing_fields": ",".join(act_missing),
+                "preview_numero_act": _clean_spaces(preview.get("numero_act", "")),
+                "act_numero_acordo": act_row.get("numero_acordo", "") if act_gold else "",
+                "preview_vigencia": _clean_spaces(preview.get("vigencia", "")),
+                "pt_vigencia": _period_label(pt_row),
+                "act_vigencia": _period_label(act_row),
+                "preview_parceiro": preview_partner,
+                "act_orgao_convenente": act_row.get("orgao_convenente", "") if act_gold else "",
+                "quality_notes": dashboard_row["quality_notes"],
             }
         )
 
@@ -299,6 +378,7 @@ def export_dashboard_ready_csv(output_dir: Path, logger: Any = None) -> Dict[str
         "source_act_parceiro",
         "memorando_gold",
         "memorando_json_path",
+        "ted_quality",
         "ted_gold",
         "ted_json_path",
         "ted_objeto",
@@ -307,8 +387,36 @@ def export_dashboard_ready_csv(output_dir: Path, logger: Any = None) -> Dict[str
         "ted_uf",
         "quality_status",
         "quality_notes",
+        "act_attempts_count",
+        "act_rejection_summary",
     ]
     csv_path = output_dir / "dashboard_ready_latest.csv"
     csv_writer.write_csv(rows, csv_path, columns=columns)
+    divergence_columns = [
+        "processo",
+        "quality_status",
+        "pt_quality",
+        "act_quality",
+        "ted_quality",
+        "act_chosen_documento",
+        "act_attempts_count",
+        "act_rejection_summary",
+        "act_missing_fields",
+        "preview_numero_act",
+        "act_numero_acordo",
+        "preview_vigencia",
+        "pt_vigencia",
+        "act_vigencia",
+        "preview_parceiro",
+        "act_orgao_convenente",
+        "quality_notes",
+    ]
+    divergence_path = output_dir / "divergence_matrix_latest.csv"
+    csv_writer.write_csv(divergence_rows, divergence_path, columns=divergence_columns)
     _log(logger, "info", "Dashboard exporter: arquivo gerado com %d linha(s) em %s.", len(rows), csv_path)
-    return {"records": len(rows), "csv_path": csv_path, "latest_path": csv_path}
+    return {
+        "records": len(rows),
+        "csv_path": csv_path,
+        "latest_path": csv_path,
+        "divergence_path": divergence_path,
+    }

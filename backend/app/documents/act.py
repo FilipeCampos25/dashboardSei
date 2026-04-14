@@ -34,6 +34,7 @@ def build_act_document_type() -> DocumentTypeSpec:
         log_label="ACT",
         cleanup_patterns=(
             "acordo_cooperacao_tecnica_*.json",
+            "candidates/acordo_cooperacao_tecnica_*.json",
             "act_status_execucao_latest.csv",
             "act_normalizado_latest.csv",
             "act_classificacao_latest.csv",
@@ -47,5 +48,5 @@ def build_act_document_type() -> DocumentTypeSpec:
             "Acordo de Cooperação Técnica",
             "Acordo de Cooperação",
         ),
-        max_filter_candidates=2,
+        max_filter_candidates=5,
     )
