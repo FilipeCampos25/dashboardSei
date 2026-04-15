@@ -10,6 +10,7 @@ import time
 import unicodedata
 import zipfile
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List
 from urllib.parse import urljoin
 
@@ -20,6 +21,9 @@ from app.rpa.performance_profiler import profiler_sleep, target_span
 
 SNAPSHOT_STAGNANT_READS_FOR_EARLY_FALLBACK = 3
 SNAPSHOT_EARLY_FALLBACK_TEXT_THRESHOLD = 120
+MANAGED_DOWNLOAD_WAIT_SECONDS = 6.0
+MANAGED_DOWNLOAD_POLL_SECONDS = 0.2
+MANAGED_DOWNLOAD_STABLE_POLLS = 2
 
 
 def _log(logger: Any, level: str, msg: str, *args: Any) -> None:
@@ -481,6 +485,38 @@ def _find_download_anchor_url(driver: Any, logger: Any = None) -> str:
     return ""
 
 
+def _get_managed_download_dir(driver: Any) -> Path | None:
+    raw_path = str(getattr(driver, "_sei_download_dir", "") or "").strip()
+    if not raw_path:
+        return None
+    try:
+        return Path(raw_path)
+    except Exception:
+        return None
+
+
+def _is_partial_download_path(path: Path) -> bool:
+    return path.suffix.lower() in {".crdownload", ".tmp", ".part"}
+
+
+def _guess_download_content_type(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix == ".pdf":
+        return "application/pdf"
+    if suffix == ".docx":
+        return "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    if suffix == ".zip":
+        return "application/zip"
+    return ""
+
+
+def _safe_delete_managed_download(path: Path, logger: Any = None) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except Exception as exc:
+        _log(logger, "debug", "Fallback download: falha ao remover arquivo temporario gerenciado (%s).", exc)
+
+
 def _write_bytes_temp_pdf(content: bytes) -> str:
     fd, temp_path = tempfile.mkstemp(prefix="sei_pt_", suffix=".pdf")
     try:
@@ -688,35 +724,26 @@ def _extract_text_from_pdf_ocr(pdf_content: bytes, logger: Any = None, ocr_dpi: 
     return "\n\n".join(chunks).strip()
 
 
-def _extract_pdf_text_via_anchor_fallback(
+def _extract_text_from_downloaded_content(
     driver: Any,
+    downloaded_content: bytes,
+    *,
+    content_type: str = "",
+    source_url: str = "",
+    source_hint: str = "response",
     logger: Any = None,
     ocr_dpi: int = 200,
 ) -> Dict[str, Any]:
-    href = _find_download_anchor_url(driver, logger=logger)
-    if not href:
-        _log(logger, "info", "Fallback PDF: link 'aqui' nao encontrado no DOM atual.")
-        return {}
-
-    resolved_url = urljoin(str(getattr(driver, "current_url", "") or ""), href)
-    _log(logger, "info", "Fallback PDF: tentando download via link do anexo.")
-
-    with target_span(driver, "snapshot:pdf_fallback_download"):
-        downloaded = _download_pdf_with_session(driver, resolved_url, logger=logger)
-    if not downloaded:
-        return {}
-
-    downloaded_content = downloaded.get("content") or b""
     if not isinstance(downloaded_content, (bytes, bytearray)) or not downloaded_content:
         return {}
-    content_type = str(downloaded.get("content_type") or "").lower()
 
+    normalized_content_type = str(content_type or "").lower()
     pdf_content = bytes(downloaded_content)
-    source_hint = "response"
-    is_pdf = "application/pdf" in content_type or pdf_content.startswith(b"%PDF")
+    is_pdf = "application/pdf" in normalized_content_type or pdf_content.startswith(b"%PDF")
     is_zip = (
-        "application/zip" in content_type
-        or "application/x-zip-compressed" in content_type
+        "application/zip" in normalized_content_type
+        or "application/x-zip-compressed" in normalized_content_type
+        or "application/vnd.openxmlformats-officedocument.wordprocessingml.document" in normalized_content_type
         or pdf_content.startswith(b"PK\x03\x04")
     )
 
@@ -732,26 +759,26 @@ def _extract_pdf_text_via_anchor_fallback(
             return {
                 "text": text_docx_direct,
                 "mode": "zip_docx",
-                "source_url": str(downloaded.get("url") or resolved_url),
-                "source_hint": "docx:raw",
+                "source_url": source_url,
+                "source_hint": source_hint or "docx:raw",
             }
 
         docx_result = _extract_docx_bytes_from_zip(pdf_content, logger=logger)
         if docx_result:
             text_docx = str(docx_result.get("docx_text") or "").strip()
-            source_hint = f"zip:{docx_result.get('zip_member') or '-'}"
+            zip_source_hint = f"zip:{docx_result.get('zip_member') or '-'}"
             _log(
                 logger,
                 "info",
                 "Fallback ZIP: DOCX interno extraido com sucesso (%s chars=%d).",
-                source_hint,
+                zip_source_hint,
                 len(text_docx),
             )
             return {
                 "text": text_docx,
                 "mode": "zip_docx",
-                "source_url": str(downloaded.get("url") or resolved_url),
-                "source_hint": source_hint,
+                "source_url": source_url,
+                "source_hint": zip_source_hint,
             }
 
         zip_result = _extract_pdf_bytes_from_zip(pdf_content, logger=logger)
@@ -772,16 +799,14 @@ def _extract_pdf_text_via_anchor_fallback(
         _log(
             logger,
             "warning",
-            "Fallback PDF: resposta nao suportada (status=%s content_type=%s bytes=%d).",
-            downloaded.get("status_code", "?"),
-            content_type,
+            "Fallback PDF: resposta nao suportada (content_type=%s bytes=%d).",
+            normalized_content_type,
             len(downloaded_content),
         )
         return {}
 
     temp_pdf_path = ""
     try:
-        # Mantemos um arquivo temporario para facilitar diagnostico/localidade de processamento.
         temp_pdf_path = _write_bytes_temp_pdf(bytes(pdf_content))
     except Exception as exc:
         _log(logger, "warning", "Fallback PDF: falha ao materializar arquivo temporario (%s).", exc)
@@ -803,7 +828,7 @@ def _extract_pdf_text_via_anchor_fallback(
         return {
             "text": text_native,
             "mode": "pdf_native",
-            "source_url": str(downloaded.get("url") or resolved_url),
+            "source_url": source_url,
             "source_hint": source_hint,
         }
 
@@ -826,11 +851,125 @@ def _extract_pdf_text_via_anchor_fallback(
         return {
             "text": text_ocr,
             "mode": "pdf_ocr",
-            "source_url": str(downloaded.get("url") or resolved_url),
+            "source_url": source_url,
             "source_hint": source_hint,
         }
 
     _log(logger, "warning", "Fallback PDF: nao foi possivel extrair texto do anexo.")
+    return {}
+
+
+def _extract_pdf_text_via_anchor_fallback(
+    driver: Any,
+    logger: Any = None,
+    ocr_dpi: int = 200,
+) -> Dict[str, Any]:
+    href = _find_download_anchor_url(driver, logger=logger)
+    if not href:
+        _log(logger, "info", "Fallback PDF: link 'aqui' nao encontrado no DOM atual.")
+        return {}
+
+    resolved_url = urljoin(str(getattr(driver, "current_url", "") or ""), href)
+    _log(logger, "info", "Fallback PDF: tentando download via link do anexo.")
+
+    with target_span(driver, "snapshot:pdf_fallback_download"):
+        downloaded = _download_pdf_with_session(driver, resolved_url, logger=logger)
+    if not downloaded:
+        return {}
+
+    downloaded_content = downloaded.get("content") or b""
+    return _extract_text_from_downloaded_content(
+        driver,
+        bytes(downloaded_content),
+        content_type=str(downloaded.get("content_type") or ""),
+        source_url=str(downloaded.get("url") or resolved_url),
+        source_hint="response",
+        logger=logger,
+        ocr_dpi=ocr_dpi,
+    )
+
+
+def _extract_text_via_managed_download_fallback(
+    driver: Any,
+    logger: Any = None,
+    *,
+    started_at: float | None = None,
+    timeout_seconds: float = MANAGED_DOWNLOAD_WAIT_SECONDS,
+    ocr_dpi: int = 200,
+) -> Dict[str, Any]:
+    download_dir = _get_managed_download_dir(driver)
+    if download_dir is None or not download_dir.exists():
+        return {}
+
+    deadline = time.time() + max(MANAGED_DOWNLOAD_POLL_SECONDS, timeout_seconds)
+    last_signature: tuple[str, int, int] | None = None
+    stable_reads = 0
+    threshold_time = (started_at or time.time()) - 1.0
+
+    while time.time() < deadline:
+        candidates: List[tuple[float, Path, int, int]] = []
+        try:
+            entries = list(download_dir.iterdir())
+        except Exception as exc:
+            _log(logger, "warning", "Fallback download: falha ao listar diretorio gerenciado (%s).", exc)
+            return {}
+
+        for path in entries:
+            try:
+                if not path.is_file() or _is_partial_download_path(path):
+                    continue
+                stat = path.stat()
+            except Exception:
+                continue
+            if float(stat.st_mtime) < threshold_time:
+                continue
+            candidates.append((float(stat.st_mtime), path, int(stat.st_size), int(stat.st_mtime_ns)))
+
+        if candidates:
+            candidates.sort(key=lambda item: (item[0], item[3]), reverse=True)
+            _, candidate_path, candidate_size, candidate_mtime_ns = candidates[0]
+            current_signature = (candidate_path.name, candidate_size, candidate_mtime_ns)
+            if current_signature == last_signature:
+                stable_reads += 1
+            else:
+                last_signature = current_signature
+                stable_reads = 1
+
+            if stable_reads >= MANAGED_DOWNLOAD_STABLE_POLLS:
+                try:
+                    downloaded_content = candidate_path.read_bytes()
+                except Exception as exc:
+                    _log(logger, "warning", "Fallback download: falha ao ler arquivo gerenciado (%s).", exc)
+                    return {}
+
+                try:
+                    result = _extract_text_from_downloaded_content(
+                        driver,
+                        downloaded_content,
+                        content_type=_guess_download_content_type(candidate_path),
+                        source_url=str(candidate_path),
+                        source_hint=f"managed_download:{candidate_path.name}",
+                        logger=logger,
+                        ocr_dpi=ocr_dpi,
+                    )
+                finally:
+                    _safe_delete_managed_download(candidate_path, logger=logger)
+
+                if result:
+                    _log(
+                        logger,
+                        "info",
+                        "Fallback download: arquivo gerenciado capturado com sucesso (%s chars=%d).",
+                        candidate_path.name,
+                        len(str(result.get("text") or "")),
+                    )
+                return result
+
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        profiler_sleep(min(MANAGED_DOWNLOAD_POLL_SECONDS, remaining))
+
     return {}
 
 
@@ -843,6 +982,7 @@ def extract_document_snapshot(driver: Any, logger: Any = None) -> Dict[str, Any]
         "extraction_mode": "html_dom",
     }
     try:
+        snapshot_started_at = time.time()
         _log(
             logger,
             "info",
@@ -948,6 +1088,13 @@ def extract_document_snapshot(driver: Any, logger: Any = None) -> Dict[str, Any]
             or _looks_like_placeholder_text(snapshot["text"])
         ):
             fallback = _extract_pdf_text_via_anchor_fallback(driver, logger=logger, ocr_dpi=200)
+            if not fallback:
+                fallback = _extract_text_via_managed_download_fallback(
+                    driver,
+                    logger=logger,
+                    started_at=snapshot_started_at,
+                    ocr_dpi=200,
+                )
             if fallback:
                 snapshot["text"] = str(fallback.get("text") or "")
                 snapshot["tables"] = []

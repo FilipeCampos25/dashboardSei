@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 import unittest
+import zipfile
 from pathlib import Path
 from typing import Any
 from unittest.mock import Mock, patch
@@ -1195,6 +1197,87 @@ class WaitOptimizationTests(unittest.TestCase):
         self.assertEqual(snapshot["text"], "conteudo pdf extraido")
         fallback_mock.assert_called_once()
         self.assertLess(clock.time(), 0.2)
+
+    def test_extract_text_via_managed_download_fallback_reads_docx_from_controlled_dir(self) -> None:
+        driver = FakeDriverSwitchOnly()
+        logger = DummyLogger()
+
+        temp_dir = (Path(__file__).resolve().parent / "_tmp_managed_download").resolve()
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            driver._sei_download_dir = str(temp_dir)
+            docx_path = temp_dir / "Minuta_ACT__Censipam_e_IME.docx"
+            with zipfile.ZipFile(docx_path, "w") as archive:
+                archive.writestr(
+                    "word/document.xml",
+                    (
+                        "<w:document><w:body><w:p><w:r><w:t>"
+                        "Teste DOCX automatico do ACT"
+                        "</w:t></w:r></w:p></w:body></w:document>"
+                    ),
+                )
+
+            with patch.object(document_text_extractor, "MANAGED_DOWNLOAD_STABLE_POLLS", 1):
+                fallback = document_text_extractor._extract_text_via_managed_download_fallback(
+                    driver,
+                    logger=logger,
+                    started_at=0.0,
+                    timeout_seconds=0.2,
+                )
+
+            self.assertEqual(fallback["mode"], "zip_docx")
+            self.assertIn("Teste DOCX automatico do ACT", fallback["text"])
+            self.assertFalse(docx_path.exists())
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_extract_document_snapshot_uses_managed_download_fallback_when_anchor_fallback_is_empty(self) -> None:
+        clock = FakeClock()
+        driver = FakeDriverSwitchOnly()
+        logger = DummyLogger()
+        blank_state = {
+            "url": "about:blank",
+            "title": "Documento",
+            "text": "",
+        }
+
+        with patch(
+            "app.rpa.sei.document_text_extractor._switch_to_visualizacao_iframe",
+            return_value=True,
+        ), patch(
+            "app.rpa.sei.document_text_extractor._read_visualizacao_state",
+            return_value=blank_state,
+        ), patch(
+            "app.rpa.sei.document_text_extractor._extract_pdf_text_via_anchor_fallback",
+            return_value={},
+        ) as anchor_mock, patch(
+            "app.rpa.sei.document_text_extractor._extract_text_via_managed_download_fallback",
+            return_value={
+                "text": "conteudo docx automatico",
+                "mode": "zip_docx",
+                "source_url": "C:/temp/Minuta_ACT.docx",
+            },
+        ) as managed_mock, patch(
+            "app.rpa.sei.document_text_extractor._should_trigger_early_file_fallback",
+            return_value=True,
+        ), patch(
+            "app.rpa.sei.document_text_extractor._extract_tables_in_current_context",
+            return_value=[],
+        ), patch(
+            "app.rpa.sei.document_text_extractor.time.time",
+            side_effect=clock.time,
+        ), patch(
+            "app.rpa.sei.document_text_extractor.time.sleep",
+            side_effect=clock.sleep,
+        ):
+            snapshot = document_text_extractor.extract_document_snapshot(driver, logger=logger)
+
+        self.assertEqual(snapshot["extraction_mode"], "zip_docx")
+        self.assertEqual(snapshot["text"], "conteudo docx automatico")
+        anchor_mock.assert_called_once()
+        managed_mock.assert_called_once()
+        self.assertLess(clock.time(), 0.5)
 
     def test_extract_document_snapshot_keeps_html_path_when_content_progresses(self) -> None:
         clock = FakeClock()
