@@ -1,18 +1,16 @@
 # dashboard_sei
 
-Automacao Selenium para coleta assistida no SEI + dashboard Streamlit para analise local de CSV.
+Automacao Selenium para coleta assistida no SEI e dashboard Streamlit para analise da ultima rodada.
 
 ## Visao geral
 
-O sistema tem dois blocos independentes:
+O projeto tem dois blocos conectados:
 
 1. `backend/main.py`
-Executa a navegacao no SEI, entra nos internos filtrados, abre processos, localiza o Plano de Trabalho mais recente e gera artefatos em `backend/output/` por padrao.
+   Executa a coleta no SEI e gera artefatos em `backend/output/` e logs em `output/`.
 
 2. `dashboard_streamlit.py`
-Le um CSV canonico em `output/sei_dashboard.csv` na raiz do repositorio. Se esse arquivo nao existir, sobe com dados de exemplo.
-
-Hoje nao existe integracao automatica entre esses dois blocos. O backend gera artefatos tecnicos e analiticos em `backend/output/`; o dashboard consome outro contrato de dados.
+   Le os arquivos `*_latest` gerados pelo backend, mostra a ultima rodada em abas separadas por tipo documental e permite disparar uma nova coleta com login manual.
 
 ## Setup rapido
 
@@ -34,55 +32,37 @@ python backend/main.py
 
 Flags uteis:
 
-- `--debug`: forca log em `DEBUG`
-- `--manual-login`: espera login manual
-- `--auto-login`: tenta login com credenciais
+- `--debug`
+- `--manual-login`
+- `--auto-login`
 - `--max-internos N`
 - `--max-processos N`
-- `--no-stop-at-filter`: abre o filtro do processo e mantem a aba aberta para depuracao manual
+- `--no-stop-at-filter`
 
 Exemplo:
 
 ```bash
-python backend/main.py --debug --manual-login --max-internos 2 --max-processos 3
+python backend/main.py --manual-login --max-internos 2 --max-processos 3
 ```
 
-## Fluxo real do backend
+## Artefatos usados pela dashboard
 
-1. Carrega `.env`, logs e Chrome WebDriver.
-2. Abre o SEI e confirma o pos-login.
-3. Fecha pop-up inicial, se existir.
-4. Navega em `Bloco > Interno`.
-5. Lista internos e filtra por `DESCRICOES_BUSCA`.
-6. Para cada interno selecionado:
-   - reabre a lista na pagina correta;
-   - entra no interno;
-   - se a descricao for `PARCERIAS VIGENTES`, gera `parcerias_vigentes_latest.csv`;
-   - lista os processos;
-   - abre cada processo;
-   - abre todas as pastas;
-   - aciona `Pesquisar no Processo`;
-   - busca `PLANO DE TRABALHO - PT`;
-   - abre o documento mais recente;
-   - extrai snapshot textual/tabelas do documento;
-   - salva JSON, CSV raw e relatorios de acompanhamento.
-7. Ao fim da rodada, normaliza os JSONs de PT e gera CSVs consolidados.
+Fontes principais:
 
-## Artefatos gerados pelo backend
+- `backend/output/dashboard_ready_latest.csv`
+- `backend/output/pt_normalizado_latest.csv`
+- `backend/output/pt_auditoria_latest.csv`
+- `backend/output/act_normalizado_latest.csv`
+- `backend/output/memorando_normalizado_latest.csv`
+- `backend/output/ted_normalizado_latest.csv`
+- `backend/output/pt_status_execucao_latest.csv`
+- `backend/output/act_status_execucao_latest.csv`
+- `backend/output/memorando_status_execucao_latest.csv`
+- `backend/output/ted_status_execucao_latest.csv`
+- `backend/output/performance_analysis.json`
+- `output/execution_log_latest.json`
 
-Por padrao em `backend/output/`:
-
-- `parcerias_vigentes_latest.csv`
-- `plano_trabalho_<processo>.json`
-- `pt_fields_raw.csv`
-- `pt_status_execucao_latest.csv`
-- `pt_sem_prazo_latest.csv`
-- `pt_normalizado_latest.csv`
-- `pt_normalizado_completo_latest.csv`
-
-Observacao importante:
-
-- Cada execucao limpa esses artefatos `*_latest` e os `plano_trabalho_*.json` anteriores antes de iniciar uma nova rodada.
+A dashboard trabalha apenas com a ultima rodada. Nao ha historico entre execucoes.
 
 ## Dashboard
 
@@ -92,11 +72,28 @@ Execucao:
 streamlit run dashboard_streamlit.py
 ```
 
-Entrada esperada:
+Abas disponiveis:
 
-- `output/sei_dashboard.csv`
+- `Coleta`
+- `Visao Geral`
+- `PT`
+- `ACT`
+- `Memorando`
+- `TED`
 
-Se o arquivo nao existir, o app mostra um warning e usa dados de exemplo.
+### O que a dashboard faz
+
+- dispara a coleta pelo botao `Executar coleta`
+- encapsula `python backend/main.py --manual-login`
+- permite limitar `max_internos` e `max_processos`
+- aplica filtros globais por processo, parceiro, qualidade e presenca documental
+- separa a analise por tipo documental para nao misturar PT, ACT, Memorando e TED
+
+### Observacao operacional
+
+- o botao da dashboard usa `manual login`
+- os dados sao recarregados a partir dos arquivos `*_latest`
+- se um arquivo ainda nao existir, a dashboard mostra estado vazio em vez de dados de exemplo
 
 ## Variaveis principais de ambiente
 
@@ -112,21 +109,18 @@ Se o arquivo nao existir, o app mostra um warning e usa dados de exemplo.
 - `OUTPUT_DIR`
 - `DESCRICOES_BUSCA`
 - `DESCRICOES_MATCH_MODE`
+- `DOCUMENT_TYPES`
 - `EXPORT_RAW_FIELDS_CSV`
 - `TESSERACT_CMD`
 - `POPPLER_PATH`
 
 ## Dependencias opcionais de extracao
 
-O extrator tenta ler o documento diretamente do DOM. Quando o PT esta como anexo/PDF, o fallback usa:
+Quando o documento precisa de fallback por arquivo, o backend pode usar:
 
 - `requests`
-- `pypdf` ou `PyPDF2`
+- `pypdf`
 - `pdf2image`
 - `pytesseract`
 
-`TESSERACT_CMD` e `POPPLER_PATH` ajudam em ambientes Windows onde OCR/conversao nao estao no `PATH`.
-
-## VS Code debug
-
-Use a configuracao `Backend SEI (Debug)` em `.vscode/launch.json`.
+Em Windows, `TESSERACT_CMD` e `POPPLER_PATH` ajudam quando OCR e conversao nao estao no `PATH`.
