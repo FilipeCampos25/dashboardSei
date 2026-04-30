@@ -4,20 +4,21 @@ from app.documents.cooperation_common import CooperationDocumentHandler
 from app.documents.types import DocumentTypeSpec
 from app.services.act_normalizer import DOC_CLASS_TED
 
-TED_SEARCH_TERMS = (
-    "TED - TERMO DE EXECUCAO DESCENTRALIZADA",
-    "TED - TERMO DE EXECUÇÃO DESCENTRALIZADA",
-    "TED -Termo de Execucao Descentralizada",
-    "TED -Termo de Execução Descentralizada",
-    "TED - Termo de Execucao Descentralizada",
+TED_FILTER_TYPE_ALIASES = (
+    "Termo de Execução Descentralizada",
+    "Termo de Execucao Descentralizada",
     "TED - Termo de Execução Descentralizada",
+    "TED - Termo de Execucao Descentralizada",
+    "TED",
 )
 
+TED_SEARCH_TERMS = TED_FILTER_TYPE_ALIASES
+
 TED_TREE_MATCH_TERMS = (
-    "ted - termo de execucao descentralizada",
     "ted - termo de execução descentralizada",
-    "termo de execucao descentralizada",
+    "ted - termo de execucao descentralizada",
     "termo de execução descentralizada",
+    "termo de execucao descentralizada",
 )
 
 
@@ -38,8 +39,5 @@ def build_ted_document_type() -> DocumentTypeSpec:
             status_filename="ted_status_execucao_latest.csv",
         ),
         accepted_doc_classes=(DOC_CLASS_TED,),
-        filter_type_aliases=(
-            "Termo de Execução Descentralizada",
-            "TED - Termo de Execução Descentralizada",
-        ),
+        filter_type_aliases=TED_FILTER_TYPE_ALIASES,
     )

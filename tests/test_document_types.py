@@ -49,6 +49,18 @@ class DocumentTypesTests(unittest.TestCase):
         self.assertTrue(any("TED -" in term for term in ted.search_terms))
         self.assertEqual(ted.snapshot_prefix, "termo_execucao_descentralizada")
         self.assertEqual(ted.accepted_doc_classes, ("ted",))
+        self.assertEqual(
+            ted.filter_type_aliases,
+            (
+                "Termo de Execução Descentralizada",
+                "Termo de Execucao Descentralizada",
+                "TED - Termo de Execução Descentralizada",
+                "TED - Termo de Execucao Descentralizada",
+                "TED",
+            ),
+        )
+        self.assertIn("termo de execução descentralizada", ted.tree_match_terms)
+        self.assertIn("termo de execucao descentralizada", ted.tree_match_terms)
 
     def test_unknown_document_type_falls_back_to_pt(self) -> None:
         specs = resolve_document_types("foo")

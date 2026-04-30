@@ -99,6 +99,35 @@ class InternoRow:
 
 
 @dataclass
+class InternalBlockProfile:
+    key: str
+    description_patterns: tuple[str, ...]
+    document_type_keys: tuple[str, ...]
+    collect_preview: bool = False
+    preview_strategy: str | None = None
+    enabled: bool = True
+
+
+INTERNAL_BLOCK_PROFILES: tuple[InternalBlockProfile, ...] = (
+    InternalBlockProfile(
+        key="parcerias_vigentes",
+        description_patterns=("PARCERIAS VIGENTES",),
+        document_type_keys=("pt", "act", "memorando"),
+        collect_preview=True,
+        preview_strategy="parcerias_vigentes",
+    ),
+    InternalBlockProfile(
+        key="ted",
+        description_patterns=(
+            "TERMO DE EXECUCAO DESCENTRALIZADA",
+            "TERMO DE EXECUÇÃO DESCENTRALIZADA",
+        ),
+        document_type_keys=("ted",),
+    ),
+)
+
+
+@dataclass
 class PesquisaFilterSession:
     state: str = document_search.PESQUISA_STATE_INACTIVE
     last_term: str = ""
@@ -381,10 +410,60 @@ class SEIScraper:
                 self.logger.info("Limitando processos por interno para %d", max_processos_por_interno)
 
             for selecionado, selected_target, list_url in selecionados:
+                profile = self._resolve_internal_block_profile(selecionado.descricao)
+                if profile is None:
+                    self.logger.warning(
+                        "Interno %s (%s): nenhum profile conhecido; documentos nao serao buscados.",
+                        selecionado.numero_interno,
+                        selecionado.descricao,
+                    )
+                    continue
+
+                document_types_for_interno = self._get_document_types_for_profile(profile)
+                if not document_types_for_interno:
+                    self.logger.warning(
+                        "Interno %s (%s): profile=%s sem document types disponiveis; interno sera ignorado.",
+                        selecionado.numero_interno,
+                        selecionado.descricao,
+                        profile.key,
+                    )
+                    continue
+
+                self.logger.info(
+                    "Interno %s (%s): profile=%s document_types=%s",
+                    selecionado.numero_interno,
+                    selecionado.descricao,
+                    profile.key,
+                    ", ".join(spec.key for spec in document_types_for_interno),
+                )
+
                 if not self._click_selected_interno(selecionado, selected_target, list_url):
                     continue
 
-                self._collect_preview_if_parcerias_vigencias()
+                if profile.collect_preview and profile.preview_strategy == "parcerias_vigentes":
+                    self.logger.info(
+                        "Interno %s (%s): profile=%s preview_strategy=%s; iniciando preview.",
+                        selecionado.numero_interno,
+                        selecionado.descricao,
+                        profile.key,
+                        profile.preview_strategy,
+                    )
+                    self._collect_preview_if_parcerias_vigencias()
+                elif profile.collect_preview:
+                    self.logger.warning(
+                        "Interno %s (%s): profile=%s solicitou preview_strategy=%s sem suporte; preview sera ignorado.",
+                        selecionado.numero_interno,
+                        selecionado.descricao,
+                        profile.key,
+                        profile.preview_strategy,
+                    )
+                else:
+                    self.logger.info(
+                        "Interno %s (%s): profile=%s sem preview; seguindo para listagem de processos.",
+                        selecionado.numero_interno,
+                        selecionado.descricao,
+                        profile.key,
+                    )
                 processos = self._list_processos()
                 if max_processos_por_interno is not None:
                     processos = processos[:max_processos_por_interno]
@@ -401,7 +480,7 @@ class SEIScraper:
                         self._wait_page_ready_in_processo()
                         self.logger.info("Processo %s: clicando Abrir todas as Pastas", proc)
                         self._click_abrir_todas_as_pastas()
-                        for document_type in self._get_document_types_for_process():
+                        for document_type in document_types_for_interno:
                             self._run_document_search_for_process(proc, document_type)
 
                         if stop_at_filter:
@@ -1255,7 +1334,7 @@ class SEIScraper:
         return bool(getattr(self, "_process_act_found", {}).get(processo, False))
 
     def _should_use_tree_fallback(self, document_type: DocumentTypeSpec) -> bool:
-        return document_type.key in {"pt", "act"}
+        return document_type.key in {"pt", "act", "ted"}
 
     def _set_process_act_found(self, processo: str, found: bool) -> None:
         act_state = getattr(self, "_process_act_found", None)
@@ -1265,19 +1344,6 @@ class SEIScraper:
         act_state[processo] = bool(found)
 
     def _should_run_document_search(self, processo: str, document_type: DocumentTypeSpec) -> bool:
-        if document_type.key != "ted":
-            return True
-        if not self._has_prior_act_for_process(processo):
-            self.logger.info("Processo %s: TED skip: sem ACT prévio", processo)
-            collection_context = self._build_collection_context(
-                found=False,
-                found_in="skipped",
-                search_term="transferegov_api",
-                selection_reason="skipped_without_prior_act",
-                selection_detail="TED skip: sem ACT prévio",
-            )
-            self._record_document_search_outcome(processo, document_type, collection_context)
-            return False
         return True
 
     def _run_document_search_for_process(self, processo: str, document_type: DocumentTypeSpec) -> bool:
@@ -1295,8 +1361,7 @@ class SEIScraper:
             if not self._should_run_document_search(processo, document_type):
                 return False
             if document_type.key == "ted":
-                ted_payload = self._process_ted_via_api(processo, document_type)
-                return ted_payload is not None
+                self.logger.info("Processo %s: TED será coletado via Selenium/SEI.", processo)
 
             if span_prefix is not None:
                 self.performance_profiler.start_span(f"{span_prefix}:busca")
@@ -1461,8 +1526,7 @@ class SEIScraper:
 
     def _ensure_document_search_open(self, processo: str, document_type: DocumentTypeSpec) -> None:
         if document_type.key == "ted":
-            self.logger.info("Processo %s: TED usa exclusivamente API; filtro Selenium ignorado.", processo)
-            return
+            self.logger.info("Processo %s: TED seguirá abertura do filtro via Selenium/SEI.", processo)
         if self._should_log_pesquisa_debug():
             document_search.log_debug_pesquisa_state(
                 self.driver,
@@ -1573,6 +1637,25 @@ class SEIScraper:
 
     def _get_document_type(self, key: str) -> Optional[DocumentTypeSpec]:
         return self.document_types_by_key.get(key)
+
+    def _get_document_types_for_profile(self, profile: InternalBlockProfile) -> List[DocumentTypeSpec]:
+        resolved: List[DocumentTypeSpec] = []
+        seen: Set[str] = set()
+        for key in profile.document_type_keys:
+            if key in seen:
+                continue
+            seen.add(key)
+
+            spec = self._get_document_type(key)
+            if spec is None:
+                self.logger.warning(
+                    "Internal block profile '%s' references unknown document type key '%s'.",
+                    profile.key,
+                    key,
+                )
+                continue
+            resolved.append(spec)
+        return resolved
 
     def _get_document_types_for_outputs(self) -> List[DocumentTypeSpec]:
         document_types = list(self.document_types)
@@ -2224,8 +2307,7 @@ class SEIScraper:
         process_url: Optional[str] = None,
     ) -> bool:
         if document_type.key == "ted":
-            self.logger.info("Processo %s: TED usa exclusivamente API; arvore Selenium ignorada.", processo)
-            return False
+            self.logger.info("Processo %s: TED seguirá fallback da árvore via Selenium/SEI quando necessário.", processo)
         candidates = self._find_document_candidates_in_tree(document_type)
         if not candidates:
             return False
@@ -2367,8 +2449,7 @@ class SEIScraper:
         document_type: DocumentTypeSpec,
     ) -> bool:
         if document_type.key == "ted":
-            self.logger.info("Processo %s: TED usa exclusivamente API; busca Selenium ignorada.", processo)
-            return False
+            self.logger.info("Processo %s: TED seguirá busca via Selenium/SEI.", processo)
         collection_context = self._build_collection_context(found=False, found_in="filter")
         processo_handle = ""
         process_url = (self.driver.current_url or "").strip()
@@ -2948,6 +3029,28 @@ class SEIScraper:
         if self.descricao_match_mode == "equals":
             return descricao_normalizada == alvo_normalizado
         return alvo_normalizado in descricao_normalizada
+
+    def _resolve_internal_block_profile(self, descricao: str) -> InternalBlockProfile | None:
+        descricao_normalizada = self._normalize_text(descricao)
+        if not descricao_normalizada:
+            return None
+
+        for profile in INTERNAL_BLOCK_PROFILES:
+            if not profile.enabled:
+                continue
+
+            for pattern in profile.description_patterns:
+                pattern_normalizado = self._normalize_text(pattern)
+                if pattern_normalizado and pattern_normalizado in descricao_normalizada:
+                    self.logger.debug(
+                        "Resolved internal block profile '%s' for descricao='%s'.",
+                        profile.key,
+                        descricao,
+                    )
+                    return profile
+
+        self.logger.debug("No internal block profile matched descricao='%s'.", descricao)
+        return None
 
     def _is_valid_descricao_candidate(self, text: str, numero_normalizado: str) -> bool:
         normalized = self._normalize_text(text)
@@ -3811,7 +3914,7 @@ class SEIScraper:
         if any(marker in blob for marker in invalid_search_markers):
             return (False, "pagina_de_pesquisa", None)
 
-        if document_type.key in {"act", "memorando"}:
+        if document_type.key in {"act", "memorando", "ted"}:
             analysis = classify_cooperation_snapshot(snapshot, document_type.key, collection_context, processo=processo)
             return (True, str(analysis.get("doc_class", "") or "ok"), analysis)
 
@@ -3894,7 +3997,7 @@ class SEIScraper:
                         document_type.log_label,
                         output_path,
                     )
-                if document_type.key in {"act", "memorando"}:
+                if document_type.key in {"act", "memorando", "ted"}:
                     is_canonical = bool((analysis or {}).get("validation_status") == VALIDATION_STATUS_VALID)
                     if not is_canonical:
                         candidate_detail = self._describe_candidate_for_logs(

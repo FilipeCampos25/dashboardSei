@@ -1376,6 +1376,40 @@ class WaitOptimizationTests(unittest.TestCase):
 
         debug_mock.assert_not_called()
 
+    def test_ensure_document_search_open_allows_ted_via_selenium(self) -> None:
+        scraper = scraping.SEIScraper.__new__(scraping.SEIScraper)
+        scraper.logger = Mock()
+        scraper.timeout_seconds = 20
+        scraper.driver = FakeScraperDriver()
+        scraper.selectors = {}
+        scraper.settings = SimpleNamespace(debug=False)
+        scraper._process_filter_degraded = {}
+        scraper._process_filter_recovery_attempts = {}
+        document_type = make_document_type("ted", "TED - Termo de Execucao Descentralizada")
+
+        with patch.object(scraping.SEIScraper, "_click_pesquisar_no_processo", autospec=True) as click_mock, patch.object(
+            scraping.SEIScraper,
+            "_capture_process_filter_session",
+            autospec=True,
+        ) as capture_mock, patch.object(
+            scraping.SEIScraper,
+            "_try_restore_process_filter_session",
+            autospec=True,
+            return_value=False,
+        ), patch("app.rpa.scraping.toolbar_actions.wait_pesquisa_anchor", return_value=None):
+            scraping.SEIScraper._ensure_document_search_open(
+                scraper,
+                "60093.000015/2020-60",
+                document_type,
+            )
+
+        click_mock.assert_not_called()
+        capture_mock.assert_called_once_with(scraper, "60093.000015/2020-60")
+        scraper.logger.info.assert_any_call(
+            "Processo %s: TED seguirá abertura do filtro via Selenium/SEI.",
+            "60093.000015/2020-60",
+        )
+
     def test_ensure_document_search_open_does_not_loop_after_second_stagnation(self) -> None:
         scraper = scraping.SEIScraper.__new__(scraping.SEIScraper)
         scraper.logger = DummyLogger()
@@ -1771,13 +1805,6 @@ class WaitOptimizationTests(unittest.TestCase):
     def test_busca_tipos_baixa_relevancia_pula_fallback_da_arvore_apos_zero_resultado(self) -> None:
         cases = (
             (
-                "ted",
-                "Termo de Execucao Descentralizada",
-                "TED",
-                ("TED - Termo de Execucao Descentralizada",),
-                ("termo de execucao descentralizada",),
-            ),
-            (
                 "memorando",
                 "Memorando de Entendimentos",
                 "MEMORANDO",
@@ -1834,27 +1861,154 @@ class WaitOptimizationTests(unittest.TestCase):
 
                 self.assertFalse(result)
                 scraper._open_document_via_tree.assert_not_called()
-                if key == "ted":
-                    scraper._record_document_search_outcome.assert_not_called()
-                else:
-                    scraper._record_document_search_outcome.assert_called_once()
-                    outcome = scraper._record_document_search_outcome.call_args.args[2]
-                    self.assertEqual(outcome["selection_reason"], "not_found_after_filter")
-                    self.assertEqual(outcome["selection_detail"], "nao encontrado no filtro")
-                if key == "ted":
-                    self.assertTrue(
-                        any(
-                            "TED usa exclusivamente API; busca Selenium ignorada." in str(call.args[0])
-                            for call in scraper.logger.info.call_args_list
-                        )
+                scraper._record_document_search_outcome.assert_called_once()
+                outcome = scraper._record_document_search_outcome.call_args.args[2]
+                self.assertEqual(outcome["selection_reason"], "not_found_after_filter")
+                self.assertEqual(outcome["selection_detail"], "nao encontrado no filtro")
+                self.assertTrue(
+                    any(
+                        "fallback skip: baixa relevância do tipo." in str(call.args[0])
+                        for call in scraper.logger.info.call_args_list
                     )
-                else:
-                    self.assertTrue(
-                        any(
-                            "fallback skip: baixa relevância do tipo." in str(call.args[0])
-                            for call in scraper.logger.info.call_args_list
-                        )
+                )
+                self.assertFalse(
+                    any(
+                        "TED usa exclusivamente API; busca Selenium ignorada." in str(call.args[0])
+                        for call in scraper.logger.info.call_args_list
                     )
+                )
+
+    def test_busca_ted_tenta_fallback_da_arvore_apos_zero_resultado(self) -> None:
+        scraper = scraping.SEIScraper.__new__(scraping.SEIScraper)
+        scraper.logger = Mock()
+        scraper.timeout_seconds = 20
+        scraper.driver = FakeScraperDriver()
+        scraper._process_filter_degraded = {}
+        scraper._process_filter_recovery_attempts = {}
+        scraper._normalize_text = scraping.SEIScraper._normalize_text.__get__(scraper, scraping.SEIScraper)
+        scraper._build_collection_context = scraping.SEIScraper._build_collection_context.__get__(scraper, scraping.SEIScraper)
+        scraper._record_document_search_outcome = Mock()
+        scraper._close_opened_doc_tabs = lambda *args, **kwargs: None
+        scraper._open_document_via_tree = Mock(return_value=True)
+        scraper._search_document_in_filter = Mock(
+            return_value=(
+                [],
+                scraper._build_collection_context(
+                    found=False,
+                    found_in="filter",
+                    search_term="TED - Termo de Execucao Descentralizada",
+                    results_count=0,
+                    selection_reason="no_results_in_filter",
+                    selection_detail="sem resultados no filtro",
+                ),
+            )
+        )
+        document_type = make_document_type("ted", "TED - Termo de Execucao Descentralizada")
+
+        result = scraping.SEIScraper._buscar_e_abrir_documento_mais_recente(
+            scraper,
+            "60093.000015/2020-60",
+            document_type,
+        )
+
+        self.assertTrue(result)
+        scraper._open_document_via_tree.assert_called_once_with(
+            "60093.000015/2020-60",
+            document_type,
+            process_url="https://sei.defesa.gov.br/processo",
+        )
+        scraper._record_document_search_outcome.assert_not_called()
+
+    def test_open_document_via_tree_allows_ted_to_reach_tree_lookup(self) -> None:
+        scraper = scraping.SEIScraper.__new__(scraping.SEIScraper)
+        scraper.logger = Mock()
+        scraper._find_document_candidates_in_tree = Mock(return_value=[])
+        document_type = make_document_type("ted", "TED - Termo de Execucao Descentralizada")
+
+        result = scraping.SEIScraper._open_document_via_tree(
+            scraper,
+            "60093.000015/2020-60",
+            document_type,
+        )
+
+        self.assertFalse(result)
+        scraper._find_document_candidates_in_tree.assert_called_once_with(document_type)
+        scraper.logger.info.assert_any_call(
+            "Processo %s: TED seguirá fallback da árvore via Selenium/SEI quando necessário.",
+            "60093.000015/2020-60",
+        )
+
+    def test_extract_and_process_document_snapshot_returns_false_for_noncanonical_ted(self) -> None:
+        scraper = scraping.SEIScraper.__new__(scraping.SEIScraper)
+        scraper.logger = Mock()
+        scraper.driver = Mock(
+            current_url="https://sei.defesa.gov.br/processo",
+            title="SEI - Processo",
+        )
+        scraper.settings = SimpleNamespace()
+        scraper.performance_profiler = SimpleNamespace(
+            start_span=lambda *args, **kwargs: None,
+            end_span=lambda *args, **kwargs: None,
+        )
+        scraper._normalize_text = scraping.SEIScraper._normalize_text.__get__(scraper, scraping.SEIScraper)
+        scraper._snapshot_text_blob = scraping.SEIScraper._snapshot_text_blob.__get__(scraper, scraping.SEIScraper)
+        scraper._validate_snapshot_for_document_type = scraping.SEIScraper._validate_snapshot_for_document_type.__get__(
+            scraper,
+            scraping.SEIScraper,
+        )
+        scraper._describe_candidate_for_logs = scraping.SEIScraper._describe_candidate_for_logs.__get__(
+            scraper,
+            scraping.SEIScraper,
+        )
+        scraper._resolve_preview_output_dir = Mock(return_value=Path.cwd())
+        handler = Mock()
+        handler.process_snapshot = Mock(return_value=None)
+        document_type = DocumentTypeSpec(
+            key="ted",
+            display_name="Termo de Execucao Descentralizada",
+            search_terms=("TED",),
+            tree_match_terms=("ted",),
+            snapshot_prefix="termo_execucao_descentralizada",
+            log_label="TED",
+            cleanup_patterns=(),
+            handler=handler,
+        )
+        snapshot = {
+            "title": "Termo de Execução Descentralizada (1º ADITIVO)",
+            "url": "https://sei.defesa.gov.br/documento?id_documento=3665688",
+            "text": (
+                "1º TERMO ADITIVO VINCULADO AO TERMO DE EXECUÇÃO DESCENTRALIZADA Nº 02/CENSIPAM/2017. "
+                "DADOS CADASTRAIS DA UNIDADE DESCENTRALIZADORA."
+            ),
+            "tables": [],
+            "extraction_mode": "html_dom",
+        }
+        collection_context = {
+            "chosen_documento": "Termo de Execução Descentralizada (1º ADITIVO) (3665688)",
+            "found_in": "tree",
+        }
+
+        with patch("app.rpa.scraping.get_iframes_info", return_value=[]), patch(
+            "app.rpa.scraping.document_text_extractor.extract_document_snapshot",
+            return_value=snapshot,
+        ):
+            result = scraping.SEIScraper._extract_and_process_document_snapshot(
+                scraper,
+                "60090.000395/2020-62",
+                "60090.000395/2020-62",
+                document_type,
+                collection_context,
+            )
+
+        self.assertFalse(result)
+        handler.process_snapshot.assert_called_once()
+        scraper.logger.warning.assert_any_call(
+            "Processo %s: snapshot de %s retido apenas na silver. doc_class=%s motivo=%s",
+            "60090.000395/2020-62",
+            "TED",
+            "termo_aditivo",
+            "cabecalho_termo_aditivo",
+        )
 
     def test_busca_act_reabre_filtro_em_sessao_limpa_apos_zero_resultado(self) -> None:
         scraper = scraping.SEIScraper.__new__(scraping.SEIScraper)
@@ -2328,19 +2482,13 @@ class WaitOptimizationTests(unittest.TestCase):
 
         self.assertEqual([spec.key for spec in ordered], ["act", "ted", "pt"])
 
-    def test_run_document_search_for_process_skips_ted_without_prior_act(self) -> None:
+    def test_run_document_search_for_process_executes_ted_without_prior_act(self) -> None:
         scraper = scraping.SEIScraper.__new__(scraping.SEIScraper)
         scraper.logger = Mock()
-        scraper._build_collection_context = scraping.SEIScraper._build_collection_context.__get__(scraper, scraping.SEIScraper)
-        scraper._normalize_text = scraping.SEIScraper._normalize_text.__get__(scraper, scraping.SEIScraper)
-        scraper._dedupe_terms = scraping.SEIScraper._dedupe_terms.__get__(scraper, scraping.SEIScraper)
-        scraper._iter_unique_filter_terms = scraping.SEIScraper._iter_unique_filter_terms.__get__(
-            scraper,
-            scraping.SEIScraper,
-        )
-        scraper._record_document_search_outcome = Mock()
+        scraper.performance_profiler = Mock(start_span=Mock(), end_span=Mock())
         scraper._ensure_document_search_open = Mock()
-        scraper._buscar_e_abrir_documento_mais_recente = Mock(return_value=False)
+        scraper._buscar_e_abrir_documento_mais_recente = Mock(return_value=True)
+        scraper._process_ted_via_api = Mock(return_value={"numero_processo": "60093000015202060"})
         document_type = make_document_type("ted", "TED - Termo de Execucao Descentralizada")
 
         result = scraping.SEIScraper._run_document_search_for_process(
@@ -2349,14 +2497,11 @@ class WaitOptimizationTests(unittest.TestCase):
             document_type,
         )
 
-        self.assertFalse(result)
-        scraper._ensure_document_search_open.assert_not_called()
-        scraper._buscar_e_abrir_documento_mais_recente.assert_not_called()
-        scraper._record_document_search_outcome.assert_called_once()
-        outcome = scraper._record_document_search_outcome.call_args.args[2]
-        self.assertEqual(outcome["selection_reason"], "skipped_without_prior_act")
-        self.assertEqual(outcome["selection_detail"], "TED skip: sem ACT prévio")
-        scraper.logger.info.assert_any_call("Processo %s: TED skip: sem ACT prévio", "60093.000015/2020-60")
+        self.assertTrue(result)
+        scraper._ensure_document_search_open.assert_called_once_with("60093.000015/2020-60", document_type)
+        scraper._buscar_e_abrir_documento_mais_recente.assert_called_once_with("60093.000015/2020-60", document_type)
+        scraper._process_ted_via_api.assert_not_called()
+        scraper.logger.info.assert_any_call("Processo %s: TED será coletado via Selenium/SEI.", "60093.000015/2020-60")
 
     def test_run_document_search_for_process_executes_ted_after_act_found(self) -> None:
         scraper = scraping.SEIScraper.__new__(scraping.SEIScraper)
@@ -2382,9 +2527,9 @@ class WaitOptimizationTests(unittest.TestCase):
         self.assertTrue(act_result)
         self.assertTrue(ted_result)
         self.assertTrue(scraping.SEIScraper._has_prior_act_for_process(scraper, "60093.000015/2020-60"))
-        self.assertEqual(scraper._ensure_document_search_open.call_count, 1)
-        self.assertEqual(scraper._buscar_e_abrir_documento_mais_recente.call_count, 1)
-        scraper._process_ted_via_api.assert_called_once_with("60093.000015/2020-60", ted_document_type)
+        self.assertEqual(scraper._ensure_document_search_open.call_count, 2)
+        self.assertEqual(scraper._buscar_e_abrir_documento_mais_recente.call_count, 2)
+        scraper._process_ted_via_api.assert_not_called()
 
     def test_process_ted_via_api_skips_when_no_instrument_number_is_linked(self) -> None:
         scraper = scraping.SEIScraper.__new__(scraping.SEIScraper)
