@@ -25,10 +25,83 @@ from app.services.act_normalizer import (
     classify_act_snapshot,
     classify_cooperation_snapshot,
     export_normalized_csv,
+    resolve_act_vigencia,
 )
 
 
 class ACTNormalizerTests(unittest.TestCase):
+    def test_resolve_act_vigencia_uses_signature_base_date(self) -> None:
+        result = resolve_act_vigencia(
+            "O prazo de vigencia sera de 5 anos a partir da data da ultima assinatura.",
+            data_assinatura="2024-02-10",
+            data_publicacao="2024-03-01",
+            outras_datas=[],
+        )
+        self.assertEqual(result["vigencia_inicio"], "2024-02-10")
+        self.assertEqual(result["vigencia_fim"], "2029-02-09")
+        self.assertEqual(result["anchor"], "assinatura")
+        self.assertEqual(result["warning"], "")
+
+    def test_resolve_act_vigencia_uses_publication_base_date(self) -> None:
+        result = resolve_act_vigencia(
+            "A vigencia sera de 24 meses a partir da publicacao no Diario Oficial da Uniao.",
+            data_assinatura="2024-02-10",
+            data_publicacao="2024-03-05",
+            outras_datas=[],
+        )
+        self.assertEqual(result["vigencia_inicio"], "2024-03-05")
+        self.assertEqual(result["vigencia_fim"], "2026-03-04")
+        self.assertEqual(result["anchor"], "publicacao")
+        self.assertEqual(result["warning"], "")
+
+    def test_resolve_act_vigencia_warns_when_base_date_is_missing(self) -> None:
+        result = resolve_act_vigencia(
+            "A vigencia sera de 12 meses a partir da publicacao no Diario Oficial da Uniao.",
+            data_assinatura="",
+            data_publicacao="",
+            outras_datas=["2024-01-01"],
+        )
+        self.assertEqual(result["vigencia_inicio"], "")
+        self.assertEqual(result["vigencia_fim"], "")
+        self.assertEqual(result["warning"], "vigencia_dependente_publicacao_sem_data")
+
+    def test_resolve_act_vigencia_uses_explicit_period_without_inventing_base_date(self) -> None:
+        result = resolve_act_vigencia(
+            "A vigencia sera de 01/02/2024 a 31/01/2025.",
+            data_assinatura="",
+            data_publicacao="",
+            outras_datas=[],
+        )
+        self.assertEqual(result["vigencia_inicio"], "2024-02-01")
+        self.assertEqual(result["vigencia_fim"], "2025-01-31")
+        self.assertEqual(result["anchor"], "data_explicita")
+
+    def test_build_normalized_record_accepts_requested_number_formats(self) -> None:
+        cases = {
+            "ACT nº 01/2024": "01/2024",
+            "Acordo de Cooperação Técnica nº 01/2024": "01/2024",
+            "Acordo de Cooperação Técnica 1/2021": "1/2021",
+            "ACORDO DE COOPERAÇÃO TÉCNICA Nº 77/2026": "77/2026",
+        }
+        for title, expected in cases.items():
+            with self.subTest(title=title):
+                payload = {
+                    "processo": "60090.000111/2024-10",
+                    "snapshot": {
+                        "title": title,
+                        "extraction_mode": "html_dom",
+                        "text": f"""
+                            {title}
+                            ACORDO DE COOPERAÇÃO TÉCNICA QUE ENTRE SI CELEBRAM O CENSIPAM E A UNIVERSIDADE FEDERAL DE TESTE.
+                            CLÁUSULA PRIMEIRA - DO OBJETO
+                            O objeto do presente Acordo de Cooperação Técnica é a cooperação institucional.
+                        """,
+                    },
+                    "collection": {"chosen_documento": title},
+                }
+                record = build_normalized_record(payload, Path("act.json"))
+                self.assertEqual(record["numero_acordo"], expected)
+
     def test_classify_act_snapshot_identifies_known_classes(self) -> None:
         cases = [
             (
@@ -88,6 +161,39 @@ class ACTNormalizerTests(unittest.TestCase):
         self.assertTrue(result["is_canonical_candidate"])
         self.assertEqual(result["validation_status"], VALIDATION_STATUS_VALID)
         self.assertEqual(result["publication_status"], PUBLICATION_STATUS_GOLD)
+
+    def test_classify_administrative_header_before_email_shape(self) -> None:
+        result = classify_cooperation_snapshot(
+            {
+                "title": "SEI - Memorando",
+                "text": "De: CENSIPAM\nPara: Diretoria\nAssunto: Encaminhamento\nMemorando que encaminha processo.",
+            },
+            requested_type="memorando",
+            collection_context={},
+        )
+        self.assertEqual(result["doc_class"], DOC_CLASS_MEMORANDO)
+        self.assertEqual(result["resolved_document_type"], RESOLVED_TYPE_MEMORANDO)
+        self.assertEqual(result["publication_status"], PUBLICATION_STATUS_GOLD)
+
+    def test_classify_cooperation_snapshot_accepts_related_administrative_documents(self) -> None:
+        cases = [
+            ("Oficio 12/2026", "Oficio que solicita manifestacao tecnica.", "oficio"),
+            ("Despacho", "Despacho de encaminhamento para aprovacao superior.", "despacho"),
+            ("Informacao Tecnica", "Informacao tecnica sobre a parceria.", "informacao_tecnica"),
+            ("Nota Tecnica", "Nota tecnica para subsidiar a decisao.", "nota_tecnica"),
+            ("Encaminhamento", "Encaminhamos o processo para ciencia.", "documento_administrativo_relacionado"),
+        ]
+
+        for title, text, expected_type in cases:
+            with self.subTest(expected_type=expected_type):
+                result = classify_cooperation_snapshot(
+                    {"title": title, "text": text},
+                    requested_type="memorando",
+                    collection_context={},
+                )
+                self.assertEqual(result["resolved_document_type"], expected_type)
+                self.assertTrue(result["is_canonical_candidate"])
+                self.assertEqual(result["publication_status"], PUBLICATION_STATUS_GOLD)
 
     def test_classify_act_snapshot_rejeita_documentos_relacionados_no_cabecalho(self) -> None:
         cases = [
@@ -157,6 +263,11 @@ class ACTNormalizerTests(unittest.TestCase):
         self.assertEqual(record["doc_class"], DOC_CLASS_ACT_FINAL)
         self.assertEqual(record["numero_acordo"], "1/2021")
         self.assertEqual(record["processo"], "60090.000269/2020-16")
+        self.assertEqual(record["data_assinatura"], "2021-12-20")
+        self.assertEqual(record["data_publicacao"], "")
+        self.assertIn("5 (cinco) anos", record["vigencia_raw"])
+        self.assertEqual(record["vigencia_inicio"], "2021-12-20")
+        self.assertEqual(record["vigencia_fim"], "2026-12-19")
         self.assertEqual(record["data_inicio_vigencia"], "2021-12-20")
         self.assertEqual(record["data_fim_vigencia"], "2026-12-19")
         self.assertIn("EMBRAPA", record["orgao_convenente"])
@@ -319,6 +430,8 @@ class ACTNormalizerTests(unittest.TestCase):
 
                     CLAUSULA SETIMA - DO PRAZO E VIGENCIA
                     O prazo de vigencia deste Acordo de Cooperacao Tecnica sera de 03 anos a partir da publicacao no Diario Oficial da Uniao.
+
+                    Documento assinado eletronicamente por Fulano, em 10/01/2024.
                 """,
             },
             "collection": {"chosen_documento": "Acordo de Cooperacao Tecnica 3 (6467241)"},
@@ -333,6 +446,46 @@ class ACTNormalizerTests(unittest.TestCase):
         self.assertEqual(record["unidade_responsavel"], "")
         self.assertFalse(record["relatorio_encerramento"])
         self.assertIn("vigencia_dependente_publicacao_sem_data", record["validation_warning"])
+        self.assertEqual(record["vigencia_rule_amount"], "03")
+        self.assertEqual(record["vigencia_rule_unit"], "anos")
+        self.assertEqual(record["vigencia_rule_anchor"], "publicacao")
+
+    def test_build_normalized_record_rejects_placeholder_number_and_splits_partner(self) -> None:
+        payload = {
+            "processo": "60090.000033/2021-52",
+            "snapshot": {
+                "title": "SEI - Acordo de Cooperacao Tecnica",
+                "extraction_mode": "zip_docx",
+                "text": """
+                    Acordo de Cooperacao Tecnica no XX/20XX
+                    PROCESSO No 60090.000033/2021-52
+                    Acordo de Cooperacao Tecnica que entre si celebram o CENSIPAM e o Estado Maior da Aeronautica - EMAER,
+                    por meio do Comando de Operacoes Aeroespaciais - COMAE, para os fins que especifica.
+
+                    RESOLVEM celebrar o presente ACORDO DE COOPERACAO TECNICA.
+
+                    CLAUSULA PRIMEIRA - DO OBJETO
+                    O objeto do presente Acordo de Cooperacao Tecnica e a definicao de atribuicoes e processos de trabalho.
+
+                    CLAUSULA NONA - DO PRAZO E VIGENCIA
+                    O prazo de vigencia deste Acordo de Cooperacao sera de 60 meses a partir da publicacao no Diario Oficial da Uniao.
+                """,
+            },
+            "collection": {"chosen_documento": "Acordo de Cooperacao Tecnica COMAE"},
+        }
+
+        record = build_normalized_record(payload, Path("acordo_cooperacao_tecnica_60090.000033_2021-52.json"))
+        self.assertEqual(record["numero_acordo"], "")
+        self.assertIn("numero_placeholder", record["validation_warning"])
+        self.assertEqual(record["orgao_convenente"], "Estado Maior da Aeronautica - EMAER")
+        self.assertEqual(record["orgao_convenente_nome"], "Estado Maior da Aeronautica")
+        self.assertEqual(record["orgao_convenente_sigla"], "EMAER")
+        self.assertIn("COMAE", record["orgao_intermediario"])
+        self.assertEqual(record["data_inicio_vigencia"], "")
+        self.assertEqual(record["data_fim_vigencia"], "")
+        self.assertEqual(record["vigencia_rule_amount"], "60")
+        self.assertEqual(record["vigencia_rule_unit"], "meses")
+        self.assertEqual(record["vigencia_rule_anchor"], "publicacao")
 
     def test_relatorio_encerramento_ignora_relatorio_periodico_sem_fecho(self) -> None:
         payload = {
@@ -432,8 +585,10 @@ class ACTNormalizerTests(unittest.TestCase):
 
             normalized_path = output_dir / "act_normalizado_latest.csv"
             audit_path = output_dir / "act_classificacao_latest.csv"
+            diagnostics_path = output_dir / "act_field_diagnostics_latest.csv"
             self.assertTrue(normalized_path.exists())
             self.assertTrue(audit_path.exists())
+            self.assertTrue(diagnostics_path.exists())
 
             with normalized_path.open("r", encoding="utf-8-sig", newline="") as file_obj:
                 rows = list(csv.DictReader(file_obj))
@@ -451,6 +606,12 @@ class ACTNormalizerTests(unittest.TestCase):
             self.assertIn("canon_rejection_reason", audit_rows[0])
             self.assertIn("field_source_vigencia", audit_rows[0])
             self.assertIn("validation_warning", audit_rows[0])
+
+            with diagnostics_path.open("r", encoding="utf-8-sig", newline="") as file_obj:
+                diagnostic_rows = list(csv.DictReader(file_obj))
+            self.assertIn("raw_value", diagnostic_rows[0])
+            self.assertIn("source_type", diagnostic_rows[0])
+            self.assertTrue(any(row["campo"] == "numero_acordo" for row in diagnostic_rows))
         finally:
             shutil.rmtree(output_dir, ignore_errors=True)
 

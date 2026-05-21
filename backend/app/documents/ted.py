@@ -34,6 +34,7 @@ def build_ted_document_type() -> DocumentTypeSpec:
             "termo_execucao_descentralizada_*.json",
             "ted_status_execucao_latest.csv",
             "ted_normalizado_latest.csv",
+            "ted_field_diagnostics_latest.csv",
         ),
         handler=CooperationDocumentHandler(
             status_filename="ted_status_execucao_latest.csv",

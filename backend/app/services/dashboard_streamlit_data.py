@@ -44,6 +44,21 @@ OVERVIEW_COLUMNS = [
     "quality_notes",
     "act_attempts_count",
     "act_rejection_summary",
+    "best_numero_acordo",
+    "best_numero_acordo_source",
+    "best_numero_acordo_confidence",
+    "best_parceiro",
+    "best_parceiro_source",
+    "best_parceiro_confidence",
+    "best_vigencia_inicio",
+    "best_vigencia_fim",
+    "best_vigencia_raw",
+    "best_vigencia_source",
+    "best_vigencia_confidence",
+    "best_objeto",
+    "best_objeto_source",
+    "best_objeto_confidence",
+    "normalization_issues",
 ]
 
 PT_DETAIL_COLUMNS = [

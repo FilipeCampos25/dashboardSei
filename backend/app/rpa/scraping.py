@@ -1354,21 +1354,38 @@ class SEIScraper:
             span_prefix = "tipo:ACT"
         elif document_type.key == "memorando":
             span_prefix = "tipo:Memorando"
+        tree_only_span_name = "document_search:tree_only"
+        if span_prefix is not None:
+            tree_only_span_name = f"{span_prefix}:tree_only"
+        elif document_type.key == "ted":
+            tree_only_span_name = "tipo:TED:tree_only"
 
         if span_prefix is not None:
             self.performance_profiler.start_span(f"{span_prefix}:total")
         try:
             if not self._should_run_document_search(processo, document_type):
                 return False
+            self.logger.info(
+                "Processo %s: modo_busca_documental=tree_only tipo=%s",
+                processo,
+                document_type.key,
+            )
             if document_type.key == "ted":
-                self.logger.info("Processo %s: TED será coletado via Selenium/SEI.", processo)
+                self.logger.info("Processo %s: TED sera buscado pela arvore do processo via Selenium/SEI.", processo)
+            else:
+                self.logger.info(
+                    "Processo %s: %s sera buscado pela arvore do processo.",
+                    processo,
+                    document_type.display_name,
+                )
 
             if span_prefix is not None:
                 self.performance_profiler.start_span(f"{span_prefix}:busca")
+            self.performance_profiler.start_span(tree_only_span_name)
             try:
-                self._ensure_document_search_open(processo, document_type)
-                found = self._buscar_e_abrir_documento_mais_recente(processo, document_type)
+                found = self._buscar_e_abrir_documento_pela_arvore(processo, document_type)
             finally:
+                self.performance_profiler.end_span(tree_only_span_name)
                 if span_prefix is not None:
                     self.performance_profiler.end_span(f"{span_prefix}:busca")
 
@@ -2307,7 +2324,7 @@ class SEIScraper:
         process_url: Optional[str] = None,
     ) -> bool:
         if document_type.key == "ted":
-            self.logger.info("Processo %s: TED seguirá fallback da árvore via Selenium/SEI quando necessário.", processo)
+            self.logger.info("Processo %s: TED seguira busca pela arvore via Selenium/SEI quando necessario.", processo)
         candidates = self._find_document_candidates_in_tree(document_type)
         if not candidates:
             return False
@@ -2442,6 +2459,68 @@ class SEIScraper:
                 exc,
             )
         return False
+
+    def _buscar_e_abrir_documento_pela_arvore(
+        self,
+        processo: str,
+        document_type: DocumentTypeSpec,
+    ) -> bool:
+        collection_context = self._build_collection_context(
+            found=False,
+            found_in="tree",
+            search_term="|".join(document_type.tree_match_terms),
+            results_count=0,
+        )
+        process_url = (self.driver.current_url or "").strip()
+        try:
+            self.logger.info(
+                "Processo %s: iniciando busca pela arvore do processo para o documento '%s'. contexto_pre_busca url=%s title=%s handles=%d",
+                processo,
+                document_type.display_name,
+                self.driver.current_url,
+                self.driver.title,
+                len(self.driver.window_handles),
+            )
+            if self._open_document_via_tree(processo, document_type, process_url=process_url):
+                return True
+
+            collection_context = self._build_collection_context(
+                found=False,
+                found_in="none",
+                search_term="|".join(document_type.tree_match_terms),
+                results_count=0,
+                selection_reason="not_found_after_tree",
+                selection_detail="nenhum candidato canonico localizado na arvore",
+            )
+            self._record_document_search_outcome(processo, document_type, collection_context)
+            self.logger.info(
+                "Processo %s: documento %s nao consolidado pela arvore; seguindo.",
+                processo,
+                document_type.log_label,
+            )
+            return False
+        except (TimeoutException, NoSuchElementException) as exc:
+            collection_context = self._build_collection_context(
+                found=bool(collection_context.get("found")),
+                found_in=collection_context.get("found_in", "tree"),
+                search_term=collection_context.get("search_term", "|".join(document_type.tree_match_terms)),
+                results_count=collection_context.get("results_count", 0),
+                chosen_documento=collection_context.get("chosen_documento", ""),
+                selection_reason=(
+                    collection_context.get("selection_reason")
+                    or ("tree_search_error" if isinstance(exc, NoSuchElementException) else "tree_open_error")
+                ),
+                selection_detail=collection_context.get("selection_detail", ""),
+                extraction_error=str(exc),
+            )
+            self._record_document_search_outcome(processo, document_type, collection_context)
+            self.logger.warning(
+                "Processo %s: falha resiliente ao buscar/abrir via arvore '%s' (%s); seguindo.",
+                processo,
+                collection_context.get("search_term", document_type.display_name) or document_type.display_name,
+                exc,
+            )
+            return False
 
     def _buscar_e_abrir_documento_mais_recente(
         self,
@@ -2923,6 +3002,7 @@ class SEIScraper:
                 termo,
                 exc,
             )
+
 
     def buscar_documento_mais_recente_no_filtro(
         self, termo: str, timeout_seconds: int = 20
@@ -3862,12 +3942,13 @@ class SEIScraper:
         chosen_documento = self._normalize_text(str((collection_context or {}).get("chosen_documento", "") or ""))
         title_blob = self._normalize_text(str(snapshot.get("title", "") or ""))
         text_head = self._normalize_text(str(snapshot.get("text", "") or "")[:1600])
+        text_prefix = self._normalize_text(str(snapshot.get("text", "") or "")[:400])
         title_context = " ".join(part for part in (chosen_documento, title_blob) if part)
 
         has_plano_marker = "PLANO DE TRABALHO" in text_head or "PLANO DE TRABALHO" in title_context
         has_documentacao_marker = "DOCUMENTACAO" in title_context
         has_minuta_marker = "MINUTA" in title_context or "MINUTAS" in title_context
-        has_minuta_text = bool(
+        has_minuta_text = "MINUTA" in text_prefix or "MINUTAS" in text_prefix or bool(
             re.search(r"\bMINUTA(?:\s+DE)?\s+PLANO\s+DE\s+TRABALHO\b", text_head, flags=re.IGNORECASE)
         )
 
@@ -3910,6 +3991,7 @@ class SEIScraper:
             "PESQUISAR NO PROCESSO",
             "TIPOS DE DOCUMENTOS DISPONIVEIS NESTE PROCESSO",
             "VER CRITERIOS DE PESQUISA",
+            "PROCESSO NAO POSSUI ANDAMENTOS ABERTOS",
         )
         if any(marker in blob for marker in invalid_search_markers):
             return (False, "pagina_de_pesquisa", None)

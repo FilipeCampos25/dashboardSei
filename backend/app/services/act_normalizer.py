@@ -9,9 +9,25 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from app.output import csv_writer
+from app.services.normalization_contract import (
+    CONFIDENCE_HIGH,
+    CONFIDENCE_LOW,
+    CONFIDENCE_MEDIUM,
+    SOURCE_DERIVED,
+    SOURCE_DOCUMENT_TEXT,
+    SOURCE_MISSING,
+    build_document_contract,
+    make_field,
+    make_missing_field,
+)
 
 DOC_CLASS_ACT_FINAL = "act_final"
 DOC_CLASS_MEMORANDO = "memorando"
+DOC_CLASS_OFICIO = "oficio"
+DOC_CLASS_DESPACHO = "despacho"
+DOC_CLASS_INFORMACAO_TECNICA = "informacao_tecnica"
+DOC_CLASS_NOTA_TECNICA = "nota_tecnica"
+DOC_CLASS_DOCUMENTO_ADMINISTRATIVO_RELACIONADO = "documento_administrativo_relacionado"
 DOC_CLASS_TED = "ted"
 DOC_CLASS_EXTRATO = "extrato"
 DOC_CLASS_MINUTA = "minuta"
@@ -21,7 +37,12 @@ DOC_CLASS_STUB = "stub"
 DOC_CLASS_EMAIL_OUTRO = "email_outro"
 
 RESOLVED_TYPE_ACT = "act"
-RESOLVED_TYPE_MEMORANDO = "memorando_entendimentos"
+RESOLVED_TYPE_MEMORANDO = "memorando"
+RESOLVED_TYPE_OFICIO = "oficio"
+RESOLVED_TYPE_DESPACHO = "despacho"
+RESOLVED_TYPE_INFORMACAO_TECNICA = "informacao_tecnica"
+RESOLVED_TYPE_NOTA_TECNICA = "nota_tecnica"
+RESOLVED_TYPE_DOCUMENTO_ADMINISTRATIVO_RELACIONADO = "documento_administrativo_relacionado"
 RESOLVED_TYPE_TED = "termo_execucao_descentralizada"
 RESOLVED_TYPE_ACT_RELATED = "act_relacionado"
 
@@ -32,6 +53,11 @@ SNAPSHOT_PREFIX_TED = "termo_execucao_descentralizada"
 DOC_CLASS_PRIORITY = {
     DOC_CLASS_ACT_FINAL: 100,
     DOC_CLASS_MEMORANDO: 80,
+    DOC_CLASS_OFICIO: 75,
+    DOC_CLASS_DESPACHO: 75,
+    DOC_CLASS_INFORMACAO_TECNICA: 75,
+    DOC_CLASS_NOTA_TECNICA: 75,
+    DOC_CLASS_DOCUMENTO_ADMINISTRATIVO_RELACIONADO: 60,
     DOC_CLASS_TED: 80,
     DOC_CLASS_EXTRATO: 30,
     DOC_CLASS_MINUTA: 20,
@@ -54,6 +80,11 @@ EMAIL_MARKERS = ("assunto:", "para:", "de:", "enviado:", "enviada:", "cc:", "cco
 DOC_CLASS_RESOLVED_TYPE = {
     DOC_CLASS_ACT_FINAL: RESOLVED_TYPE_ACT,
     DOC_CLASS_MEMORANDO: RESOLVED_TYPE_MEMORANDO,
+    DOC_CLASS_OFICIO: RESOLVED_TYPE_OFICIO,
+    DOC_CLASS_DESPACHO: RESOLVED_TYPE_DESPACHO,
+    DOC_CLASS_INFORMACAO_TECNICA: RESOLVED_TYPE_INFORMACAO_TECNICA,
+    DOC_CLASS_NOTA_TECNICA: RESOLVED_TYPE_NOTA_TECNICA,
+    DOC_CLASS_DOCUMENTO_ADMINISTRATIVO_RELACIONADO: RESOLVED_TYPE_DOCUMENTO_ADMINISTRATIVO_RELACIONADO,
     DOC_CLASS_TED: RESOLVED_TYPE_TED,
     DOC_CLASS_EXTRATO: RESOLVED_TYPE_ACT_RELATED,
     DOC_CLASS_MINUTA: RESOLVED_TYPE_ACT_RELATED,
@@ -66,6 +97,11 @@ DOC_CLASS_RESOLVED_TYPE = {
 DOC_CLASS_SNAPSHOT_PREFIX = {
     DOC_CLASS_ACT_FINAL: SNAPSHOT_PREFIX_ACT,
     DOC_CLASS_MEMORANDO: SNAPSHOT_PREFIX_MEMORANDO,
+    DOC_CLASS_OFICIO: SNAPSHOT_PREFIX_MEMORANDO,
+    DOC_CLASS_DESPACHO: SNAPSHOT_PREFIX_MEMORANDO,
+    DOC_CLASS_INFORMACAO_TECNICA: SNAPSHOT_PREFIX_MEMORANDO,
+    DOC_CLASS_NOTA_TECNICA: SNAPSHOT_PREFIX_MEMORANDO,
+    DOC_CLASS_DOCUMENTO_ADMINISTRATIVO_RELACIONADO: SNAPSHOT_PREFIX_MEMORANDO,
     DOC_CLASS_TED: SNAPSHOT_PREFIX_TED,
     DOC_CLASS_EXTRATO: SNAPSHOT_PREFIX_ACT,
     DOC_CLASS_MINUTA: SNAPSHOT_PREFIX_ACT,
@@ -130,6 +166,11 @@ HEADER_REJECTION_MARKERS = {
     "termo aditivo": (DOC_CLASS_TERMO_ADITIVO, "cabecalho_termo_aditivo"),
     "proposta de termo aditivo": (DOC_CLASS_TERMO_ADITIVO, "cabecalho_proposta_termo_aditivo"),
     "memorando de entendimentos": (DOC_CLASS_MEMORANDO, "cabecalho_memorando"),
+    "memorando": (DOC_CLASS_MEMORANDO, "cabecalho_memorando"),
+    "oficio": (DOC_CLASS_OFICIO, "cabecalho_oficio"),
+    "despacho": (DOC_CLASS_DESPACHO, "cabecalho_despacho"),
+    "informacao tecnica": (DOC_CLASS_INFORMACAO_TECNICA, "cabecalho_informacao_tecnica"),
+    "nota tecnica": (DOC_CLASS_NOTA_TECNICA, "cabecalho_nota_tecnica"),
     "termo de execucao descentralizada": (DOC_CLASS_TED, "cabecalho_ted"),
     "portaria": (DOC_CLASS_EMAIL_OUTRO, "cabecalho_portaria"),
     "publicacao": (DOC_CLASS_EMAIL_OUTRO, "cabecalho_publicacao"),
@@ -138,6 +179,35 @@ HEADER_REJECTION_MARKERS = {
     "plano de trabalho": (DOC_CLASS_EMAIL_OUTRO, "cabecalho_plano_trabalho"),
     "reuniao": (DOC_CLASS_EMAIL_OUTRO, "cabecalho_reuniao"),
     "convenio": (DOC_CLASS_EMAIL_OUTRO, "cabecalho_convenio"),
+}
+
+ADMINISTRATIVE_DOC_CLASSES = (
+    DOC_CLASS_MEMORANDO,
+    DOC_CLASS_OFICIO,
+    DOC_CLASS_DESPACHO,
+    DOC_CLASS_INFORMACAO_TECNICA,
+    DOC_CLASS_NOTA_TECNICA,
+    DOC_CLASS_DOCUMENTO_ADMINISTRATIVO_RELACIONADO,
+)
+
+ADMINISTRATIVE_RELATED_MARKERS = (
+    "encaminhamento",
+    "encaminha",
+    "encaminho",
+    "encaminhamos",
+    "solicitacao",
+    "solicita",
+    "solicito",
+    "solicitamos",
+)
+
+ADMINISTRATIVE_HEADER_MARKERS = {
+    "memorando de entendimentos": (DOC_CLASS_MEMORANDO, "cabecalho_memorando"),
+    "memorando": (DOC_CLASS_MEMORANDO, "cabecalho_memorando"),
+    "oficio": (DOC_CLASS_OFICIO, "cabecalho_oficio"),
+    "despacho": (DOC_CLASS_DESPACHO, "cabecalho_despacho"),
+    "informacao tecnica": (DOC_CLASS_INFORMACAO_TECNICA, "cabecalho_informacao_tecnica"),
+    "nota tecnica": (DOC_CLASS_NOTA_TECNICA, "cabecalho_nota_tecnica"),
 }
 
 ACT_HEADER_MARKERS = (
@@ -339,6 +409,16 @@ def _classify_snapshot_core(
     if "clique aqui para visualizar o conteudo deste documento" in opening_blob:
         return _classification_record(DOC_CLASS_STUB, "stub_visualizacao")
 
+    for marker, (doc_class, reason) in ADMINISTRATIVE_HEADER_MARKERS.items():
+        if marker not in rejection_blob:
+            continue
+        if marker == "oficio" and re.search(r"\boficio\b", rejection_blob) is None:
+            continue
+        return _classification_record(doc_class, reason)
+
+    if re.search(r"\bmemo\b", rejection_blob):
+        return _classification_record(DOC_CLASS_MEMORANDO, "cabecalho_memo")
+
     email_hits = sum(1 for marker in EMAIL_MARKERS if marker in full_blob)
     if email_hits >= 3 or "e-mail" in rejection_blob or "email" in rejection_blob:
         return _classification_record(DOC_CLASS_EMAIL_OUTRO, "email_ou_mensagem")
@@ -346,11 +426,22 @@ def _classify_snapshot_core(
     for marker, (doc_class, reason) in HEADER_REJECTION_MARKERS.items():
         if marker not in rejection_blob:
             continue
+        if marker == "oficio" and re.search(r"\boficio\b", rejection_blob) is None:
+            continue
         if doc_class == DOC_CLASS_TED and not (
             "termo de execucao descentralizada" in rejection_blob or re.search(r"\bted\b", rejection_blob)
         ):
             continue
         return _classification_record(doc_class, reason)
+
+    if re.search(r"\bmemo\b", rejection_blob):
+        return _classification_record(DOC_CLASS_MEMORANDO, "cabecalho_memo")
+
+    if any(marker in opening_blob for marker in ADMINISTRATIVE_RELATED_MARKERS):
+        return _classification_record(
+            DOC_CLASS_DOCUMENTO_ADMINISTRATIVO_RELACIONADO,
+            "conteudo_administrativo_relacionado",
+        )
 
     has_act_marker = any(marker in header_blob for marker in ACT_HEADER_MARKERS)
     has_contractual_language = any(marker in opening_blob for marker in CONTRACTUAL_MARKERS) or any(
@@ -374,7 +465,7 @@ def _classify_snapshot_core(
 def _accepted_doc_classes_for_requested_type(requested_type: str) -> Tuple[str, ...]:
     return {
         "act": (DOC_CLASS_ACT_FINAL,),
-        "memorando": (DOC_CLASS_MEMORANDO,),
+        "memorando": ADMINISTRATIVE_DOC_CLASSES,
         "ted": (DOC_CLASS_TED,),
     }.get(requested_type, ())
 
@@ -553,6 +644,7 @@ def _normalize_date_token(token: str) -> str:
         return ""
 
     for pattern in (
+        r"(\d{4})-(\d{1,2})-(\d{1,2})",
         r"(\d{1,2})/(\d{1,2})/(\d{4})",
         r"(\d{1,2})\.(\d{1,2})\.(\d{4})",
         r"(\d{1,2})-(\d{1,2})-(\d{4})",
@@ -560,6 +652,8 @@ def _normalize_date_token(token: str) -> str:
         match = re.fullmatch(pattern, normalized)
         if match:
             try:
+                if pattern.startswith(r"(\d{4})"):
+                    return date(int(match.group(1)), int(match.group(2)), int(match.group(3))).isoformat()
                 return date(int(match.group(3)), int(match.group(2)), int(match.group(1))).isoformat()
             except ValueError:
                 return ""
@@ -656,6 +750,30 @@ def _extract_signature_dates(text: str) -> List[str]:
     return _dedupe(matches)
 
 
+def _extract_data_assinatura(snapshot: Dict[str, Any]) -> str:
+    signatures = _extract_signature_dates(str(snapshot.get("text", "") or ""))
+    return max(signatures) if signatures else ""
+
+
+def _extract_data_publicacao(snapshot: Dict[str, Any]) -> str:
+    text = _prepare_text(str(snapshot.get("text", "") or ""))
+    if not text:
+        return ""
+    patterns = (
+        rf"(?:publicad[oa]|publicacao|publica[cç][aã]o)[^\n. ]*(?:[^\n.]{{0,180}}?){DATE_PATTERN}",
+        rf"(?:diario oficial da uniao|dou)[^\n. ]*(?:[^\n.]{{0,180}}?){DATE_PATTERN}",
+        rf"{DATE_PATTERN}[^\n.]{{0,120}}?(?:diario oficial da uniao|dou)",
+    )
+    dates: List[str] = []
+    for pattern in patterns:
+        for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+            token = match.group(1)
+            iso = _normalize_date_token(token)
+            if iso:
+                dates.append(iso)
+    return min(_dedupe(dates)) if dates else ""
+
+
 def _extract_preamble(text: str) -> str:
     prepared = _prepare_text(text)
     if not prepared:
@@ -704,9 +822,16 @@ def _extract_numero_acordo(snapshot: Dict[str, Any]) -> Tuple[str, str]:
         ("cabecalho_documento", _trim_noise(str(snapshot.get("text", "") or ""))[:HEADER_SCAN_CHARS]),
     )
     patterns = (
-        ("cabecalho_act_tecnica", r"acordo de cooperacao tecnica\s+(?:n[o.]|no|n)?\s*[:o]?\s*([a-z0-9./-]*\d[a-z0-9./-]*)"),
+        ("cabecalho_act_sigla", r"\bact\s*(?:n(?:o|\.|umero)?|no)?\s*[:o.]?\s*([a-z0-9./-]*\d[a-z0-9./-]*)"),
+        (
+            "cabecalho_act_tecnica",
+            r"acordo de cooperacao tecnica\s*(?:n(?:o|\.|umero)?|no)?\s*[:o.]?\s*([a-z0-9./-]*\d[a-z0-9./-]*)",
+        ),
         ("cabecalho_act_tecnica", r"acordo de cooperacao tecnica\s+([0-9]{1,4}/[0-9]{2,4})"),
-        ("cabecalho_act_generico", r"acordo de cooperacao\s+(?:n[o.]|no|n)?\s*[:o]?\s*([a-z0-9./-]*\d[a-z0-9./-]*)"),
+        (
+            "cabecalho_act_generico",
+            r"acordo de cooperacao\s*(?:n(?:o|\.|umero)?|no)?\s*[:o.]?\s*([a-z0-9./-]*\d[a-z0-9./-]*)",
+        ),
         ("cabecalho_act_generico", r"acordo de cooperacao\s+(?!tecnica\b)([0-9]{1,4}/[0-9]{2,4})"),
     )
     for _, source in sources:
@@ -718,6 +843,17 @@ def _extract_numero_acordo(snapshot: Dict[str, Any]) -> Tuple[str, str]:
             if match:
                 return (_clean_spaces(match.group(1).rstrip(".,;:")), field_source)
     return ("", "")
+
+
+def _is_placeholder_numero_acordo(value: str) -> bool:
+    normalized = _normalize_text(value).replace(" ", "")
+    if not normalized:
+        return False
+    if re.fullmatch(r"x+[/.-]?(?:x+|\d*x+\d*)", normalized):
+        return True
+    if re.fullmatch(r"s[/.-]?n(?:o|umero)?", normalized):
+        return True
+    return any(marker in normalized for marker in ("semnumero", "semnumeracao", "xxxxx", "xx/20xx"))
 
 
 def _extract_document_process(snapshot: Dict[str, Any]) -> str:
@@ -743,7 +879,122 @@ def _extract_first_date_after_marker(prepared: str, marker: str) -> str:
     return _normalize_date_token(match.group(1)) if match else ""
 
 
-def _extract_vigencia(snapshot: Dict[str, Any]) -> Tuple[str, str, str, str]:
+def _extract_vigencia_raw(snapshot: Dict[str, Any]) -> str:
+    text = str(snapshot.get("text", "") or "")
+    section = _extract_section(
+        text,
+        (
+            r"(?:\d+\s*[.)-]\s*)?CL[\u00c1A]USULA\s+(?:NONA|S[\u00c9E]TIMA|OITAVA|QUINTA|D[\u00c9E]CIMA(?:\s+\w+)*)\s*[-â€“â€”]?\s*(?:DO\s+)?PRAZO(?:\s+E\s+VIG[\u00caE]NCIA)?",
+            r"(?:\d+\s*[.)-]\s*)?CL[\u00c1A]USULA\s+.*?\s*[-â€“â€”]?\s*(?:DA|DO)\s+VIG[\u00caE]NCIA",
+            r"\bPRAZO\s+E\s+VIG[\u00caE]NCIA\b",
+            r"\bPRAZO\s+DE\s+VIG[\u00caE]NCIA\b",
+            r"\bVIG[\u00caE]NCIA\b\s*:",
+        ),
+    )
+    if not section:
+        section = _extract_focus_window(
+            text,
+            (
+                r"\bPRAZO\s+DE\s+VIG[\u00caE]NCIA\b",
+                r"\bPRAZO\s+E\s+VIG[\u00caE]NCIA\b",
+                r"\bVIG[\u00caE]NCIA\b",
+            ),
+        )
+    return _clean_clause_value(section) if section else ""
+
+
+def resolve_act_vigencia(
+    vigencia_raw: str,
+    data_assinatura: str = "",
+    data_publicacao: str = "",
+    outras_datas: Optional[Iterable[str]] = None,
+) -> Dict[str, str]:
+    prepared = _prepare_text(vigencia_raw or "")
+    normalized = _normalize_text(prepared)
+    result = {
+        "vigencia_inicio": "",
+        "vigencia_fim": "",
+        "field_source_vigencia": "",
+        "warning": "",
+        "amount": "",
+        "unit": "",
+        "anchor": "",
+    }
+    if not normalized:
+        return result
+
+    explicit_start, explicit_end = _extract_explicit_period(prepared)
+    if explicit_start and explicit_end:
+        return {
+            **result,
+            "vigencia_inicio": explicit_start,
+            "vigencia_fim": explicit_end,
+            "field_source_vigencia": "clausula_vigencia_periodo_explicito",
+            "anchor": "data_explicita",
+        }
+
+    duration = re.search(r"(\d{1,3})\s*(?:\([^)]+\))?\s+(mes(?:es)?|anos?)", normalized, flags=re.IGNORECASE)
+    if duration:
+        result["amount"] = duration.group(1)
+        result["unit"] = duration.group(2)
+
+    start_match = re.search(
+        rf"(?:a partir de|a contar de|contados? de|contado da)\s+{DATE_PATTERN}",
+        prepared,
+        flags=re.IGNORECASE,
+    )
+    if start_match:
+        start_iso = _normalize_date_token(start_match.group(1))
+        if start_iso:
+            return {
+                **result,
+                "vigencia_inicio": start_iso,
+                "vigencia_fim": _add_duration(start_iso, result["amount"], result["unit"]) if duration else "",
+                "field_source_vigencia": "clausula_vigencia_data_inicial_explicita",
+                "anchor": "data_explicita",
+            }
+
+    if "assinatura" in normalized:
+        result["anchor"] = "assinatura"
+        source = "clausula_vigencia_ultima_assinatura" if "ultima assinatura" in normalized else "clausula_vigencia_assinatura"
+        if not data_assinatura:
+            return {**result, "warning": "vigencia_dependente_assinatura_sem_data"}
+        return {
+            **result,
+            "vigencia_inicio": data_assinatura,
+            "vigencia_fim": _add_duration(data_assinatura, result["amount"], result["unit"]) if duration else "",
+            "field_source_vigencia": source,
+        }
+
+    if "publicacao" in normalized or "diario oficial" in normalized or re.search(r"\bdou\b", normalized):
+        result["anchor"] = "publicacao"
+        if not data_publicacao:
+            data_publicacao = _extract_first_date_after_marker(prepared, "publicacao")
+        if not data_publicacao:
+            return {**result, "warning": "vigencia_dependente_publicacao_sem_data"}
+        return {
+            **result,
+            "vigencia_inicio": data_publicacao,
+            "vigencia_fim": _add_duration(data_publicacao, result["amount"], result["unit"]) if duration else "",
+            "field_source_vigencia": "clausula_vigencia_publicacao",
+        }
+
+    normalized_other_dates = [_normalize_date_token(value) for value in (outras_datas or [])]
+    normalized_other_dates = [value for value in normalized_other_dates if value]
+    if duration and len(normalized_other_dates) == 1:
+        start_iso = normalized_other_dates[0]
+        return {
+            **result,
+            "vigencia_inicio": start_iso,
+            "vigencia_fim": _add_duration(start_iso, result["amount"], result["unit"]),
+            "field_source_vigencia": "clausula_vigencia_data_contextual",
+            "anchor": "data_contextual",
+        }
+
+    return result
+
+
+def _extract_vigencia_legacy(snapshot: Dict[str, Any]) -> Tuple[str, str, str, str]:
     text = str(snapshot.get("text", "") or "")
     section = _extract_section(
         text,
@@ -813,6 +1064,62 @@ def _extract_vigencia(snapshot: Dict[str, Any]) -> Tuple[str, str, str, str]:
     return ("", "", "", "")
 
 
+def _extract_vigencia(snapshot: Dict[str, Any]) -> Tuple[str, str, str, str]:
+    raw = _extract_vigencia_raw(snapshot)
+    resolved = resolve_act_vigencia(
+        raw,
+        data_assinatura=_extract_data_assinatura(snapshot),
+        data_publicacao=_extract_data_publicacao(snapshot),
+        outras_datas=_extract_signature_dates(str(snapshot.get("text", "") or "")),
+    )
+    return (
+        resolved["vigencia_inicio"],
+        resolved["vigencia_fim"],
+        resolved["field_source_vigencia"],
+        resolved["warning"],
+    )
+
+
+def _extract_vigencia_rule(snapshot: Dict[str, Any]) -> Dict[str, str]:
+    text = str(snapshot.get("text", "") or "")
+    section = _extract_section(
+        text,
+        (
+            r"(?:\d+\s*[.)-]\s*)?CL[\u00c1A]USULA\s+(?:NONA|S[\u00c9E]TIMA|OITAVA|QUINTA|D[\u00c9E]CIMA(?:\s+\w+)*)\s*[-–—]?\s*(?:DO\s+)?PRAZO(?:\s+E\s+VIG[\u00caE]NCIA)?",
+            r"(?:\d+\s*[.)-]\s*)?CL[\u00c1A]USULA\s+.*?\s*[-–—]?\s*(?:DA|DO)\s+VIG[\u00caE]NCIA",
+            r"\bPRAZO\s+E\s+VIG[\u00caE]NCIA\b",
+            r"\bPRAZO\s+DE\s+VIG[\u00caE]NCIA\b",
+            r"\bVIG[\u00caE]NCIA\b\s*:",
+        ),
+    )
+    if not section:
+        section = _extract_focus_window(
+            text,
+            (
+                r"\bPRAZO\s+DE\s+VIG[\u00caE]NCIA\b",
+                r"\bPRAZO\s+E\s+VIG[\u00caE]NCIA\b",
+                r"\bVIG[\u00caE]NCIA\b",
+            ),
+        )
+    normalized = _normalize_text(section)
+    if not normalized:
+        return {"amount": "", "unit": "", "anchor": ""}
+
+    duration = re.search(r"(\d{1,3})\s*(?:\([^)]+\))?\s+(mes(?:es)?|anos?)", normalized, flags=re.IGNORECASE)
+    anchor = ""
+    if "publicacao" in normalized:
+        anchor = "publicacao"
+    elif "assinatura" in normalized:
+        anchor = "assinatura"
+    elif re.search(r"\ba partir de\b|\ba contar de\b", normalized):
+        anchor = "data_explicita"
+    return {
+        "amount": duration.group(1) if duration else "",
+        "unit": duration.group(2) if duration else "",
+        "anchor": anchor,
+    }
+
+
 def _looks_like_internal_orgao(value: str) -> bool:
     normalized = _normalize_text(value)
     return any(
@@ -830,16 +1137,62 @@ def _clean_party_candidate(value: str) -> str:
     candidate = _clean_spaces(value)
     candidate = re.sub(r"^(?:a|o|as|os)\s+", "", candidate, flags=re.IGNORECASE)
     for pattern in (
-        r",\s+por\s+interm[eé]dio.*$",
+        r",?\s+por\s+(?:interm[eé]dio|meio)\s+d[aoe]\s+.*$",
         r",\s+neste\s+ato.*$",
         r",\s+doravante.*$",
         r",\s+com\s+sede.*$",
         r",\s*inscrit[oa].*$",
         r",\s+qualificad[oa].*$",
+        r",\s+portador(?:a)?\s+.*$",
     ):
         candidate = re.sub(pattern, "", candidate, flags=re.IGNORECASE)
     candidate = re.sub(r"\s*\([^)]*\)", "", candidate)
     return candidate.strip(" ,.;:-")
+
+
+def _split_orgao_candidate(value: str) -> Dict[str, str]:
+    prepared = _clean_spaces(_prepare_text(value))
+    intermediary = ""
+    split = re.search(
+        r"\bpor\s+(?:interm[eé]dio|meio)\s+d[aoe]\s+(.+)$",
+        prepared,
+        flags=re.IGNORECASE,
+    )
+    if split:
+        intermediary = _clean_party_candidate(split.group(1))
+    cleaned = _clean_party_candidate(prepared)
+    name = cleaned
+    sigla = ""
+    paren_sigla = re.search(r"\(([A-Z0-9]{2,}(?:/[A-Z0-9]{2,})?)\)\s*$", prepared)
+    if paren_sigla:
+        sigla = paren_sigla.group(1)
+        name = _clean_party_candidate(prepared[: paren_sigla.start()])
+        cleaned = f"{name} - {sigla}" if name else sigla
+    sigla_match = re.search(r"\s[-–—]\s*([A-Z0-9]{2,}(?:/[A-Z0-9]{2,})?)\s*$", cleaned)
+    if sigla_match and not sigla:
+        sigla = sigla_match.group(1)
+        name = cleaned[: sigla_match.start()].strip(" -–—")
+    return {
+        "orgao_convenente": cleaned,
+        "orgao_convenente_nome": name,
+        "orgao_convenente_sigla": sigla,
+        "orgao_intermediario": intermediary,
+    }
+
+
+def _extract_orgao_intermediario(snapshot: Dict[str, Any]) -> str:
+    preamble = _extract_preamble(str(snapshot.get("text", "") or ""))
+    if not preamble:
+        return ""
+    match = re.search(
+        r"\bpor\s+(?:interm[eé]dio|meio)\s+d[aoe]\s+(.+?)(?:,\s+para os fins que especifica|,\s+doravante|,\s+neste ato|\.|\n|$)",
+        _prepare_text(preamble),
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if not match:
+        return ""
+    candidate = _clean_party_candidate(match.group(1))
+    return "" if _looks_like_internal_orgao(candidate) else candidate
 
 
 def _extract_orgao_convenente(snapshot: Dict[str, Any]) -> Tuple[str, str]:
@@ -887,6 +1240,17 @@ def _extract_orgao_convenente(snapshot: Dict[str, Any]) -> Tuple[str, str]:
         if _has_content(candidate, min_alpha=4) and not _looks_like_internal_orgao(candidate):
             return (candidate, "preambulo_normalizado_partes")
 
+    for source in (preamble, normalized_preamble):
+        match = re.search(
+            r"\bcensipam\s+e\s+(?:a|o|as|os)\s+(.+?)(?:\s+para os fins que especifica|\.|\n|$)",
+            source,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if match:
+            candidate = _clean_party_candidate(match.group(1))
+            if _has_content(candidate, min_alpha=4) and not _looks_like_internal_orgao(candidate):
+                return (candidate, "preambulo_partes_fallback")
+
     return ("", "")
 
 
@@ -915,7 +1279,7 @@ def _extract_objeto(snapshot: Dict[str, Any]) -> Tuple[str, str]:
 def _extract_explicit_named_value(text: str, labels: Tuple[str, ...]) -> str:
     prepared = _prepare_text(text)
     for label in labels:
-        pattern = rf"{label}\s*:\s*([A-Z\u00c0-\u00dd][^\n\r:]+)"
+        pattern = rf"{label}\s*(?:-|–|—|:)\s*([A-Z\u00c0-\u00dd][^\n\r:]+)"
         match = re.search(pattern, prepared, flags=re.IGNORECASE)
         if not match:
             continue
@@ -933,15 +1297,24 @@ def _extract_explicit_named_value(text: str, labels: Tuple[str, ...]) -> str:
 
 def _extract_gestores(snapshot: Dict[str, Any]) -> Tuple[str, str, str]:
     text = str(snapshot.get("text", "") or "")
-    titular = _extract_explicit_named_value(text, ("Gestor Titular", "Titular", "Gestor"))
-    substituto = _extract_explicit_named_value(text, ("Gestor Substituto", "Substituto", "Suplente"))
+    titular = _extract_explicit_named_value(
+        text,
+        ("Gestor Titular", "Representante Titular", "Fiscal Titular", "Titular", "Gestor"),
+    )
+    substituto = _extract_explicit_named_value(
+        text,
+        ("Gestor Substituto", "Representante Substituto", "Fiscal Substituto", "Substituto", "Suplente"),
+    )
     source = "rotulos_explicitos" if titular or substituto else ""
     return (titular, substituto, source)
 
 
 def _extract_unidade_responsavel(snapshot: Dict[str, Any]) -> Tuple[str, str]:
     text = str(snapshot.get("text", "") or "")
-    value = _extract_explicit_named_value(text, (r"Unidade Respons[a\u00e1]vel",))
+    value = _extract_explicit_named_value(
+        text,
+        (r"Unidade Respons[a\u00e1]vel", r"[AÁ]rea Respons[a\u00e1]vel", r"Unidade Demandante"),
+    )
     return (value, "rotulo_unidade_responsavel" if value else "")
 
 
@@ -1033,6 +1406,171 @@ def _canonical_score(payload: Dict[str, Any], normalized_record: Dict[str, Any])
     return score
 
 
+def _field_or_missing(
+    *,
+    value: str,
+    raw_value: str = "",
+    source_type: str,
+    confidence: str,
+    rule_id: str,
+    warning: str = "",
+) -> Dict[str, Any]:
+    if not _clean_spaces(str(value or "")):
+        return make_missing_field(rule_id=rule_id, warning=warning or "missing")
+    return make_field(
+        value=value,
+        raw_value=raw_value or value,
+        source_type=source_type,
+        confidence=confidence,
+        rule_id=rule_id,
+        warning=warning,
+    )
+
+
+def _vigencia_source_type(field_source_vigencia: str) -> str:
+    normalized = _normalize_text(field_source_vigencia)
+    if "assinatura" in normalized or "publicacao" in normalized or "prazo" in normalized:
+        return SOURCE_DERIVED
+    if normalized:
+        return SOURCE_DOCUMENT_TEXT
+    return SOURCE_MISSING
+
+
+def _build_contract_fields(record: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    vigencia_source = _clean_spaces(str(record.get("field_source_vigencia", "") or ""))
+    vigencia_source_type = _vigencia_source_type(vigencia_source)
+    vigencia_confidence = CONFIDENCE_MEDIUM if vigencia_source_type == SOURCE_DERIVED else CONFIDENCE_HIGH
+    vigencia_warning = _clean_spaces(str(record.get("vigencia_warning", "") or ""))
+    return {
+        "numero_acordo": _field_or_missing(
+            value=str(record.get("numero_acordo", "") or ""),
+            source_type=SOURCE_DOCUMENT_TEXT if record.get("field_source_numero_acordo") else SOURCE_MISSING,
+            confidence=CONFIDENCE_HIGH if record.get("field_source_numero_acordo") else CONFIDENCE_LOW,
+            rule_id=str(record.get("field_source_numero_acordo", "") or "act.numero_acordo.missing"),
+        ),
+        "data_assinatura": _field_or_missing(
+            value=str(record.get("data_assinatura", "") or ""),
+            source_type=SOURCE_DOCUMENT_TEXT,
+            confidence=CONFIDENCE_MEDIUM,
+            rule_id="act.data_assinatura.assinaturas_eletronicas",
+        ),
+        "data_publicacao": _field_or_missing(
+            value=str(record.get("data_publicacao", "") or ""),
+            source_type=SOURCE_DOCUMENT_TEXT,
+            confidence=CONFIDENCE_MEDIUM,
+            rule_id="act.data_publicacao.publicacao",
+        ),
+        "vigencia_raw": _field_or_missing(
+            value=str(record.get("vigencia_raw", "") or ""),
+            source_type=SOURCE_DOCUMENT_TEXT,
+            confidence=CONFIDENCE_HIGH,
+            rule_id="act.vigencia.raw",
+            warning=vigencia_warning,
+        ),
+        "vigencia_inicio": _field_or_missing(
+            value=str(record.get("vigencia_inicio", "") or ""),
+            raw_value=str(record.get("vigencia_raw", "") or ""),
+            source_type=vigencia_source_type,
+            confidence=vigencia_confidence,
+            rule_id=vigencia_source or "act.vigencia.missing",
+            warning=vigencia_warning,
+        ),
+        "vigencia_fim": _field_or_missing(
+            value=str(record.get("vigencia_fim", "") or ""),
+            raw_value=str(record.get("vigencia_raw", "") or ""),
+            source_type=vigencia_source_type,
+            confidence=vigencia_confidence,
+            rule_id=vigencia_source or "act.vigencia.missing",
+            warning=vigencia_warning,
+        ),
+        "data_inicio_vigencia": _field_or_missing(
+            value=str(record.get("data_inicio_vigencia", "") or ""),
+            raw_value=str(record.get("vigencia_raw", "") or ""),
+            source_type=vigencia_source_type,
+            confidence=vigencia_confidence,
+            rule_id=vigencia_source or "act.vigencia.missing",
+            warning=vigencia_warning,
+        ),
+        "data_fim_vigencia": _field_or_missing(
+            value=str(record.get("data_fim_vigencia", "") or ""),
+            raw_value=str(record.get("vigencia_raw", "") or ""),
+            source_type=vigencia_source_type,
+            confidence=vigencia_confidence,
+            rule_id=vigencia_source or "act.vigencia.missing",
+            warning=vigencia_warning,
+        ),
+        "orgao_convenente": _field_or_missing(
+            value=str(record.get("orgao_convenente", "") or ""),
+            source_type=SOURCE_DOCUMENT_TEXT,
+            confidence=CONFIDENCE_HIGH,
+            rule_id="act.orgao_convenente.preambulo",
+        ),
+        "orgao_convenente_nome": _field_or_missing(
+            value=str(record.get("orgao_convenente_nome", "") or ""),
+            source_type=SOURCE_DOCUMENT_TEXT,
+            confidence=CONFIDENCE_HIGH,
+            rule_id="act.orgao_convenente_nome.preambulo",
+        ),
+        "orgao_convenente_sigla": _field_or_missing(
+            value=str(record.get("orgao_convenente_sigla", "") or ""),
+            source_type=SOURCE_DOCUMENT_TEXT,
+            confidence=CONFIDENCE_MEDIUM,
+            rule_id="act.orgao_convenente_sigla.preambulo",
+        ),
+        "orgao_intermediario": _field_or_missing(
+            value=str(record.get("orgao_intermediario", "") or ""),
+            source_type=SOURCE_DOCUMENT_TEXT,
+            confidence=CONFIDENCE_MEDIUM,
+            rule_id="act.orgao_intermediario.preambulo",
+        ),
+        "objeto": _field_or_missing(
+            value=str(record.get("objeto", "") or ""),
+            source_type=SOURCE_DOCUMENT_TEXT if record.get("field_source_objeto") else SOURCE_MISSING,
+            confidence=CONFIDENCE_HIGH if record.get("field_source_objeto") else CONFIDENCE_LOW,
+            rule_id=str(record.get("field_source_objeto", "") or "act.objeto.missing"),
+        ),
+        "gestor_titular": _field_or_missing(
+            value=str(record.get("gestor_titular", "") or ""),
+            source_type=SOURCE_DOCUMENT_TEXT,
+            confidence=CONFIDENCE_MEDIUM,
+            rule_id=str(record.get("field_source_gestao", "") or "act.gestor_titular.missing"),
+        ),
+        "gestor_substituto": _field_or_missing(
+            value=str(record.get("gestor_substituto", "") or ""),
+            source_type=SOURCE_DOCUMENT_TEXT,
+            confidence=CONFIDENCE_MEDIUM,
+            rule_id=str(record.get("field_source_gestao", "") or "act.gestor_substituto.missing"),
+        ),
+        "unidade_responsavel": _field_or_missing(
+            value=str(record.get("unidade_responsavel", "") or ""),
+            source_type=SOURCE_DOCUMENT_TEXT,
+            confidence=CONFIDENCE_MEDIUM,
+            rule_id=str(record.get("field_source_gestao", "") or "act.unidade_responsavel.missing"),
+        ),
+    }
+
+
+def _refresh_contract(record: Dict[str, Any]) -> None:
+    existing = record.get("normalization_contract")
+    fields = existing.get("fields", {}) if isinstance(existing, dict) else _build_contract_fields(record)
+    record["normalization_contract"] = build_document_contract(
+        processo=str(record.get("processo", "") or ""),
+        requested_type=str(record.get("requested_type", "") or ""),
+        resolved_document_type=str(record.get("resolved_document_type", "") or ""),
+        documento=None,
+        found=True,
+        is_canonical_candidate=bool(record.get("is_canonical_candidate")),
+        validation_status=str(record.get("validation_status", "") or ""),
+        publication_status=str(record.get("publication_status", "") or ""),
+        normalization_status=str(record.get("normalization_status", "") or ""),
+        fields=fields,
+        extra_issues=[
+            str(record.get("validation_warning", "") or ""),
+            str(record.get("canon_rejection_reason", "") or ""),
+        ],
+    )
+
+
 def build_normalized_record(payload: Dict[str, Any], json_path: Path) -> Dict[str, Any]:
     snapshot = payload.get("snapshot", {}) or {}
     collection = payload.get("collection", {}) or {}
@@ -1048,9 +1586,15 @@ def build_normalized_record(payload: Dict[str, Any], json_path: Path) -> Dict[st
     )
 
     numero_acordo = ""
+    data_assinatura = ""
+    data_publicacao = ""
+    vigencia_raw = ""
     data_inicio_vigencia = ""
     data_fim_vigencia = ""
     orgao_convenente = ""
+    orgao_convenente_nome = ""
+    orgao_convenente_sigla = ""
+    orgao_intermediario = ""
     objeto = ""
     gestor_titular = ""
     gestor_substituto = ""
@@ -1060,25 +1604,63 @@ def build_normalized_record(payload: Dict[str, Any], json_path: Path) -> Dict[st
     field_source_vigencia = ""
     field_source_gestao = ""
     vigencia_warning = ""
+    vigencia_rule = {"amount": "", "unit": "", "anchor": ""}
+    numero_warning = ""
 
     if analysis.get("doc_class") == DOC_CLASS_ACT_FINAL:
         numero_acordo, field_source_numero_acordo = _extract_numero_acordo(snapshot)
-        data_inicio_vigencia, data_fim_vigencia, field_source_vigencia, vigencia_warning = _extract_vigencia(snapshot)
-        orgao_convenente, _ = _extract_orgao_convenente(snapshot)
+        if _is_placeholder_numero_acordo(numero_acordo):
+            numero_acordo = ""
+            field_source_numero_acordo = ""
+            numero_warning = "numero_placeholder"
+        data_assinatura = _extract_data_assinatura(snapshot)
+        data_publicacao = _extract_data_publicacao(snapshot)
+        vigencia_raw = _extract_vigencia_raw(snapshot)
+        resolved_vigencia = resolve_act_vigencia(
+            vigencia_raw,
+            data_assinatura=data_assinatura,
+            data_publicacao=data_publicacao,
+            outras_datas=_extract_signature_dates(str(snapshot.get("text", "") or "")),
+        )
+        data_inicio_vigencia = resolved_vigencia["vigencia_inicio"]
+        data_fim_vigencia = resolved_vigencia["vigencia_fim"]
+        field_source_vigencia = resolved_vigencia["field_source_vigencia"]
+        vigencia_warning = resolved_vigencia["warning"]
+        vigencia_rule = {
+            "amount": resolved_vigencia["amount"],
+            "unit": resolved_vigencia["unit"],
+            "anchor": resolved_vigencia["anchor"],
+        }
+        orgao_raw, _ = _extract_orgao_convenente(snapshot)
+        orgao_parts = _split_orgao_candidate(orgao_raw) if orgao_raw else {}
+        orgao_convenente = orgao_parts.get("orgao_convenente", "")
+        orgao_convenente_nome = orgao_parts.get("orgao_convenente_nome", "")
+        orgao_convenente_sigla = orgao_parts.get("orgao_convenente_sigla", "")
+        orgao_intermediario = orgao_parts.get("orgao_intermediario", "") or _extract_orgao_intermediario(snapshot)
         objeto, field_source_objeto = _extract_objeto(snapshot)
         gestor_titular, gestor_substituto, gestor_source = _extract_gestores(snapshot)
         unidade_responsavel, unidade_source = _extract_unidade_responsavel(snapshot)
         field_source_gestao = gestor_source or unidade_source
 
     validation_warning = _collect_validation_warnings(payload, analysis, vigencia_warning)
+    if numero_warning:
+        validation_warning = "; ".join(part for part in (validation_warning, numero_warning) if part)
     document_processos = analysis.get("document_processos", []) or []
     record = {
         "requested_type": requested_type,
         "numero_acordo": numero_acordo,
         "processo": processo,
+        "data_assinatura": data_assinatura,
+        "data_publicacao": data_publicacao,
+        "vigencia_raw": vigencia_raw,
+        "vigencia_inicio": data_inicio_vigencia,
+        "vigencia_fim": data_fim_vigencia,
         "data_inicio_vigencia": data_inicio_vigencia,
         "data_fim_vigencia": data_fim_vigencia,
         "orgao_convenente": orgao_convenente,
+        "orgao_convenente_nome": orgao_convenente_nome,
+        "orgao_convenente_sigla": orgao_convenente_sigla,
+        "orgao_intermediario": orgao_intermediario,
         "objeto": objeto,
         "gestor_titular": gestor_titular,
         "gestor_substituto": gestor_substituto,
@@ -1102,6 +1684,10 @@ def build_normalized_record(payload: Dict[str, Any], json_path: Path) -> Dict[st
         "field_source_objeto": field_source_objeto,
         "field_source_vigencia": field_source_vigencia,
         "field_source_gestao": field_source_gestao,
+        "vigencia_rule_amount": vigencia_rule.get("amount", ""),
+        "vigencia_rule_unit": vigencia_rule.get("unit", ""),
+        "vigencia_rule_anchor": vigencia_rule.get("anchor", ""),
+        "vigencia_warning": vigencia_warning,
         "validation_warning": validation_warning,
         "has_internal_context": bool(analysis.get("has_internal_context")),
         "process_alignment_status": analysis.get("process_alignment_status", ""),
@@ -1114,7 +1700,46 @@ def build_normalized_record(payload: Dict[str, Any], json_path: Path) -> Dict[st
         "canonical_score": 0,
     }
     record["canonical_score"] = _canonical_score(payload, record)
+    record["normalization_contract"] = build_document_contract(
+        processo=record["processo"],
+        requested_type=record["requested_type"],
+        resolved_document_type=record["resolved_document_type"],
+        documento=_clean_spaces(str(payload.get("documento", "") or "")) or None,
+        found=True,
+        is_canonical_candidate=bool(record["is_canonical_candidate"]),
+        validation_status=record["validation_status"],
+        publication_status=record["publication_status"],
+        normalization_status=record["normalization_status"],
+        fields=_build_contract_fields(record),
+        extra_issues=[
+            record.get("validation_warning", ""),
+            record.get("canon_rejection_reason", ""),
+        ],
+    )
     return record
+
+
+def _build_field_diagnostics(records: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    diagnostics: List[Dict[str, str]] = []
+    for record in records:
+        contract = record.get("normalization_contract", {})
+        fields = contract.get("fields", {}) if isinstance(contract, dict) else {}
+        processo = _clean_spaces(str(record.get("processo", "") or ""))
+        for campo, field in fields.items():
+            if not isinstance(field, dict):
+                continue
+            diagnostics.append(
+                {
+                    "processo": processo,
+                    "campo": str(campo),
+                    "valor": _clean_spaces(str(field.get("value", "") or "")),
+                    "raw_value": _clean_spaces(str(field.get("raw_value", "") or "")),
+                    "source_type": _clean_spaces(str(field.get("source_type", "") or "")),
+                    "confidence": _clean_spaces(str(field.get("confidence", "") or "")),
+                    "warning": _clean_spaces(str(field.get("warning", "") or "")),
+                }
+            )
+    return diagnostics
 
 
 def export_normalized_csv(output_dir: Path, logger: Any = None) -> Dict[str, Any]:
@@ -1160,6 +1785,7 @@ def export_normalized_csv(output_dir: Path, logger: Any = None) -> Dict[str, Any
                         "discard_reason",
                         "",
                     )
+                _refresh_contract(record)
             continue
 
         canonical = max(
@@ -1179,12 +1805,14 @@ def export_normalized_csv(output_dir: Path, logger: Any = None) -> Dict[str, Any
                 record["publication_status"] = PUBLICATION_STATUS_GOLD
                 record["discard_reason"] = ""
                 record["canon_rejection_reason"] = ""
+                _refresh_contract(record)
                 canonical_records.append(record)
             elif record.get("doc_class") == DOC_CLASS_ACT_FINAL and record.get("validation_status") == VALIDATION_STATUS_VALID:
                 record["normalization_status"] = "descartado_por_desempate"
                 record["publication_status"] = PUBLICATION_STATUS_SILVER
                 record["discard_reason"] = "act_final_nao_canonico"
                 record["canon_rejection_reason"] = "act_final_nao_canonico"
+                _refresh_contract(record)
             else:
                 record["normalization_status"] = "descartado_nao_canonico"
                 record["publication_status"] = PUBLICATION_STATUS_SILVER
@@ -1195,6 +1823,7 @@ def export_normalized_csv(output_dir: Path, logger: Any = None) -> Dict[str, Any
                         "discard_reason",
                         "",
                     )
+                _refresh_contract(record)
         _log(logger, "info", "Normalizador ACT: processo %s canonico=%s.", processo, canonical.get("json_path", ""))
 
     audit_columns = [
@@ -1210,9 +1839,17 @@ def export_normalized_csv(output_dir: Path, logger: Any = None) -> Dict[str, Any
         "discard_reason",
         "classification_reason",
         "canon_rejection_reason",
+        "data_assinatura",
+        "data_publicacao",
+        "vigencia_raw",
+        "vigencia_inicio",
+        "vigencia_fim",
         "data_inicio_vigencia",
         "data_fim_vigencia",
         "orgao_convenente",
+        "orgao_convenente_nome",
+        "orgao_convenente_sigla",
+        "orgao_intermediario",
         "objeto",
         "gestor_titular",
         "gestor_substituto",
@@ -1222,6 +1859,10 @@ def export_normalized_csv(output_dir: Path, logger: Any = None) -> Dict[str, Any
         "field_source_objeto",
         "field_source_vigencia",
         "field_source_gestao",
+        "vigencia_rule_amount",
+        "vigencia_rule_unit",
+        "vigencia_rule_anchor",
+        "vigencia_warning",
         "validation_warning",
         "has_internal_context",
         "process_alignment_status",
@@ -1239,9 +1880,17 @@ def export_normalized_csv(output_dir: Path, logger: Any = None) -> Dict[str, Any
     normalized_columns = [
         "numero_acordo",
         "processo",
+        "data_assinatura",
+        "data_publicacao",
+        "vigencia_raw",
+        "vigencia_inicio",
+        "vigencia_fim",
         "data_inicio_vigencia",
         "data_fim_vigencia",
         "orgao_convenente",
+        "orgao_convenente_nome",
+        "orgao_convenente_sigla",
+        "orgao_intermediario",
         "objeto",
         "gestor_titular",
         "gestor_substituto",
@@ -1252,6 +1901,9 @@ def export_normalized_csv(output_dir: Path, logger: Any = None) -> Dict[str, Any
     csv_path = output_dir / "act_normalizado_latest.csv"
     public_rows = [{column: row.get(column, "") for column in normalized_columns} for row in canonical_records]
     csv_writer.write_csv(public_rows, csv_path, columns=normalized_columns)
+    diagnostic_columns = ["processo", "campo", "valor", "raw_value", "source_type", "confidence", "warning"]
+    diagnostics_path = output_dir / "act_field_diagnostics_latest.csv"
+    csv_writer.write_csv(_build_field_diagnostics(audit_records), diagnostics_path, columns=diagnostic_columns)
     _log(
         logger,
         "info",
@@ -1264,4 +1916,5 @@ def export_normalized_csv(output_dir: Path, logger: Any = None) -> Dict[str, Any
         "csv_path": csv_path,
         "latest_path": csv_path,
         "audit_path": audit_path,
+        "diagnostics_path": diagnostics_path,
     }

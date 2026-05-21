@@ -124,6 +124,14 @@ class PTHandlerTests(unittest.TestCase):
             self.assertEqual(rows[0]["publication_status"], "retained_silver")
             self.assertEqual(rows[0]["normalization_status"], "parcial_padronizado")
             self.assertEqual(rows[0]["found"], "True")
+
+            diagnostics_path = output_dir / "pt_period_diagnostics_latest.csv"
+            self.assertTrue(diagnostics_path.exists())
+            with diagnostics_path.open("r", encoding="utf-8-sig", newline="") as file_obj:
+                diagnostic_rows = list(csv.DictReader(file_obj))
+            self.assertEqual(len(diagnostic_rows), 1)
+            self.assertIn("period_class", diagnostic_rows[0])
+            self.assertIn("rule_anchor", diagnostic_rows[0])
         finally:
             shutil.rmtree(output_dir, ignore_errors=True)
 

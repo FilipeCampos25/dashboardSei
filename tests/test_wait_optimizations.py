@@ -7,10 +7,10 @@ import unittest
 import zipfile
 from pathlib import Path
 from typing import Any
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 from types import SimpleNamespace
 
-from selenium.common.exceptions import StaleElementReferenceException, TimeoutException, WebDriverException
+from selenium.common.exceptions import NoSuchElementException, StaleElementReferenceException, TimeoutException, WebDriverException
 from selenium.webdriver.common.by import By
 
 
@@ -1934,9 +1934,163 @@ class WaitOptimizationTests(unittest.TestCase):
         self.assertFalse(result)
         scraper._find_document_candidates_in_tree.assert_called_once_with(document_type)
         scraper.logger.info.assert_any_call(
-            "Processo %s: TED seguirá fallback da árvore via Selenium/SEI quando necessário.",
+            "Processo %s: TED seguira busca pela arvore via Selenium/SEI quando necessario.",
             "60093.000015/2020-60",
         )
+
+    def test_busca_documento_pela_arvore_retorna_true_sem_registrar_not_found(self) -> None:
+        scraper = scraping.SEIScraper.__new__(scraping.SEIScraper)
+        scraper.logger = Mock()
+        scraper.driver = FakeScraperDriver()
+        scraper._build_collection_context = scraping.SEIScraper._build_collection_context.__get__(
+            scraper,
+            scraping.SEIScraper,
+        )
+        scraper._record_document_search_outcome = Mock()
+        scraper._open_document_via_tree = Mock(return_value=True)
+        scraper._search_document_in_filter = Mock()
+        scraper._ensure_document_search_open = Mock()
+        scraper._reset_search_context_with_fallback = Mock()
+        scraper.abrir_documento_no_filtro = Mock()
+        document_type = make_document_type("act", "Acordo de Cooperacao Tecnica")
+
+        result = scraping.SEIScraper._buscar_e_abrir_documento_pela_arvore(
+            scraper,
+            "60093.000015/2020-60",
+            document_type,
+        )
+
+        self.assertTrue(result)
+        scraper._open_document_via_tree.assert_called_once_with(
+            "60093.000015/2020-60",
+            document_type,
+            process_url="https://sei.defesa.gov.br/processo",
+        )
+        self.assertTrue(
+            any(
+                "iniciando busca pela arvore" in str(call.args[0])
+                for call in scraper.logger.info.call_args_list
+            )
+        )
+        scraper._record_document_search_outcome.assert_not_called()
+        scraper._search_document_in_filter.assert_not_called()
+        scraper._ensure_document_search_open.assert_not_called()
+        scraper._reset_search_context_with_fallback.assert_not_called()
+        scraper.abrir_documento_no_filtro.assert_not_called()
+
+    def test_busca_documento_pela_arvore_registra_not_found_after_tree(self) -> None:
+        scraper = scraping.SEIScraper.__new__(scraping.SEIScraper)
+        scraper.logger = Mock()
+        scraper.driver = FakeScraperDriver()
+        scraper._build_collection_context = scraping.SEIScraper._build_collection_context.__get__(
+            scraper,
+            scraping.SEIScraper,
+        )
+        scraper._record_document_search_outcome = Mock()
+        scraper._open_document_via_tree = Mock(return_value=False)
+        scraper._search_document_in_filter = Mock()
+        scraper._ensure_document_search_open = Mock()
+        scraper._reset_search_context_with_fallback = Mock()
+        scraper.abrir_documento_no_filtro = Mock()
+        document_type = make_document_type("pt", "Plano de Trabalho")
+
+        result = scraping.SEIScraper._buscar_e_abrir_documento_pela_arvore(
+            scraper,
+            "60093.000015/2020-60",
+            document_type,
+        )
+
+        self.assertFalse(result)
+        scraper._record_document_search_outcome.assert_called_once()
+        outcome = scraper._record_document_search_outcome.call_args.args[2]
+        self.assertFalse(outcome["found"])
+        self.assertEqual(outcome["found_in"], "none")
+        self.assertEqual(outcome["search_term"], "Plano de Trabalho")
+        self.assertEqual(outcome["results_count"], 0)
+        self.assertEqual(outcome["selection_reason"], "not_found_after_tree")
+        self.assertEqual(outcome["selection_detail"], "nenhum candidato canonico localizado na arvore")
+        self.assertTrue(
+            any(
+                "nao consolidado pela arvore" in str(call.args[0])
+                for call in scraper.logger.info.call_args_list
+            )
+        )
+        scraper._search_document_in_filter.assert_not_called()
+        scraper._ensure_document_search_open.assert_not_called()
+        scraper._reset_search_context_with_fallback.assert_not_called()
+        scraper.abrir_documento_no_filtro.assert_not_called()
+
+    def test_busca_documento_pela_arvore_trata_timeout_sem_tocar_no_fluxo_de_filtro(self) -> None:
+        scraper = scraping.SEIScraper.__new__(scraping.SEIScraper)
+        scraper.logger = Mock()
+        scraper.driver = FakeScraperDriver()
+        scraper._build_collection_context = scraping.SEIScraper._build_collection_context.__get__(
+            scraper,
+            scraping.SEIScraper,
+        )
+        scraper._record_document_search_outcome = Mock()
+        scraper._open_document_via_tree = Mock(side_effect=TimeoutException("tree timeout"))
+        scraper._search_document_in_filter = Mock()
+        scraper._ensure_document_search_open = Mock()
+        scraper._reset_search_context_with_fallback = Mock()
+        scraper.abrir_documento_no_filtro = Mock()
+        scraper._is_search_context_stagnation_timeout = scraping.SEIScraper._is_search_context_stagnation_timeout.__get__(
+            scraper,
+            scraping.SEIScraper,
+        )
+        document_type = make_document_type("memorando", "Memorando de Entendimentos")
+
+        result = scraping.SEIScraper._buscar_e_abrir_documento_pela_arvore(
+            scraper,
+            "60093.000015/2020-60",
+            document_type,
+        )
+
+        self.assertFalse(result)
+        scraper._record_document_search_outcome.assert_called_once()
+        outcome = scraper._record_document_search_outcome.call_args.args[2]
+        self.assertEqual(outcome["found_in"], "tree")
+        self.assertEqual(outcome["search_term"], "Memorando de Entendimentos")
+        self.assertEqual(outcome["selection_reason"], "tree_open_error")
+        self.assertIn("tree timeout", outcome["extraction_error"])
+        scraper._search_document_in_filter.assert_not_called()
+        scraper._ensure_document_search_open.assert_not_called()
+        scraper._reset_search_context_with_fallback.assert_not_called()
+        scraper.abrir_documento_no_filtro.assert_not_called()
+
+    def test_busca_documento_pela_arvore_trata_no_such_element_com_tree_search_error(self) -> None:
+        scraper = scraping.SEIScraper.__new__(scraping.SEIScraper)
+        scraper.logger = Mock()
+        scraper.driver = FakeScraperDriver()
+        scraper._build_collection_context = scraping.SEIScraper._build_collection_context.__get__(
+            scraper,
+            scraping.SEIScraper,
+        )
+        scraper._record_document_search_outcome = Mock()
+        scraper._open_document_via_tree = Mock(side_effect=NoSuchElementException("tree missing element"))
+        scraper._search_document_in_filter = Mock()
+        scraper._ensure_document_search_open = Mock()
+        scraper._reset_search_context_with_fallback = Mock()
+        scraper.abrir_documento_no_filtro = Mock()
+        document_type = make_document_type("act", "Acordo de Cooperacao Tecnica")
+
+        result = scraping.SEIScraper._buscar_e_abrir_documento_pela_arvore(
+            scraper,
+            "60093.000015/2020-60",
+            document_type,
+        )
+
+        self.assertFalse(result)
+        scraper._record_document_search_outcome.assert_called_once()
+        outcome = scraper._record_document_search_outcome.call_args.args[2]
+        self.assertEqual(outcome["found_in"], "tree")
+        self.assertEqual(outcome["search_term"], "Acordo de Cooperacao Tecnica")
+        self.assertEqual(outcome["selection_reason"], "tree_search_error")
+        self.assertIn("tree missing element", outcome["extraction_error"])
+        scraper._search_document_in_filter.assert_not_called()
+        scraper._ensure_document_search_open.assert_not_called()
+        scraper._reset_search_context_with_fallback.assert_not_called()
+        scraper.abrir_documento_no_filtro.assert_not_called()
 
     def test_extract_and_process_document_snapshot_returns_false_for_noncanonical_ted(self) -> None:
         scraper = scraping.SEIScraper.__new__(scraping.SEIScraper)
@@ -2488,6 +2642,7 @@ class WaitOptimizationTests(unittest.TestCase):
         scraper.performance_profiler = Mock(start_span=Mock(), end_span=Mock())
         scraper._ensure_document_search_open = Mock()
         scraper._buscar_e_abrir_documento_mais_recente = Mock(return_value=True)
+        scraper._buscar_e_abrir_documento_pela_arvore = Mock(return_value=True)
         scraper._process_ted_via_api = Mock(return_value={"numero_processo": "60093000015202060"})
         document_type = make_document_type("ted", "TED - Termo de Execucao Descentralizada")
 
@@ -2498,10 +2653,21 @@ class WaitOptimizationTests(unittest.TestCase):
         )
 
         self.assertTrue(result)
-        scraper._ensure_document_search_open.assert_called_once_with("60093.000015/2020-60", document_type)
-        scraper._buscar_e_abrir_documento_mais_recente.assert_called_once_with("60093.000015/2020-60", document_type)
+        scraper._buscar_e_abrir_documento_pela_arvore.assert_called_once_with("60093.000015/2020-60", document_type)
+        scraper._ensure_document_search_open.assert_not_called()
+        scraper._buscar_e_abrir_documento_mais_recente.assert_not_called()
         scraper._process_ted_via_api.assert_not_called()
-        scraper.logger.info.assert_any_call("Processo %s: TED será coletado via Selenium/SEI.", "60093.000015/2020-60")
+        scraper.logger.info.assert_any_call(
+            "Processo %s: modo_busca_documental=tree_only tipo=%s",
+            "60093.000015/2020-60",
+            "ted",
+        )
+        scraper.logger.info.assert_any_call(
+            "Processo %s: TED sera buscado pela arvore do processo via Selenium/SEI.",
+            "60093.000015/2020-60",
+        )
+        self.assertIn(call("tipo:TED:tree_only"), scraper.performance_profiler.start_span.call_args_list)
+        self.assertIn(call("tipo:TED:tree_only"), scraper.performance_profiler.end_span.call_args_list)
 
     def test_run_document_search_for_process_executes_ted_after_act_found(self) -> None:
         scraper = scraping.SEIScraper.__new__(scraping.SEIScraper)
@@ -2509,6 +2675,7 @@ class WaitOptimizationTests(unittest.TestCase):
         scraper.performance_profiler = Mock(start_span=Mock(), end_span=Mock())
         scraper._ensure_document_search_open = Mock()
         scraper._buscar_e_abrir_documento_mais_recente = Mock(return_value=True)
+        scraper._buscar_e_abrir_documento_pela_arvore = Mock(return_value=True)
         scraper._process_ted_via_api = Mock(return_value={"numero_processo": "60093000015202060"})
         act_document_type = make_document_type("act", "ACT")
         ted_document_type = make_document_type("ted", "TED - Termo de Execucao Descentralizada")
@@ -2527,9 +2694,102 @@ class WaitOptimizationTests(unittest.TestCase):
         self.assertTrue(act_result)
         self.assertTrue(ted_result)
         self.assertTrue(scraping.SEIScraper._has_prior_act_for_process(scraper, "60093.000015/2020-60"))
-        self.assertEqual(scraper._ensure_document_search_open.call_count, 2)
-        self.assertEqual(scraper._buscar_e_abrir_documento_mais_recente.call_count, 2)
+        self.assertEqual(scraper._buscar_e_abrir_documento_pela_arvore.call_count, 2)
+        self.assertEqual(
+            [call.args[1].key for call in scraper._buscar_e_abrir_documento_pela_arvore.call_args_list],
+            ["act", "ted"],
+        )
+        self.assertIn(call("tipo:ACT:tree_only"), scraper.performance_profiler.start_span.call_args_list)
+        self.assertIn(call("tipo:TED:tree_only"), scraper.performance_profiler.start_span.call_args_list)
+        scraper._ensure_document_search_open.assert_not_called()
+        scraper._buscar_e_abrir_documento_mais_recente.assert_not_called()
         scraper._process_ted_via_api.assert_not_called()
+
+    def test_run_document_search_for_process_uses_tree_for_pt(self) -> None:
+        scraper = scraping.SEIScraper.__new__(scraping.SEIScraper)
+        scraper.logger = Mock()
+        scraper.performance_profiler = Mock(start_span=Mock(), end_span=Mock())
+        scraper.driver = FakeScraperDriver()
+        scraper._build_collection_context = scraping.SEIScraper._build_collection_context.__get__(
+            scraper,
+            scraping.SEIScraper,
+        )
+        scraper._record_document_search_outcome = Mock()
+        scraper._open_document_via_tree = Mock(return_value=True)
+        scraper._ensure_document_search_open = Mock()
+        scraper._buscar_e_abrir_documento_mais_recente = Mock(return_value=True)
+        document_type = make_document_type("pt", "Plano de Trabalho")
+
+        result = scraping.SEIScraper._run_document_search_for_process(
+            scraper,
+            "60093.000015/2020-60",
+            document_type,
+        )
+
+        self.assertTrue(result)
+        scraper._open_document_via_tree.assert_called_once_with(
+            "60093.000015/2020-60",
+            document_type,
+            process_url="https://sei.defesa.gov.br/processo",
+        )
+        scraper.logger.info.assert_any_call(
+            "Processo %s: modo_busca_documental=tree_only tipo=%s",
+            "60093.000015/2020-60",
+            "pt",
+        )
+        scraper.logger.info.assert_any_call(
+            "Processo %s: %s sera buscado pela arvore do processo.",
+            "60093.000015/2020-60",
+            "Plano de Trabalho",
+        )
+        self.assertIn(call("tipo:PT:tree_only"), scraper.performance_profiler.start_span.call_args_list)
+        self.assertIn(call("tipo:PT:tree_only"), scraper.performance_profiler.end_span.call_args_list)
+        scraper._ensure_document_search_open.assert_not_called()
+        scraper._buscar_e_abrir_documento_mais_recente.assert_not_called()
+        scraper._record_document_search_outcome.assert_not_called()
+
+    def test_run_document_search_for_process_uses_tree_for_memorando(self) -> None:
+        scraper = scraping.SEIScraper.__new__(scraping.SEIScraper)
+        scraper.logger = Mock()
+        scraper.performance_profiler = Mock(start_span=Mock(), end_span=Mock())
+        scraper.driver = FakeScraperDriver()
+        scraper._build_collection_context = scraping.SEIScraper._build_collection_context.__get__(
+            scraper,
+            scraping.SEIScraper,
+        )
+        scraper._record_document_search_outcome = Mock()
+        scraper._open_document_via_tree = Mock(return_value=True)
+        scraper._ensure_document_search_open = Mock()
+        scraper._buscar_e_abrir_documento_mais_recente = Mock(return_value=True)
+        document_type = make_document_type("memorando", "Memorando de Entendimentos")
+
+        result = scraping.SEIScraper._run_document_search_for_process(
+            scraper,
+            "60093.000015/2020-60",
+            document_type,
+        )
+
+        self.assertTrue(result)
+        scraper._open_document_via_tree.assert_called_once_with(
+            "60093.000015/2020-60",
+            document_type,
+            process_url="https://sei.defesa.gov.br/processo",
+        )
+        scraper.logger.info.assert_any_call(
+            "Processo %s: modo_busca_documental=tree_only tipo=%s",
+            "60093.000015/2020-60",
+            "memorando",
+        )
+        scraper.logger.info.assert_any_call(
+            "Processo %s: %s sera buscado pela arvore do processo.",
+            "60093.000015/2020-60",
+            "Memorando de Entendimentos",
+        )
+        self.assertIn(call("tipo:Memorando:tree_only"), scraper.performance_profiler.start_span.call_args_list)
+        self.assertIn(call("tipo:Memorando:tree_only"), scraper.performance_profiler.end_span.call_args_list)
+        scraper._ensure_document_search_open.assert_not_called()
+        scraper._buscar_e_abrir_documento_mais_recente.assert_not_called()
+        scraper._record_document_search_outcome.assert_not_called()
 
     def test_process_ted_via_api_skips_when_no_instrument_number_is_linked(self) -> None:
         scraper = scraping.SEIScraper.__new__(scraping.SEIScraper)

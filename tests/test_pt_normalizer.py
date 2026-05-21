@@ -8,6 +8,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 
 from app.services.pt_normalizer import (
     CLASSIFICATION_REASON_MINUTA_DOCUMENTACAO,
+    PERIOD_CLASS_CONTAMINATED_TEXT,
+    PERIOD_CLASS_EXPLICIT_DATE,
+    PERIOD_CLASS_NARRATIVE_NO_BASE,
+    PERIOD_CLASS_RELATIVE_APPROVAL,
+    PERIOD_CLASS_RELATIVE_PUBLICATION,
+    PERIOD_CLASS_RELATIVE_SIGNATURE,
     PERIOD_SOURCE_DIRECT,
     PERIOD_SOURCE_NOISE,
     PERIOD_SOURCE_SIGNATURE,
@@ -15,6 +21,7 @@ from app.services.pt_normalizer import (
     PUBLICATION_STATUS_SILVER,
     VALIDATION_STATUS_NON_CANONICAL,
     build_normalized_record,
+    normalize_pt_period,
 )
 from app.rpa.sei.document_text_extractor import parse_prazos
 
@@ -345,6 +352,62 @@ class PTNormalizerTests(unittest.TestCase):
         self.assertEqual(record["prazo_inicio"], "2021-12-14")
         self.assertEqual(record["prazo_fim"], "2026-12-14")
         self.assertEqual(record["period_source"], PERIOD_SOURCE_SIGNATURE)
+        self.assertEqual(record["period_class"], PERIOD_CLASS_RELATIVE_SIGNATURE)
+        self.assertEqual(record["rule_amount"], "5")
+        self.assertEqual(record["rule_unit"], "anos")
+        self.assertEqual(record["rule_anchor"], "assinatura")
+
+    def test_normalize_pt_period_classifica_60_meses_sem_data_base(self) -> None:
+        period = normalize_pt_period("", "60 meses", {})
+        self.assertEqual(period.period_class, PERIOD_CLASS_NARRATIVE_NO_BASE)
+        self.assertEqual(period.rule_amount, "60")
+        self.assertEqual(period.rule_unit, "meses")
+        self.assertEqual(period.missing_base_date, "true")
+        self.assertEqual(period.prazo_fim, "")
+
+    def test_normalize_pt_period_calcula_cinco_anos_apos_assinatura(self) -> None:
+        period = normalize_pt_period(
+            "imediatamente apos a assinatura",
+            "cinco anos apos a assinatura",
+            {"signature_date": "2021-12-14"},
+        )
+        self.assertEqual(period.period_class, PERIOD_CLASS_RELATIVE_SIGNATURE)
+        self.assertEqual(period.prazo_inicio, "2021-12-14")
+        self.assertEqual(period.prazo_fim, "2026-12-14")
+        self.assertEqual(period.rule_amount, "5")
+        self.assertEqual(period.rule_anchor, "assinatura")
+
+    def test_normalize_pt_period_classifica_imediatamente_apos_publicacao(self) -> None:
+        period = normalize_pt_period("imediatamente apos a publicacao", "", {"publication_date": "2024-06-10"})
+        self.assertEqual(period.period_class, PERIOD_CLASS_RELATIVE_PUBLICATION)
+        self.assertEqual(period.prazo_inicio, "2024-06-10")
+        self.assertEqual(period.rule_anchor, "publicacao")
+        self.assertEqual(period.period_warning, "periodo_relativo_sem_regra_completa")
+
+    def test_normalize_pt_period_classifica_relativo_aprovacao_sem_base(self) -> None:
+        period = normalize_pt_period("apos aprovacao", "12 meses apos aprovacao", {})
+        self.assertEqual(period.period_class, PERIOD_CLASS_RELATIVE_APPROVAL)
+        self.assertEqual(period.rule_anchor, "aprovacao")
+        self.assertEqual(period.rule_amount, "12")
+        self.assertEqual(period.missing_base_date, "true")
+
+    def test_normalize_pt_period_data_explicita(self) -> None:
+        period = normalize_pt_period("01/06/2025", "30/06/2030", {})
+        self.assertEqual(period.period_class, PERIOD_CLASS_EXPLICIT_DATE)
+        self.assertEqual(period.prazo_inicio, "2025-06-01")
+        self.assertEqual(period.prazo_fim, "2030-06-30")
+        self.assertEqual(period.period_source, PERIOD_SOURCE_DIRECT)
+
+    def test_normalize_pt_period_narrativo_impossivel_de_calcular(self) -> None:
+        period = normalize_pt_period("", "ate a conclusao das atividades pactuadas", {})
+        self.assertEqual(period.period_class, PERIOD_CLASS_NARRATIVE_NO_BASE)
+        self.assertEqual(period.prazo_fim, "")
+        self.assertEqual(period.period_warning, "periodo_narrativo_sem_data_base")
+
+    def test_normalize_pt_period_texto_contaminado(self) -> None:
+        period = normalize_pt_period("", "codigo verificador 123456 documento assinado eletronicamente", {})
+        self.assertEqual(period.period_class, PERIOD_CLASS_CONTAMINATED_TEXT)
+        self.assertEqual(period.period_warning, "periodo_bruto_contaminado_ou_narrativo")
 
 
 if __name__ == "__main__":

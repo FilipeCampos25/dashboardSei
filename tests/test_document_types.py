@@ -30,7 +30,7 @@ class DocumentTypesTests(unittest.TestCase):
 
     def test_cooperation_document_types_are_separated(self) -> None:
         spec = build_act_document_type()
-        self.assertNotIn("Memorando de Entendimentos", spec.search_terms)
+        self.assertNotIn("memorando", spec.search_terms)
         self.assertFalse(any("TED -" in term for term in spec.search_terms))
         self.assertNotIn("memorando de entendimentos", spec.tree_match_terms)
         self.assertFalse(any("execucao descentralizada" in term for term in spec.tree_match_terms))
@@ -40,10 +40,14 @@ class DocumentTypesTests(unittest.TestCase):
         self.assertEqual(spec.max_filter_candidates, 5)
 
         memorando = build_memorando_document_type()
-        self.assertIn("Memorando de Entendimentos", memorando.search_terms)
+        self.assertIn("memorando", memorando.search_terms)
+        self.assertIn("ofício", memorando.search_terms)
+        self.assertIn("solicitacao", memorando.search_terms)
         self.assertEqual(memorando.snapshot_prefix, "memorando_entendimentos")
-        self.assertEqual(memorando.accepted_doc_classes, ("memorando",))
-        self.assertEqual(memorando.filter_type_aliases, ("Memorando de Entendimentos",))
+        self.assertIn("memorando", memorando.accepted_doc_classes)
+        self.assertIn("oficio", memorando.accepted_doc_classes)
+        self.assertEqual(memorando.filter_type_aliases, memorando.search_terms)
+        self.assertEqual(memorando.max_filter_candidates, 3)
 
         ted = build_ted_document_type()
         self.assertTrue(any("TED -" in term for term in ted.search_terms))

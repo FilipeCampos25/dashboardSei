@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -21,6 +22,16 @@ from app.services.act_normalizer import (
     export_normalized_csv,
 )
 from app.services.dashboard_exporter import export_dashboard_ready_csv
+from app.services.normalization_contract import (
+    CONFIDENCE_HIGH,
+    CONFIDENCE_MEDIUM,
+    SOURCE_DERIVED,
+    SOURCE_DOCUMENT_TEXT,
+    SOURCE_MISSING,
+    build_document_contract,
+    make_field,
+    make_missing_field,
+)
 
 
 class CooperationDocumentHandler:
@@ -277,6 +288,8 @@ class CooperationDocumentHandler:
         ]
         status_path = output_dir / self._status_filename
         csv_writer.write_csv(self._tracking_records, status_path, columns=columns)
+        if spec.key == "memorando":
+            csv_writer.write_csv(self._tracking_records, output_dir / "memorando_status_execucao_latest.csv", columns=columns)
         logger.info(
             "Relatorio %s gerado: total=%d arquivo=%s",
             spec.log_label,
@@ -284,6 +297,30 @@ class CooperationDocumentHandler:
             status_path,
         )
         if not self._export_act_normalized:
+            if spec.key == "memorando":
+                try:
+                    from app.services.documento_administrativo_normalizer import export_normalized_csv as export_admin_normalized_csv
+
+                    export_admin_normalized_csv(output_dir, records=self._tracking_records, logger=logger)
+                except Exception as exc:
+                    logger.warning("Falha ao gerar CSV %s normalizado (%s).", spec.log_label, exc)
+                try:
+                    export_dashboard_ready_csv(output_dir, logger=logger)
+                except Exception as exc:
+                    logger.warning("Falha ao gerar CSV dashboard_ready_latest.csv (%s).", exc)
+                return
+            if spec.key == "ted":
+                try:
+                    from app.services.ted_normalizer import export_normalized_csv as export_ted_normalized_csv
+
+                    export_ted_normalized_csv(output_dir, records=self._tracking_records, logger=logger)
+                except Exception as exc:
+                    logger.warning("Falha ao gerar CSV %s normalizado (%s).", spec.log_label, exc)
+                try:
+                    export_dashboard_ready_csv(output_dir, logger=logger)
+                except Exception as exc:
+                    logger.warning("Falha ao gerar CSV dashboard_ready_latest.csv (%s).", exc)
+                return
             self._export_published_manifest(spec=spec, output_dir=output_dir)
             try:
                 export_dashboard_ready_csv(output_dir, logger=logger)
@@ -310,19 +347,7 @@ class CooperationDocumentHandler:
     def _export_published_manifest(self, *, spec: DocumentTypeSpec, output_dir: Path) -> None:
         # Manifesto gold enxuto para familias que nao possuem normalizacao rica nesta rodada.
         published_rows = [
-            {
-                "captured_at": record.get("captured_at", ""),
-                "requested_type": record.get("requested_type", spec.key),
-                "processo": record.get("processo", ""),
-                "documento": record.get("documento", ""),
-                "resolved_document_type": record.get("resolved_document_type", ""),
-                "selection_reason": record.get("selection_reason", ""),
-                "classification_reason": record.get("classification_reason", ""),
-                "validation_status": record.get("validation_status", ""),
-                "publication_status": record.get("publication_status", ""),
-                "snapshot_mode": record.get("snapshot_mode", ""),
-                "json_path": record.get("json_path", ""),
-            }
+            self._build_published_manifest_row(record=record, spec=spec)
             for record in self._tracking_records
             if record.get("publication_status") == PUBLICATION_STATUS_GOLD and record.get("json_path")
         ]
@@ -344,3 +369,88 @@ class CooperationDocumentHandler:
                 "json_path",
             ],
         )
+
+    def _build_published_manifest_row(self, *, record: Dict[str, Any], spec: DocumentTypeSpec) -> Dict[str, Any]:
+        row = {
+            "captured_at": record.get("captured_at", ""),
+            "requested_type": record.get("requested_type", spec.key),
+            "processo": record.get("processo", ""),
+            "documento": record.get("documento", ""),
+            "resolved_document_type": record.get("resolved_document_type", ""),
+            "selection_reason": record.get("selection_reason", ""),
+            "classification_reason": record.get("classification_reason", ""),
+            "validation_status": record.get("validation_status", ""),
+            "publication_status": record.get("publication_status", ""),
+            "snapshot_mode": record.get("snapshot_mode", ""),
+            "json_path": record.get("json_path", ""),
+        }
+        primary_field_name = "documento_administrativo" if spec.key not in {"memorando", "ted"} else spec.key
+        documento = str(record.get("documento", "") or "")
+        fields = {
+            primary_field_name: make_field(
+                value=documento,
+                raw_value=documento,
+                source_type=SOURCE_DOCUMENT_TEXT if documento else SOURCE_MISSING,
+                confidence=CONFIDENCE_HIGH,
+                rule_id=f"{spec.key}.manifest.documento",
+            )
+            if documento
+            else make_missing_field(rule_id=f"{spec.key}.manifest.documento"),
+            "json_path": make_field(
+                value=str(record.get("json_path", "") or ""),
+                raw_value=str(record.get("json_path", "") or ""),
+                source_type=SOURCE_DOCUMENT_TEXT,
+                confidence=CONFIDENCE_HIGH,
+                rule_id=f"{spec.key}.manifest.json_path",
+            ),
+        }
+        if spec.key == "ted":
+            fields.update(self._build_ted_manifest_fields(record))
+        row["normalization_contract"] = build_document_contract(
+            processo=str(row.get("processo", "") or ""),
+            requested_type=str(row.get("requested_type", "") or spec.key),
+            resolved_document_type=str(row.get("resolved_document_type", "") or ""),
+            documento=str(row.get("documento", "") or "") or None,
+            found=True,
+            is_canonical_candidate=True,
+            validation_status=str(row.get("validation_status", "") or ""),
+            publication_status=str(row.get("publication_status", "") or ""),
+            normalization_status="publicado_canonico",
+            fields=fields,
+        )
+        return row
+
+    def _build_ted_manifest_fields(self, record: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+        payload = self._read_manifest_json(record.get("json_path", ""))
+        snapshot = payload.get("snapshot", {}) if isinstance(payload, dict) else {}
+        api_payload = snapshot.get("api_payload", {}) if isinstance(snapshot, dict) else {}
+        if not isinstance(api_payload, dict):
+            api_payload = {}
+
+        fields: Dict[str, Dict[str, Any]] = {}
+        for field_name in ("objeto", "valor_global", "situacao", "uf"):
+            value = api_payload.get(field_name)
+            fields[field_name] = (
+                make_field(
+                    value=value,
+                    raw_value=value,
+                    source_type=SOURCE_DERIVED,
+                    confidence=CONFIDENCE_MEDIUM,
+                    rule_id=f"ted.api_payload.{field_name}",
+                )
+                if value not in (None, "")
+                else make_missing_field(rule_id=f"ted.api_payload.{field_name}")
+            )
+        return fields
+
+    def _read_manifest_json(self, raw_path: Any) -> Dict[str, Any]:
+        path_text = str(raw_path or "").strip()
+        if not path_text:
+            return {}
+        path = Path(path_text)
+        if not path.exists():
+            return {}
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}

@@ -4,6 +4,7 @@ import calendar
 import json
 import re
 import unicodedata
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -11,6 +12,18 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import pandas as pd
 
 from app.output import csv_writer
+from app.services.normalization_contract import (
+    CONFIDENCE_HIGH,
+    CONFIDENCE_MEDIUM,
+    SOURCE_DERIVED,
+    SOURCE_DOCUMENT_TEXT,
+    SOURCE_MISSING,
+    SOURCE_PREVIEW,
+    SOURCE_TABLE,
+    build_document_contract,
+    make_field,
+    make_missing_field,
+)
 
 ATTRIBUICOES_COLUMN = "atribuições_raw"
 REQUESTED_TYPE_PT = "pt"
@@ -24,6 +37,13 @@ PERIOD_SOURCE_SIGNATURE = "derived_from_signature"
 PERIOD_SOURCE_RELATIVE = "unresolved_relative"
 PERIOD_SOURCE_NOISE = "unresolved_noise"
 PERIOD_SOURCE_MISSING = "missing_period"
+PERIOD_CLASS_EXPLICIT_DATE = "data_explicita"
+PERIOD_CLASS_RELATIVE_SIGNATURE = "prazo_relativo_assinatura"
+PERIOD_CLASS_RELATIVE_PUBLICATION = "prazo_relativo_publicacao"
+PERIOD_CLASS_RELATIVE_APPROVAL = "prazo_relativo_aprovacao"
+PERIOD_CLASS_NARRATIVE_NO_BASE = "prazo_narrativo_sem_data_base"
+PERIOD_CLASS_CONTAMINATED_TEXT = "texto_contaminado"
+PERIOD_CLASS_MISSING = "ausente"
 CLASSIFICATION_REASON_PT = "plano_trabalho_validado_por_conteudo"
 CLASSIFICATION_REASON_MINUTA_DOCUMENTACAO = "pt_minuta_documentacao"
 
@@ -116,6 +136,24 @@ TOP_STOP = (
     r"(?:\bprevisao\s+de\s+inicio\b|\bunidade\s+responsavel\b|\bobservacoes\b"
     r"|\bcronograma\s+de\s+desembolso\b|(?:^|\n)\s*\d+\.\s*[A-Z])"
 )
+
+
+@dataclass(frozen=True)
+class NormalizedPeriod:
+    prazo_inicio_raw: str = ""
+    prazo_inicio: str = ""
+    prazo_fim_raw: str = ""
+    prazo_fim: str = ""
+    period_source: str = PERIOD_SOURCE_MISSING
+    period_warning: str = ""
+    period_class: str = PERIOD_CLASS_MISSING
+    rule_amount: str = ""
+    rule_unit: str = ""
+    rule_anchor: str = ""
+    missing_base_date: str = ""
+
+    def to_record(self) -> Dict[str, str]:
+        return asdict(self)
 
 
 def _log(logger: Any, level: str, msg: str, *args: Any) -> None:
@@ -377,6 +415,80 @@ def _looks_like_relative_signature_reference(value: str) -> bool:
     )
 
 
+def _anchor_from_text(value: str) -> str:
+    normalized = _normalize_text(value)
+    if re.search(r"\b(publicacao|publicado|diario oficial|dou)\b", normalized):
+        return "publicacao"
+    if re.search(r"\b(aprovacao|aprovado|aprovada)\b", normalized):
+        return "aprovacao"
+    if re.search(r"\b(assinatura|assinado|assinada)\b", normalized):
+        return "assinatura"
+    return ""
+
+
+def _period_class_for_anchor(anchor: str) -> str:
+    return {
+        "assinatura": PERIOD_CLASS_RELATIVE_SIGNATURE,
+        "publicacao": PERIOD_CLASS_RELATIVE_PUBLICATION,
+        "aprovacao": PERIOD_CLASS_RELATIVE_APPROVAL,
+    }.get(anchor, PERIOD_CLASS_NARRATIVE_NO_BASE)
+
+
+def _period_source_for_anchor(anchor: str, has_base_date: bool) -> str:
+    if anchor == "assinatura" and has_base_date:
+        return PERIOD_SOURCE_SIGNATURE
+    if anchor:
+        return PERIOD_SOURCE_RELATIVE
+    return PERIOD_SOURCE_NOISE
+
+
+def _base_date_from_context(anchor: str, context: Dict[str, Any]) -> str:
+    keys_by_anchor = {
+        "assinatura": ("signature_date", "assinatura_data", "data_assinatura", "base_signature_date"),
+        "publicacao": ("publication_date", "publicacao_data", "data_publicacao", "base_publication_date"),
+        "aprovacao": ("approval_date", "aprovacao_data", "data_aprovacao", "base_approval_date"),
+    }
+    for key in keys_by_anchor.get(anchor, ()):
+        value = _clean_spaces(str(context.get(key, "") or ""))
+        if value:
+            return value
+    return ""
+
+
+def _parse_amount(raw_amount: str) -> int:
+    normalized = _normalize_text(raw_amount).replace(" ", "_")
+    return int(raw_amount) if str(raw_amount).isdigit() else NUMBER_WORDS.get(normalized, 0)
+
+
+def _normalize_rule_unit(unit: str) -> str:
+    normalized = _normalize_text(unit)
+    if "ano" in normalized:
+        return "anos"
+    if "mes" in normalized:
+        return "meses"
+    return normalized
+
+
+def _duration_match(value: str) -> Optional[re.Match[str]]:
+    normalized = _normalize_text(value)
+    return re.search(
+        r"\b(\d+|um|uma|dois|duas|tres|quatro|cinco|seis|sete|oito|nove|dez|sessenta)"
+        r"(?:\s*\([^)]+\))?\s+(mes(?:es)?|anos?)\b",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+
+
+def _add_rule_duration(base_iso: str, amount: int, unit: str) -> str:
+    try:
+        base = datetime.fromisoformat(base_iso)
+        if "ano" in unit:
+            return base.replace(year=base.year + amount).date().isoformat()
+        return _add_months(base, amount).date().isoformat()
+    except Exception:
+        return ""
+
+
 def _period_value_is_noise(value: str) -> bool:
     normalized = _normalize_text(value)
     if not normalized:
@@ -388,21 +500,119 @@ def _period_value_is_noise(value: str) -> bool:
     return False
 
 
-def _empty_period(*, source: str = PERIOD_SOURCE_MISSING, warning: str = "") -> Dict[str, str]:
-    return {
-        "prazo_inicio_raw": "",
-        "prazo_inicio": "",
-        "prazo_fim_raw": "",
-        "prazo_fim": "",
-        "period_source": source,
-        "period_warning": warning,
-    }
+def _empty_period(*, source: str = PERIOD_SOURCE_MISSING, warning: str = "") -> NormalizedPeriod:
+    period_class = PERIOD_CLASS_CONTAMINATED_TEXT if source == PERIOD_SOURCE_NOISE else PERIOD_CLASS_MISSING
+    return NormalizedPeriod(period_source=source, period_warning=warning, period_class=period_class)
+
+
+def normalize_pt_period(raw_inicio: str, raw_fim: str, context: Dict[str, Any]) -> NormalizedPeriod:
+    start_raw = _clean_spaces(str(raw_inicio or ""))
+    end_raw = _clean_spaces(str(raw_fim or ""))
+    context = context or {}
+    start_iso = _clean_spaces(str(context.get("inicio_data", "") or "")) or _normalize_date_token(start_raw, end_of_month=False)
+    end_iso = _clean_spaces(str(context.get("termino_data", "") or "")) or _normalize_date_token(end_raw, end_of_month=True)
+    raw_blob = _clean_spaces(" ".join(part for part in (start_raw, end_raw) if part))
+    raw_blob_normalized = _normalize_text(raw_blob)
+    if raw_blob_normalized and any(marker in raw_blob_normalized for marker in INVALID_MARKERS):
+        return NormalizedPeriod(
+            prazo_inicio_raw=start_raw,
+            prazo_fim_raw=end_raw,
+            period_source=PERIOD_SOURCE_NOISE,
+            period_warning="periodo_bruto_contaminado_ou_narrativo",
+            period_class=PERIOD_CLASS_CONTAMINATED_TEXT,
+        )
+    anchor = _anchor_from_text(raw_blob)
+    duration = _duration_match(raw_blob)
+
+    if not (anchor or duration) and (start_raw and _period_value_is_noise(start_raw) or end_raw and _period_value_is_noise(end_raw)):
+        return NormalizedPeriod(
+            prazo_inicio_raw=start_raw,
+            prazo_fim_raw=end_raw,
+            period_source=PERIOD_SOURCE_NOISE,
+            period_warning="periodo_bruto_contaminado_ou_narrativo",
+            period_class=PERIOD_CLASS_CONTAMINATED_TEXT,
+        )
+
+    if start_iso and end_iso and end_iso >= start_iso:
+        return NormalizedPeriod(
+            prazo_inicio_raw=start_raw or start_iso,
+            prazo_inicio=start_iso,
+            prazo_fim_raw=end_raw or end_iso,
+            prazo_fim=end_iso,
+            period_source=PERIOD_SOURCE_DIRECT,
+            period_class=PERIOD_CLASS_EXPLICIT_DATE,
+        )
+
+    if not raw_blob:
+        return _empty_period()
+
+    has_immediate_start = bool(re.search(r"\b(imediatamente|a partir|na data)\b", _normalize_text(start_raw or raw_blob)))
+    amount = 0
+    unit = ""
+    if duration:
+        amount = _parse_amount(duration.group(1))
+        unit = _normalize_rule_unit(duration.group(2))
+
+    if anchor:
+        base_date = _base_date_from_context(anchor, context)
+        period_class = _period_class_for_anchor(anchor)
+        if not base_date:
+            return NormalizedPeriod(
+                prazo_inicio_raw=start_raw,
+                prazo_fim_raw=end_raw,
+                period_source=PERIOD_SOURCE_RELATIVE,
+                period_warning=f"periodo_relativo_{anchor}_sem_data_base",
+                period_class=period_class,
+                rule_amount=str(amount) if amount else "",
+                rule_unit=unit,
+                rule_anchor=anchor,
+                missing_base_date="true",
+            )
+        start_value = base_date if (has_immediate_start or anchor in _normalize_text(start_raw)) else ""
+        end_value = _add_rule_duration(base_date, amount, unit) if amount and unit else ""
+        warning = "" if start_value and end_value else "periodo_relativo_sem_regra_completa"
+        return NormalizedPeriod(
+            prazo_inicio_raw=start_raw or f"a partir da {anchor}",
+            prazo_inicio=start_value,
+            prazo_fim_raw=end_raw,
+            prazo_fim=end_value,
+            period_source=_period_source_for_anchor(anchor, bool(base_date)),
+            period_warning=warning,
+            period_class=period_class,
+            rule_amount=str(amount) if amount else "",
+            rule_unit=unit,
+            rule_anchor=anchor,
+            missing_base_date="",
+        )
+
+    if duration or re.search(
+        r"\b(prazo|vigorar|vigencia|meses|anos|imediatamente|apos|a partir|ate a conclusao|conclusao das atividades)\b",
+        _normalize_text(raw_blob),
+    ):
+        return NormalizedPeriod(
+            prazo_inicio_raw=start_raw,
+            prazo_fim_raw=end_raw,
+            period_source=PERIOD_SOURCE_RELATIVE,
+            period_warning="periodo_narrativo_sem_data_base",
+            period_class=PERIOD_CLASS_NARRATIVE_NO_BASE,
+            rule_amount=str(amount) if amount else "",
+            rule_unit=unit,
+            missing_base_date="true",
+        )
+
+    return NormalizedPeriod(
+        prazo_inicio_raw=start_raw,
+        prazo_fim_raw=end_raw,
+        period_source=PERIOD_SOURCE_NOISE,
+        period_warning="periodo_bruto_contaminado_ou_narrativo",
+        period_class=PERIOD_CLASS_CONTAMINATED_TEXT,
+    )
 
 
 def _extract_period_from_snapshot(snapshot: Dict[str, Any], prazos: Dict[str, Any]) -> Dict[str, str]:
     text = _prepare_text(str(snapshot.get("text", "") or ""))
     normalized = _normalize_text(text)
-    empty = _empty_period()
+    empty = _empty_period().to_record()
     if not normalized:
         return empty
 
@@ -421,17 +631,9 @@ def _extract_period_from_snapshot(snapshot: Dict[str, Any], prazos: Dict[str, An
             continue
         start_raw = _clean_spaces(match.group(1))
         end_raw = _clean_spaces(match.group(2))
-        start_iso = _normalize_date_token(start_raw, end_of_month=False)
-        end_iso = _normalize_date_token(end_raw, end_of_month=True)
-        if start_iso and end_iso and end_iso >= start_iso:
-            return {
-                "prazo_inicio_raw": start_raw,
-                "prazo_inicio": start_iso,
-                "prazo_fim_raw": end_raw,
-                "prazo_fim": end_iso,
-                "period_source": PERIOD_SOURCE_DIRECT,
-                "period_warning": "",
-            }
+        period = normalize_pt_period(start_raw, end_raw, {})
+        if period.prazo_inicio and period.prazo_fim:
+            return period.to_record()
 
     signature_dates = _signature_dates(text)
     signature_iso = signature_dates[0] if signature_dates else _clean_spaces(str(prazos.get("inicio_data", "") or ""))
@@ -443,19 +645,13 @@ def _extract_period_from_snapshot(snapshot: Dict[str, Any], prazos: Dict[str, An
         flags=re.IGNORECASE | re.DOTALL,
     )
     if duration and signature_iso:
-        raw_amount, unit = duration.groups()
-        amount = int(raw_amount) if raw_amount.isdigit() else NUMBER_WORDS.get(raw_amount.replace(" ", "_"), 0)
-        if amount > 0:
-            base = datetime.fromisoformat(signature_iso)
-            end_dt = base.replace(year=base.year + amount) if "ano" in unit else _add_months(base, amount)
-            return {
-                "prazo_inicio_raw": "a partir da assinatura",
-                "prazo_inicio": signature_iso,
-                "prazo_fim_raw": duration.group(0),
-                "prazo_fim": end_dt.date().isoformat(),
-                "period_source": PERIOD_SOURCE_SIGNATURE,
-                "period_warning": "",
-            }
+        period = normalize_pt_period(
+            "a partir da assinatura",
+            duration.group(0),
+            {"signature_date": signature_iso},
+        )
+        if period.prazo_inicio and period.prazo_fim:
+            return period.to_record()
 
     if signature_iso:
         start_iso = ""
@@ -475,62 +671,38 @@ def _extract_period_from_snapshot(snapshot: Dict[str, Any], prazos: Dict[str, An
                 end_dt = base.replace(year=base.year + amount) if "ano" in unit else _add_months(base, amount)
                 end_iso = end_dt.date().isoformat()
         if start_iso and end_iso and end_iso >= start_iso:
-            return {
-                "prazo_inicio_raw": "a partir da assinatura",
-                "prazo_inicio": start_iso,
-                "prazo_fim_raw": relative.group(0) if relative else "",
-                "prazo_fim": end_iso,
-                "period_source": PERIOD_SOURCE_SIGNATURE,
-                "period_warning": "",
-            }
+            period = normalize_pt_period(
+                "a partir da assinatura",
+                relative.group(0) if relative else "",
+                {"signature_date": signature_iso},
+            )
+            if period.prazo_inicio and period.prazo_fim:
+                return period.to_record()
 
     start_raw = _clean_spaces(str(prazos.get("inicio_raw", "") or ""))
     end_raw = _clean_spaces(str(prazos.get("termino_raw", "") or ""))
     start_iso = _clean_spaces(str(prazos.get("inicio_data", "") or ""))
     end_iso = _clean_spaces(str(prazos.get("termino_data", "") or ""))
-    if start_raw and not _period_value_is_noise(start_raw):
-        start_iso = start_iso or _normalize_date_token(start_raw, end_of_month=False)
-    if end_raw and not _period_value_is_noise(end_raw):
-        end_iso = end_iso or _normalize_date_token(end_raw, end_of_month=True)
-    if start_iso and end_iso and end_iso >= start_iso:
-        return {
-            "prazo_inicio_raw": start_raw or start_iso,
-            "prazo_inicio": start_iso,
-            "prazo_fim_raw": end_raw or end_iso,
-            "prazo_fim": end_iso,
-            "period_source": PERIOD_SOURCE_DIRECT,
-            "period_warning": "",
-        }
+    context = {
+        "inicio_data": start_iso,
+        "termino_data": end_iso,
+        "signature_date": signature_iso,
+    }
+    period = normalize_pt_period(start_raw, end_raw, context)
+    if period.period_class != PERIOD_CLASS_MISSING and (
+        period.prazo_inicio
+        or period.prazo_fim
+        or period.period_source in {PERIOD_SOURCE_NOISE, PERIOD_SOURCE_RELATIVE}
+    ):
+        return period.to_record()
 
     raw_blob = " ".join(part for part in (start_raw, end_raw) if _clean_spaces(part))
     if raw_blob:
-        if _period_value_is_noise(start_raw) or _period_value_is_noise(end_raw):
-            return _empty_period(source=PERIOD_SOURCE_NOISE, warning="periodo_bruto_contaminado_ou_narrativo")
         if _looks_like_relative_signature_reference(raw_blob):
-            if signature_iso:
-                relative = re.search(
-                    r"(\d+|um|uma|dois|duas|tres|quatro|cinco|seis|sete|oito|nove|dez|sessenta)\s+(mes(?:es)?|anos?)",
-                    _normalize_text(raw_blob),
-                    flags=re.IGNORECASE,
-                )
-                if relative:
-                    raw_amount, unit = relative.groups()
-                    amount = int(raw_amount) if raw_amount.isdigit() else NUMBER_WORDS.get(raw_amount.replace(" ", "_"), 0)
-                    if amount > 0:
-                        base = datetime.fromisoformat(signature_iso)
-                        end_dt = base.replace(year=base.year + amount) if "ano" in unit else _add_months(base, amount)
-                        return {
-                            "prazo_inicio_raw": start_raw or "a partir da assinatura",
-                            "prazo_inicio": signature_iso,
-                            "prazo_fim_raw": end_raw,
-                            "prazo_fim": end_dt.date().isoformat(),
-                            "period_source": PERIOD_SOURCE_SIGNATURE,
-                            "period_warning": "",
-                        }
-            return _empty_period(source=PERIOD_SOURCE_RELATIVE, warning="periodo_relativo_sem_assinatura_inequivoca")
+            return normalize_pt_period(start_raw, end_raw, context).to_record()
 
     if re.search(r"(a partir da assinatura|apos a assinatura|imediatamente apos a assinatura)", normalized, flags=re.IGNORECASE):
-        return _empty_period(source=PERIOD_SOURCE_RELATIVE, warning="periodo_relativo_sem_data_derivada")
+        return normalize_pt_period("a partir da assinatura", "", context).to_record()
 
     return empty
 
@@ -728,6 +900,98 @@ def _classify_record(record: Dict[str, str]) -> Tuple[str, int]:
     return ("extraido_sem_padrao", captured)
 
 
+def _field_or_missing(
+    *,
+    value: str,
+    raw_value: str = "",
+    source_type: str,
+    confidence: str,
+    rule_id: str,
+    warning: str = "",
+) -> Dict[str, Any]:
+    if not _clean_spaces(str(value or "")):
+        return make_missing_field(rule_id=rule_id, warning=warning or "missing")
+    return make_field(
+        value=value,
+        raw_value=raw_value or value,
+        source_type=source_type,
+        confidence=confidence,
+        rule_id=rule_id,
+        warning=warning,
+    )
+
+
+def _period_source_type(period_source: str) -> str:
+    if period_source == PERIOD_SOURCE_DIRECT:
+        return SOURCE_DOCUMENT_TEXT
+    if period_source == PERIOD_SOURCE_SIGNATURE:
+        return SOURCE_DERIVED
+    return SOURCE_MISSING
+
+
+def _build_contract_fields(
+    *,
+    record: Dict[str, str],
+    preview: Dict[str, str],
+    snapshot: Dict[str, Any],
+) -> Dict[str, Dict[str, Any]]:
+    preview_partner = _clean_spaces(str(preview.get("parceiro", "") or ""))
+    preview_objeto = _clean_spaces(str(preview.get("objeto", "") or ""))
+    tables = snapshot.get("tables", []) or []
+    metas_source = SOURCE_TABLE if tables and _clean_spaces(record.get("metas_raw", "")) else SOURCE_DOCUMENT_TEXT
+    acoes_source = SOURCE_TABLE if tables and _clean_spaces(record.get("acoes_raw", "")) else SOURCE_DOCUMENT_TEXT
+    period_source = _clean_spaces(record.get("period_source", ""))
+    period_source_type = _period_source_type(period_source)
+    period_confidence = CONFIDENCE_HIGH if period_source == PERIOD_SOURCE_DIRECT else CONFIDENCE_MEDIUM
+
+    return {
+        "parceiro": _field_or_missing(
+            value=record.get("parceiro", ""),
+            raw_value=preview_partner if preview_partner and record.get("parceiro", "") == preview_partner else record.get("parceiro", ""),
+            source_type=SOURCE_PREVIEW if preview_partner and record.get("parceiro", "") == preview_partner else SOURCE_DOCUMENT_TEXT,
+            confidence=CONFIDENCE_MEDIUM if preview_partner and record.get("parceiro", "") == preview_partner else CONFIDENCE_HIGH,
+            rule_id="pt.parceiro.preview_or_document_text",
+            warning="preview_fallback" if preview_partner and record.get("parceiro", "") == preview_partner else "",
+        ),
+        "vigencia_inicio": _field_or_missing(
+            value=record.get("vigencia_inicio", ""),
+            raw_value=record.get("prazo_inicio_raw", ""),
+            source_type=period_source_type,
+            confidence=period_confidence,
+            rule_id=f"pt.vigencia.{period_source or PERIOD_SOURCE_MISSING}",
+            warning=record.get("period_warning", ""),
+        ),
+        "vigencia_fim": _field_or_missing(
+            value=record.get("vigencia_fim", ""),
+            raw_value=record.get("prazo_fim_raw", ""),
+            source_type=period_source_type,
+            confidence=period_confidence,
+            rule_id=f"pt.vigencia.{period_source or PERIOD_SOURCE_MISSING}",
+            warning=record.get("period_warning", ""),
+        ),
+        "objeto": _field_or_missing(
+            value=record.get("objeto", ""),
+            raw_value=preview_objeto if preview_objeto and record.get("objeto", "") == preview_objeto else record.get("objeto", ""),
+            source_type=SOURCE_PREVIEW if preview_objeto and record.get("objeto", "") == preview_objeto else SOURCE_DOCUMENT_TEXT,
+            confidence=CONFIDENCE_MEDIUM if preview_objeto and record.get("objeto", "") == preview_objeto else CONFIDENCE_HIGH,
+            rule_id="pt.objeto.preview_or_document_text",
+            warning="preview_fallback" if preview_objeto and record.get("objeto", "") == preview_objeto else "",
+        ),
+        "metas_raw": _field_or_missing(
+            value=record.get("metas_raw", ""),
+            source_type=metas_source,
+            confidence=CONFIDENCE_MEDIUM,
+            rule_id="pt.execucao.metas",
+        ),
+        "acoes_raw": _field_or_missing(
+            value=record.get("acoes_raw", ""),
+            source_type=acoes_source,
+            confidence=CONFIDENCE_MEDIUM,
+            rule_id="pt.execucao.acoes",
+        ),
+    }
+
+
 def build_normalized_record(payload: Dict[str, Any], preview: Dict[str, str], json_path: Path) -> Dict[str, str]:
     snapshot = payload.get("snapshot", {}) or {}
     collection = payload.get("collection", {}) or {}
@@ -743,26 +1007,36 @@ def build_normalized_record(payload: Dict[str, Any], preview: Dict[str, str], js
         or period["period_warning"]
         or CLASSIFICATION_REASON_PT
     )
+    parceiro = _extract_partner(snapshot, preview)
+    objeto = _extract_objeto(snapshot, preview)
+    atribuicoes = _extract_atribuicoes(snapshot)
+    metas = _extract_metas(snapshot)
+    acoes = _extract_acoes(snapshot)
     record = {
         "captured_at": _clean_spaces(str(payload.get("captured_at", "") or "")),
         "requested_type": _clean_spaces(str(payload.get("requested_type", "") or "")) or REQUESTED_TYPE_PT,
         "resolved_document_type": _clean_spaces(str(analysis.get("resolved_document_type", "") or "")) or _clean_spaces(str(payload.get("resolved_document_type", "") or "")) or RESOLVED_TYPE_PT,
         "processo": _clean_spaces(str(payload.get("processo", "") or "")),
         "documento": _clean_spaces(str(payload.get("documento", "") or "")),
-        "parceiro": _extract_partner(snapshot, preview),
+        "parceiro": parceiro,
         "vigencia_raw": vigencia_raw,
         "vigencia_inicio": period["prazo_inicio"],
         "vigencia_fim": period["prazo_fim"],
-        "objeto": _extract_objeto(snapshot, preview),
-        ATTRIBUICOES_COLUMN: _extract_atribuicoes(snapshot),
-        "metas_raw": _extract_metas(snapshot),
-        "acoes_raw": _extract_acoes(snapshot),
+        "objeto": objeto,
+        ATTRIBUICOES_COLUMN: atribuicoes,
+        "metas_raw": metas,
+        "acoes_raw": acoes,
         "prazo_inicio_raw": period["prazo_inicio_raw"],
         "prazo_inicio": period["prazo_inicio"],
         "prazo_fim_raw": period["prazo_fim_raw"],
         "prazo_fim": period["prazo_fim"],
         "period_source": period["period_source"],
         "period_warning": period["period_warning"],
+        "period_class": period.get("period_class", ""),
+        "rule_amount": period.get("rule_amount", ""),
+        "rule_unit": period.get("rule_unit", ""),
+        "rule_anchor": period.get("rule_anchor", ""),
+        "missing_base_date": period.get("missing_base_date", ""),
         "selection_reason": _clean_spaces(str(collection.get("selection_reason", "") or "")),
         "classification_reason": classification_reason,
         "validation_status": validation_status,
@@ -777,6 +1051,20 @@ def build_normalized_record(payload: Dict[str, Any], preview: Dict[str, str], js
         PUBLICATION_STATUS_GOLD
         if is_canonical_candidate and status == "completo_padronizado"
         else PUBLICATION_STATUS_SILVER
+    )
+    contract_fields = _build_contract_fields(record=record, preview=preview, snapshot=snapshot)
+    record["normalization_contract"] = build_document_contract(
+        processo=record["processo"],
+        requested_type=record["requested_type"],
+        resolved_document_type=record["resolved_document_type"],
+        documento=record["documento"] or None,
+        found=True,
+        is_canonical_candidate=is_canonical_candidate,
+        validation_status=record["validation_status"],
+        publication_status=record["publication_status"],
+        normalization_status=record["normalization_status"],
+        fields=contract_fields,
+        extra_issues=[record.get("period_warning", "")],
     )
     return record
 
@@ -818,6 +1106,11 @@ def export_normalized_csv(output_dir: Path, logger: Any = None) -> Dict[str, Any
         "prazo_fim",
         "period_source",
         "period_warning",
+        "period_class",
+        "rule_amount",
+        "rule_unit",
+        "rule_anchor",
+        "missing_base_date",
         "selection_reason",
         "classification_reason",
         "validation_status",
@@ -831,6 +1124,27 @@ def export_normalized_csv(output_dir: Path, logger: Any = None) -> Dict[str, Any
 
     audit_path = output_dir / "pt_auditoria_latest.csv"
     csv_writer.write_csv(records, audit_path, columns=columns)
+
+    diagnostic_columns = [
+        "processo",
+        "documento",
+        "prazo_inicio_raw",
+        "prazo_inicio",
+        "prazo_fim_raw",
+        "prazo_fim",
+        "period_class",
+        "period_source",
+        "rule_amount",
+        "rule_unit",
+        "rule_anchor",
+        "missing_base_date",
+        "period_warning",
+        "normalization_status",
+        "publication_status",
+        "json_path",
+    ]
+    diagnostics_path = output_dir / "pt_period_diagnostics_latest.csv"
+    csv_writer.write_csv(records, diagnostics_path, columns=diagnostic_columns)
 
     published_rows = [record for record in records if record.get("publication_status") == PUBLICATION_STATUS_GOLD]
     csv_path = output_dir / "pt_normalizado_latest.csv"
@@ -853,6 +1167,7 @@ def export_normalized_csv(output_dir: Path, logger: Any = None) -> Dict[str, Any
         "csv_path": csv_path,
         "latest_path": csv_path,
         "audit_path": audit_path,
+        "diagnostics_path": diagnostics_path,
         "complete_path": complete_path,
         "complete_latest_path": complete_path,
     }
