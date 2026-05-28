@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import csv
 import os
 import sys
 import unittest
 from pathlib import Path
+from typing import Any
 from unittest.mock import Mock, patch
 
 
@@ -67,6 +69,22 @@ class InternalBlockProfileResolutionTests(unittest.TestCase):
         self.assertIsNotNone(profile)
         self.assertEqual(profile.key, "parcerias_vigentes")
 
+    def test_parcerias_descontinuadas_resolves_profile_with_accent(self) -> None:
+        scraper = self._make_scraper()
+
+        profile = scraper._resolve_internal_block_profile("PARCERIAS DESCONTINUADAS / N\u00c3O REALIZADAS")
+
+        self.assertIsNotNone(profile)
+        self.assertEqual(profile.key, "parcerias_descontinuadas")
+
+    def test_parcerias_descontinuadas_resolves_profile_without_accent(self) -> None:
+        scraper = self._make_scraper()
+
+        profile = scraper._resolve_internal_block_profile("PARCERIAS DESCONTINUADAS / NAO REALIZADAS")
+
+        self.assertIsNotNone(profile)
+        self.assertEqual(profile.key, "parcerias_descontinuadas")
+
     def test_ted_resolves_profile_with_accent(self) -> None:
         scraper = self._make_scraper()
 
@@ -119,6 +137,16 @@ class InternalBlockProfileDocumentTypesTests(unittest.TestCase):
         document_types = scraper._get_document_types_for_profile(profile)
 
         self.assertEqual([spec.key for spec in document_types], ["ted"])
+
+    def test_parcerias_descontinuadas_profile_is_preview_only(self) -> None:
+        scraper = self._make_scraper()
+        profile = next(item for item in scraping.INTERNAL_BLOCK_PROFILES if item.key == "parcerias_descontinuadas")
+
+        document_types = scraper._get_document_types_for_profile(profile)
+
+        self.assertEqual(document_types, [])
+        self.assertTrue(profile.collect_preview)
+        self.assertEqual(profile.preview_strategy, "parcerias_descontinuadas")
 
     def test_ted_does_not_appear_in_parcerias_vigentes_profile(self) -> None:
         scraper = self._make_scraper()
@@ -181,6 +209,7 @@ class InternalBlockProfileMainLoopTests(unittest.TestCase):
         scraper._open_interno_menu = Mock()
         scraper._click_selected_interno = Mock(return_value=True)
         scraper._collect_preview_if_parcerias_vigencias = Mock()
+        scraper._collect_preview_if_parcerias_descontinuadas = Mock()
         scraper._list_processos = Mock(return_value=["60093.000015/2020-60"])
         scraper._clear_process_filter_state = Mock()
         scraper._switch_to_main_window_context = Mock()
@@ -255,6 +284,31 @@ class InternalBlockProfileMainLoopTests(unittest.TestCase):
             ["ted"],
         )
 
+    def test_main_loop_collects_descontinuadas_preview_only(self) -> None:
+        scraper = self._make_scraper()
+        scraper._select_guided_internos_by_descricao = Mock(
+            return_value=[
+                (
+                    scraping.InternoRow(
+                        numero_interno="I-004",
+                        descricao="PARCERIAS DESCONTINUADAS / NAO REALIZADAS",
+                        descricao_normalizada="PARCERIAS DESCONTINUADAS / NAO REALIZADAS",
+                        link=None,
+                        page=1,
+                        row_index=1,
+                    ),
+                    "PARCERIAS DESCONTINUADAS / NAO REALIZADAS",
+                    "https://sei.example.local/lista",
+                )
+            ]
+        )
+
+        self._run_flow(scraper)
+
+        scraper._collect_preview_if_parcerias_descontinuadas.assert_called_once()
+        scraper._list_processos.assert_not_called()
+        scraper._run_document_search_for_process.assert_not_called()
+
     def test_main_loop_skips_unknown_profile_without_searching_documents(self) -> None:
         scraper = self._make_scraper()
         scraper._select_guided_internos_by_descricao = Mock(
@@ -278,6 +332,141 @@ class InternalBlockProfileMainLoopTests(unittest.TestCase):
 
         scraper._click_selected_interno.assert_not_called()
         scraper._run_document_search_for_process.assert_not_called()
+
+
+class FakeElement:
+    def __init__(self, text: str = "", *, attrs: dict[str, str] | None = None, children: list[Any] | None = None) -> None:
+        self.text = text
+        self.attrs = attrs or {}
+        self.children = children or []
+
+    def find_elements(self, by: str, selector: str) -> list[Any]:
+        if selector == "td":
+            return self.children
+        if "protocoloFechado" in selector or selector == "a":
+            matches: list[Any] = []
+            for child in self.children:
+                if "protocoloFechado" in child.attrs.get("class", ""):
+                    matches.append(child)
+                matches.extend(child.find_elements(by, selector))
+            return matches
+        return []
+
+    def get_attribute(self, name: str) -> str:
+        return self.attrs.get(name, "")
+
+
+class ParceriasDescontinuadasExtractionTests(unittest.TestCase):
+    def _make_scraper(self) -> scraping.SEIScraper:
+        scraper = scraping.SEIScraper.__new__(scraping.SEIScraper)
+        scraper.logger = Mock()
+        scraper._normalize_text = scraping.SEIScraper._normalize_text.__get__(scraper, scraping.SEIScraper)
+        scraper._clean_text_value = scraping.SEIScraper._clean_text_value.__get__(scraper, scraping.SEIScraper)
+        scraper._clean_multiline_text_value = scraping.SEIScraper._clean_multiline_text_value.__get__(
+            scraper,
+            scraping.SEIScraper,
+        )
+        scraper._cell_looks_like_anotacoes = scraping.SEIScraper._cell_looks_like_anotacoes.__get__(
+            scraper,
+            scraping.SEIScraper,
+        )
+        scraper._find_anotacoes_cell_index = scraping.SEIScraper._find_anotacoes_cell_index.__get__(
+            scraper,
+            scraping.SEIScraper,
+        )
+        scraper._extract_processo_from_protocol_row = scraping.SEIScraper._extract_processo_from_protocol_row.__get__(
+            scraper,
+            scraping.SEIScraper,
+        )
+        scraper._extract_descontinuadas_record_from_row = scraping.SEIScraper._extract_descontinuadas_record_from_row.__get__(
+            scraper,
+            scraping.SEIScraper,
+        )
+        scraper._resolve_preview_output_dir = scraping.SEIScraper._resolve_preview_output_dir.__get__(
+            scraper,
+            scraping.SEIScraper,
+        )
+        scraper._save_descontinuadas_records_csv = scraping.SEIScraper._save_descontinuadas_records_csv.__get__(
+            scraper,
+            scraping.SEIScraper,
+        )
+        return scraper
+
+    def test_extract_descontinuadas_record_from_row_returns_process_and_annotations_only(self) -> None:
+        scraper = self._make_scraper()
+        process_link = FakeElement(
+            "60093.000214/2016-91",
+            attrs={"class": "protocoloFechado"},
+        )
+        row = FakeElement(
+            children=[
+                FakeElement(""),
+                FakeElement("1"),
+                FakeElement("60093.000214/2016-91", children=[process_link]),
+                FakeElement("Gestao da Informacao: Protocolo"),
+                FakeElement(
+                    "TIPO: ACORDO DE COOPERACAO TECNICA\n"
+                    "PARCEIRO: Rede Nacional de Ensino e Pesquisa\n"
+                    "STATUS: Nao Realizado",
+                    attrs={
+                        "innerText": " TIPO: ACORDO DE COOPERACAO TECNICA\n\n"
+                        "PARCEIRO: Rede Nacional de Ensino e Pesquisa\n"
+                        "STATUS: Nao Realizado "
+                    },
+                ),
+            ],
+        )
+
+        record = scraper._extract_descontinuadas_record_from_row(
+            row,
+            "PARCERIAS DESCONTINUADAS / NAO REALIZADAS",
+        )
+
+        self.assertEqual(
+            record,
+            {
+                "processo": "60093.000214/2016-91",
+                "anotacoes": "TIPO: ACORDO DE COOPERACAO TECNICA\n"
+                "PARCEIRO: Rede Nacional de Ensino e Pesquisa\n"
+                "STATUS: Nao Realizado",
+            },
+        )
+
+    def test_save_descontinuadas_records_csv_writes_expected_columns(self) -> None:
+        scraper = self._make_scraper()
+        output_dir = Path.cwd() / "output" / "test_parcerias_descontinuadas_unit"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        csv_path = output_dir / "parcerias_descontinuadas_latest.csv"
+        normalized_path = output_dir / "parcerias_descontinuadas_normalizado_latest.csv"
+        if csv_path.exists():
+            csv_path.unlink()
+        if normalized_path.exists():
+            normalized_path.unlink()
+        scraper.settings = Mock(output_dir=str(output_dir))
+
+        try:
+            written_path = scraper._save_descontinuadas_records_csv(
+                [
+                    {
+                        "processo": " 60093.000214/2016-91 ",
+                        "anotacoes": " TIPO: ACORDO\n\n STATUS: Nao Realizado ",
+                    }
+                ]
+            )
+
+            self.assertEqual(written_path, csv_path)
+            self.assertTrue(normalized_path.exists())
+            with csv_path.open(encoding="utf-8-sig", newline="") as file:
+                rows = list(csv.DictReader(file))
+        finally:
+            if csv_path.exists():
+                csv_path.unlink()
+            if normalized_path.exists():
+                normalized_path.unlink()
+
+        self.assertEqual(list(rows[0].keys()), ["processo", "anotacoes"])
+        self.assertEqual(rows[0]["processo"], "60093.000214/2016-91")
+        self.assertEqual(rows[0]["anotacoes"], "TIPO: ACORDO\nSTATUS: Nao Realizado")
 
 
 if __name__ == "__main__":

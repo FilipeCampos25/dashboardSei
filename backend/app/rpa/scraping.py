@@ -117,6 +117,13 @@ INTERNAL_BLOCK_PROFILES: tuple[InternalBlockProfile, ...] = (
         preview_strategy="parcerias_vigentes",
     ),
     InternalBlockProfile(
+        key="parcerias_descontinuadas",
+        description_patterns=("PARCERIAS DESCONTINUADAS / NAO REALIZADAS",),
+        document_type_keys=(),
+        collect_preview=True,
+        preview_strategy="parcerias_descontinuadas",
+    ),
+    InternalBlockProfile(
         key="ted",
         description_patterns=(
             "TERMO DE EXECUCAO DESCENTRALIZADA",
@@ -338,6 +345,8 @@ class SEIScraper:
 
         cleanup_patterns = {
             "parcerias_vigentes_latest.csv",
+            "parcerias_descontinuadas_latest.csv",
+            "parcerias_descontinuadas_normalizado_latest.csv",
             "dashboard_ready_latest.csv",
             "divergence_matrix_latest.csv",
         }
@@ -420,7 +429,12 @@ class SEIScraper:
                     continue
 
                 document_types_for_interno = self._get_document_types_for_profile(profile)
-                if not document_types_for_interno:
+                supported_preview_strategy = profile.preview_strategy in {
+                    "parcerias_vigentes",
+                    "parcerias_descontinuadas",
+                }
+                preview_only = bool(profile.collect_preview and supported_preview_strategy and not document_types_for_interno)
+                if not document_types_for_interno and not preview_only:
                     self.logger.warning(
                         "Interno %s (%s): profile=%s sem document types disponiveis; interno sera ignorado.",
                         selecionado.numero_interno,
@@ -434,13 +448,13 @@ class SEIScraper:
                     selecionado.numero_interno,
                     selecionado.descricao,
                     profile.key,
-                    ", ".join(spec.key for spec in document_types_for_interno),
+                    ", ".join(spec.key for spec in document_types_for_interno) if document_types_for_interno else "(preview-only)",
                 )
 
                 if not self._click_selected_interno(selecionado, selected_target, list_url):
                     continue
 
-                if profile.collect_preview and profile.preview_strategy == "parcerias_vigentes":
+                if profile.collect_preview and supported_preview_strategy:
                     self.logger.info(
                         "Interno %s (%s): profile=%s preview_strategy=%s; iniciando preview.",
                         selecionado.numero_interno,
@@ -448,7 +462,7 @@ class SEIScraper:
                         profile.key,
                         profile.preview_strategy,
                     )
-                    self._collect_preview_if_parcerias_vigencias()
+                    self._collect_preview_for_profile(profile)
                 elif profile.collect_preview:
                     self.logger.warning(
                         "Interno %s (%s): profile=%s solicitou preview_strategy=%s sem suporte; preview sera ignorado.",
@@ -464,6 +478,14 @@ class SEIScraper:
                         selecionado.descricao,
                         profile.key,
                     )
+                if not document_types_for_interno:
+                    self.logger.info(
+                        "Interno %s (%s): profile=%s preview-only concluido; busca documental sera pulada.",
+                        selecionado.numero_interno,
+                        selecionado.descricao,
+                        profile.key,
+                    )
+                    continue
                 processos = self._list_processos()
                 if max_processos_por_interno is not None:
                     processos = processos[:max_processos_por_interno]
@@ -3493,6 +3515,14 @@ class SEIScraper:
     def _clean_text_value(self, value: str) -> str:
         return " ".join((value or "").replace("\xa0", " ").split()).strip()
 
+    def _clean_multiline_text_value(self, value: str) -> str:
+        lines = []
+        for line in (value or "").replace("\xa0", " ").replace("\r", "\n").splitlines():
+            cleaned = " ".join(line.split()).strip()
+            if cleaned:
+                lines.append(cleaned)
+        return "\n".join(lines)
+
     def _clean_numero_act(self, value: str) -> str:
         cleaned = self._clean_text_value(value)
         if not cleaned:
@@ -3685,6 +3715,18 @@ class SEIScraper:
                 return idx
         return -1
 
+    def _extract_processo_from_protocol_row(self, row: Any) -> str:
+        for selector in ("a.protocoloFechado", "a[class*='protocoloFechado']", "a"):
+            try:
+                links = row.find_elements(By.CSS_SELECTOR, selector)
+            except WebDriverException:
+                links = []
+            for link in links:
+                text = (link.text or "").strip()
+                if text:
+                    return text
+        return ""
+
 
     def _extract_preview_record_from_row(self, row: Any, interno_descricao: str) -> Optional[Dict[str, str]]:
         try:
@@ -3696,20 +3738,7 @@ class SEIScraper:
 
         cell_texts = [(td.text or "").strip() for td in tds]
 
-        processo = ""
-        for selector in ("a.protocoloFechado", "a[class*='protocoloFechado']", "a"):
-            try:
-                links = row.find_elements(By.CSS_SELECTOR, selector)
-            except WebDriverException:
-                links = []
-            for link in links:
-                text = (link.text or "").strip()
-                if text:
-                    processo = text
-                    break
-            if processo:
-                break
-
+        processo = self._extract_processo_from_protocol_row(row)
         if not processo:
             return None
 
@@ -3734,6 +3763,32 @@ class SEIScraper:
             "numero_act": anotacoes_parsed["numero_act"],
         }
 
+    def _extract_descontinuadas_record_from_row(self, row: Any, interno_descricao: str) -> Optional[Dict[str, str]]:
+        try:
+            tds = row.find_elements(By.CSS_SELECTOR, "td")
+        except WebDriverException:
+            return None
+        if not tds:
+            return None
+
+        processo = self._extract_processo_from_protocol_row(row)
+        if not processo:
+            return None
+
+        cell_texts = [(td.text or "").strip() for td in tds]
+        anotacoes_idx = self._find_anotacoes_cell_index(tds, cell_texts)
+        anotacoes_raw = ""
+        if anotacoes_idx >= 0 and anotacoes_idx < len(tds):
+            try:
+                anotacoes_raw = tds[anotacoes_idx].get_attribute("innerText") or ""
+            except WebDriverException:
+                anotacoes_raw = tds[anotacoes_idx].text or ""
+
+        return {
+            "processo": self._clean_text_value(processo),
+            "anotacoes": self._clean_multiline_text_value(anotacoes_raw),
+        }
+
     def _collect_preview_records_from_current_page(self, interno_descricao: str) -> List[Dict[str, str]]:
         try:
             rows = self.wait_for_elements(
@@ -3753,6 +3808,35 @@ class SEIScraper:
         try:
             for row in rows:
                 record = self._extract_preview_record_from_row(row, interno_descricao)
+                if record:
+                    records.append(record)
+        finally:
+            try:
+                self.driver.switch_to.default_content()
+            except WebDriverException:
+                pass
+
+        return records
+
+    def _collect_descontinuadas_records_from_current_page(self, interno_descricao: str) -> List[Dict[str, str]]:
+        try:
+            rows = self.wait_for_elements(
+                "//table[@id='tblProtocolosBlocos']//tbody/tr[td]",
+                tag="descontinuadas_tblProtocolosBlocos_rows",
+                timeout=max(5, min(10, self.timeout_seconds)),
+                restore_context=False,
+            )
+        except TimeoutException:
+            self.logger.warning(
+                "Coleta PARCERIAS DESCONTINUADAS pulada: tabela tblProtocolosBlocos nao encontrada para descricao '%s'.",
+                interno_descricao,
+            )
+            return []
+
+        records: List[Dict[str, str]] = []
+        try:
+            for row in rows:
+                record = self._extract_descontinuadas_record_from_row(row, interno_descricao)
                 if record:
                     records.append(record)
         finally:
@@ -3798,6 +3882,46 @@ class SEIScraper:
         if page > max_pages:
             self.logger.warning(
                 "Coleta PARCERIAS VIGENTES: limite de seguranca de paginacao atingido (%d paginas).",
+                max_pages,
+            )
+
+        return all_records
+
+    def _collect_descontinuadas_records_from_current_list(self, interno_descricao: str) -> List[Dict[str, str]]:
+        all_records: List[Dict[str, str]] = []
+        seen_rows: Set[Tuple[str, str]] = set()
+        seen_pages: Set[Tuple[str, int]] = set()
+        page = 1
+        max_pages = 100
+
+        while page <= max_pages:
+            page_records = self._collect_descontinuadas_records_from_current_page(interno_descricao)
+            page_signature = (
+                page_records[0]["processo"] if page_records else "",
+                len(page_records),
+            )
+            if page_signature in seen_pages and page_records:
+                self.logger.warning(
+                    "Coleta PARCERIAS DESCONTINUADAS: pagina repetida detectada na pagina %d; encerrando paginacao.",
+                    page,
+                )
+                break
+            seen_pages.add(page_signature)
+
+            for record in page_records:
+                row_key = (record.get("processo", ""), record.get("anotacoes", ""))
+                if row_key in seen_rows:
+                    continue
+                seen_rows.add(row_key)
+                all_records.append(record)
+
+            if not self._click_next_page_if_available(page=page):
+                break
+            page += 1
+
+        if page > max_pages:
+            self.logger.warning(
+                "Coleta PARCERIAS DESCONTINUADAS: limite de seguranca de paginacao atingido (%d paginas).",
                 max_pages,
             )
 
@@ -4193,6 +4317,44 @@ class SEIScraper:
         csv_writer.write_csv(sanitized_records, csv_path, columns=ordered_columns)
         return csv_path
 
+    def _save_descontinuadas_records_csv(self, records: List[Dict[str, str]]) -> Optional[Path]:
+        if not records:
+            return None
+
+        output_dir = self._resolve_preview_output_dir()
+        csv_writer.ensure_output_dir(output_dir)
+        csv_path = output_dir / "parcerias_descontinuadas_latest.csv"
+        ordered_columns = ["processo", "anotacoes"]
+        sanitized_records: List[Dict[str, str]] = []
+        for record in records:
+            sanitized_records.append(
+                {
+                    "processo": self._clean_text_value(str(record.get("processo", "") or "")),
+                    "anotacoes": self._clean_multiline_text_value(str(record.get("anotacoes", "") or "")),
+                }
+            )
+        csv_writer.write_csv(sanitized_records, csv_path, columns=ordered_columns)
+        try:
+            from app.services.parcerias_descontinuadas_normalizer import export_normalized_csv
+
+            export_normalized_csv(output_dir, records=sanitized_records, logger=self.logger)
+        except Exception as exc:
+            self.logger.warning("Falha ao normalizar PARCERIAS DESCONTINUADAS (%s).", exc)
+        return csv_path
+
+    def _collect_preview_for_profile(self, profile: InternalBlockProfile) -> None:
+        if profile.preview_strategy == "parcerias_vigentes":
+            self._collect_preview_if_parcerias_vigencias()
+            return
+        if profile.preview_strategy == "parcerias_descontinuadas":
+            self._collect_preview_if_parcerias_descontinuadas()
+            return
+        self.logger.warning(
+            "Profile %s solicitou preview_strategy=%s sem suporte; preview sera ignorado.",
+            profile.key,
+            profile.preview_strategy,
+        )
+
     def _collect_preview_if_parcerias_vigencias(self) -> None:
         self._preview_records_by_processo = {}
         try:
@@ -4225,6 +4387,37 @@ class SEIScraper:
                 self.logger.info("CSV PARCERIAS VIGENTES nao gerado: nenhuma linha util foi extraida.")
         except Exception as exc:
             self.logger.exception("Falha na coleta preview direcional: %s", exc)
+
+    def _collect_preview_if_parcerias_descontinuadas(self) -> None:
+        try:
+            descricao_atual = self._get_current_interno_descricao_value()
+            if not descricao_atual:
+                self.logger.warning(
+                    "Coleta PARCERIAS DESCONTINUADAS pulada: nao foi possivel ler txtDescricao (descricao atual do interno)."
+                )
+                return
+
+            descricao_norm = self._normalize_text(descricao_atual)
+            if descricao_norm != "PARCERIAS DESCONTINUADAS / NAO REALIZADAS":
+                self.logger.info(
+                    "Coleta PARCERIAS DESCONTINUADAS pulada: interno atual '%s' nao e 'PARCERIAS DESCONTINUADAS / NAO REALIZADAS'.",
+                    descricao_atual,
+                )
+                return
+
+            self.logger.info(
+                "Entrou no interno '%s'. Iniciando coleta de PARCERIAS DESCONTINUADAS / NAO REALIZADAS.",
+                descricao_atual,
+            )
+            records = self._collect_descontinuadas_records_from_current_list(descricao_atual)
+            csv_path = self._save_descontinuadas_records_csv(records)
+            self.logger.info("Coleta PARCERIAS DESCONTINUADAS: %d registro(s) coletado(s).", len(records))
+            if csv_path:
+                self.logger.info("CSV PARCERIAS DESCONTINUADAS gerado em: %s", csv_path)
+            else:
+                self.logger.info("CSV PARCERIAS DESCONTINUADAS nao gerado: nenhuma linha util foi extraida.")
+        except Exception as exc:
+            self.logger.exception("Falha na coleta PARCERIAS DESCONTINUADAS: %s", exc)
 
     # Processos (listagem / abertura)
     def _list_processos(self) -> List[str]:
