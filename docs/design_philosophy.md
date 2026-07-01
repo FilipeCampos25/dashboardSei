@@ -66,7 +66,7 @@ O parser de PT e necessariamente heuristico. Em vez de esconder essa limitacao, 
 
 ### 6. Separacao entre coleta e visualizacao
 
-O dashboard nao depende do backend em tempo real. Isso simplifica a operacao e evita acoplamento prematuro, mas cria uma lacuna de publicacao que ainda precisa ser resolvida.
+O dashboard nao depende do backend em tempo real. Ele le os artefatos `latest` da ultima rodada, monta uma carteira canonica em memoria e preserva a separacao entre coleta, normalizacao, visao gerencial e qualidade.
 
 ## Trade-offs assumidos
 
@@ -74,7 +74,7 @@ O dashboard nao depende do backend em tempo real. Isso simplifica a operacao e e
 - Login manual reduz problemas de autenticacao complexa, mas exige operador.
 - Limpeza do diretorio de saida no inicio da rodada simplifica leitura dos `latest`, mas remove historico local.
 - Normalizacao baseada em texto, tabelas e assinaturas aumenta cobertura, mas continua sujeita a OCR ruim e documentos fora do padrao.
-- O dashboard consumir um contrato diferente do backend protege a interface analitica, mas introduz um passo de integracao ainda ausente.
+- A carteira canonica existir em memoria evita reescrever outputs da coleta, mas exige testes claros para as regras gerenciais de deduplicacao, vigencia e qualidade.
 
 ## Consequencias praticas
 
@@ -86,13 +86,15 @@ O valor do sistema hoje esta em:
 - separar claramente o que vai para silver do que pode subir para gold;
 - gerar uma base normalizada inicial para evolucao do parser.
 
-O valor ainda nao entregue de forma automatica e:
+O valor gerencial entregue pela dashboard e:
 
-- publicar diretamente um `output/sei_dashboard.csv` pronto para o Streamlit.
+- separar carteira ativa de historico;
+- explicitar vigencia, parceiro, objeto e instrumento por processo;
+- tratar dados incompletos como qualidade/cobertura, nao como estatistica falsa.
 
 ## Direcao de evolucao
 
-- Consolidar um publisher do backend para o contrato do dashboard.
+- Avaliar, se necessario, um publisher aditivo da carteira canonica sem substituir os arquivos `latest`.
 - Adicionar cobertura de testes para casos reais de ambiguidade documental.
 - Evoluir a familia de cooperacao quando houver necessidade de suportar novos instrumentos, como `Acordo de Parceria`.
 - Reduzir duplicidade de heuristicas de datas entre extrator e normalizador.

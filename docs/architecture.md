@@ -8,9 +8,9 @@ O repositorio continua organizado em dois executaveis desacoplados:
 Responsavel por autenticar no SEI, navegar nos internos, abrir processos, localizar documentos de parceria e persistir artefatos tecnicos em disco.
 
 2. Dashboard Streamlit
-Responsavel por ler um CSV canonico local e exibir filtros, KPIs, graficos e tabela analitica.
+Responsavel por ler os artefatos `latest`, consolidar uma carteira gerencial em memoria e exibir filtros, KPIs, tabelas e qualidade da base.
 
-O backend produz dados em `backend/output/`. O dashboard consome `output/sei_dashboard.csv` na raiz. Esse desacoplamento ainda nao foi resolvido por um publisher interno.
+O backend produz dados em `backend/output/`. O dashboard consome diretamente `backend/output/*_latest` e `output/execution_log_latest.json`, sem criar ou exigir `output/sei_dashboard.csv`.
 
 ## Entrypoints
 
@@ -18,7 +18,7 @@ O backend produz dados em `backend/output/`. O dashboard consome `output/sei_das
 CLI principal do backend. Resolve flags, configura logging e chama `SEIScraper.run_full_flow(...)`.
 
 - `dashboard_streamlit.py`
-Aplicacao Streamlit que tenta carregar `output/sei_dashboard.csv`.
+Aplicacao Streamlit que carrega a ultima rodada e delega consolidacao, metricas, qualidade e renderizacao aos servicos de dashboard.
 
 ## Modulos principais do backend
 
@@ -74,6 +74,21 @@ Cruza JSONs de PT com a previa de `PARCERIAS VIGENTES`, endurece o parse de peri
 
 - `backend/app/output/csv_writer.py`
 Escrita padronizada de CSV.
+
+- `backend/app/services/dashboard_data.py`
+Leitura segura dos arquivos `latest`, metadados de coleta e compatibilidade com arquivos ausentes, vazios ou malformados.
+
+- `backend/app/services/dashboard_metrics.py`
+Regras puras de vigencia, cobertura, moeda e resumo de texto.
+
+- `backend/app/services/dashboard_portfolio.py`
+Modelo canonico de carteira, deduplicacao, classificacao ativo/historico e enriquecimento por PT, TED e memorando.
+
+- `backend/app/services/dashboard_quality.py`
+Cobertura, conflitos, duplicidades, fila de revisao e criterios para bloquear graficos sobre dimensoes sujas.
+
+- `backend/app/services/dashboard_views.py`
+Componentes Streamlit das paginas gerenciais.
 
 ## Fluxo real do backend
 
@@ -249,41 +264,70 @@ Gold da familia memorando.
 - `ted_status_execucao_latest.csv`
 Silver da familia TED.
 
-### Contrato esperado pelo dashboard
+- `ted_normalizado_latest.csv`
+Gold normalizada de TED quando disponivel, incluindo valor, vigencia e unidades.
 
-Arquivo na raiz:
+- `parcerias_descontinuadas_normalizado_latest.csv`
+Historico de parcerias encerradas, nao realizadas ou com status inconsistente.
 
-- `output/sei_dashboard.csv`
+- `dashboard_ready_latest.csv`
+Base consolidada inicial por processo/instrumento, com melhores campos conhecidos e qualidade.
 
-Colunas canonicas:
+- `divergence_matrix_latest.csv`
+Matriz de divergencias e origem dos melhores campos usados na carteira.
+
+- `normalization_review_queue_latest.csv`
+Fila de revisao e qualidade.
+
+### Contrato consumido pelo dashboard
+
+Fontes primarias:
+
+- `backend/output/dashboard_ready_latest.csv`
+- `backend/output/parcerias_vigentes_latest.csv`
+- `backend/output/parcerias_descontinuadas_normalizado_latest.csv`
+- `backend/output/pt_auditoria_latest.csv`
+- `backend/output/pt_normalizado_latest.csv`
+- `backend/output/act_normalizado_latest.csv`
+- `backend/output/act_classificacao_latest.csv`
+- `backend/output/memorando_normalizado_latest.csv`
+- `backend/output/documento_administrativo_normalizado_latest.csv`
+- `backend/output/ted_normalizado_latest.csv`
+- `backend/output/divergence_matrix_latest.csv`
+- `backend/output/normalization_review_queue_latest.csv`
+- `backend/output/performance_analysis.json`
+- `output/execution_log_latest.json`
+
+Modelo canonico em memoria:
 
 - `processo`
-- `documento`
+- `processo_normalizado`
+- `chave_canonica`
+- `situacao_carteira`
+- `documento_principal_tipo`
+- `documento_principal_numero`
+- `documentos_relacionados`
 - `parceiro`
+- `objeto_resumo`
+- `objeto_completo`
 - `vigencia_inicio`
 - `vigencia_fim`
-- `objeto`
-- `atribuicao`
-- `meta`
-- `acao`
-- `prazo`
-- `status`
-- `fonte`
-- `collected_at`
+- `dias_restantes`
+- `indicador_vigencia`
+- campos de PT, TED, memorando, qualidade, origem e conflitos
 
 ## Dashboard
 
 O dashboard:
 
-1. tenta ler `output/sei_dashboard.csv`;
-2. aplica aliases de colunas;
-3. tenta completar campos a partir de uma coluna `linha`;
-4. faz parse de datas;
-5. calcula `vigencia_status`;
-6. renderiza filtros, KPIs, graficos e tabela.
+1. le os arquivos `latest` de forma segura;
+2. obtem a data real da ultima coleta pelo log, com fallback para `captured_at` e mtime;
+3. monta modelos independentes para `Parcerias Vigentes`, `Termo de Execucao Descentralizada` e `Parcerias Descontinuadas / Nao Realizadas`;
+4. calcula vigencia com a regra centralizada apenas onde ha acompanhamento operacional de prazo;
+5. renderiza exatamente as tres categorias principais, sem total geral ou metricas misturadas.
 
-Se o CSV nao existir, usa um dataset de exemplo embutido.
+Se uma fonte nao existir ou estiver vazia, a dashboard mostra estado vazio e cobertura, sem dados de exemplo.
 
-## Lacuna arquitetural atual
+## Separacao arquitetural atual
 
-Ainda falta uma etapa que converta a gold do backend para o contrato `output/sei_dashboard.csv`.
+A camada gerencial fica no pacote `dashboard/` e nao altera o pipeline Selenium nem os arquivos bronze, silver e gold existentes. O entrypoint `dashboard_streamlit.py` apenas renderiza os modelos preparados por categoria. Se for necessario publicar um artefato canonico persistido no futuro, ele deve ser criado de forma aditiva a partir do mesmo contrato em memoria.

@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import date
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
 import pandas as pd
+
+from . import dashboard_metrics
 
 DEFAULT_LOG_LIMIT = 20
 
@@ -17,12 +20,14 @@ OVERVIEW_COLUMNS = [
     "preview_vigencia",
     "pt_gold",
     "pt_json_path",
+    "pt_data_assinatura",
     "pt_vigencia_inicio",
     "pt_vigencia_fim",
     "pt_quality",
     "act_gold",
     "act_json_path",
     "act_numero_acordo",
+    "act_data_assinatura",
     "act_data_inicio_vigencia",
     "act_data_fim_vigencia",
     "act_orgao_convenente",
@@ -33,6 +38,7 @@ OVERVIEW_COLUMNS = [
     "source_act_parceiro",
     "memorando_gold",
     "memorando_json_path",
+    "memorando_data_assinatura",
     "ted_quality",
     "ted_gold",
     "ted_json_path",
@@ -55,6 +61,10 @@ OVERVIEW_COLUMNS = [
     "best_vigencia_raw",
     "best_vigencia_source",
     "best_vigencia_confidence",
+    "best_data_assinatura",
+    "best_datas_assinatura",
+    "best_data_assinatura_source",
+    "best_data_assinatura_confidence",
     "best_objeto",
     "best_objeto_source",
     "best_objeto_confidence",
@@ -68,6 +78,8 @@ PT_DETAIL_COLUMNS = [
     "processo",
     "documento",
     "parceiro",
+    "data_assinatura",
+    "datas_assinatura",
     "vigencia_raw",
     "vigencia_inicio",
     "vigencia_fim",
@@ -93,6 +105,52 @@ PT_DETAIL_COLUMNS = [
 ]
 
 PT_ATTRIBUICOES_ALIASES = ("atribuicoes_raw", "atribuições_raw")
+
+
+PARCERIAS_VIGENTES_COLUMNS = [
+    "interno_descricao",
+    "seq",
+    "processo",
+    "parceiro",
+    "vigencia",
+    "numero_act",
+    "objeto",
+]
+
+TED_PROJECT_COLUMNS = [
+    "processo",
+    "documento",
+    "numero_ted",
+    "ano_ted",
+    "objeto",
+    "unidade_descentralizadora",
+    "unidade_descentralizada",
+    "valor_global",
+    "vigencia_inicio",
+    "vigencia_fim",
+]
+
+PARCERIAS_DESCONTINUADAS_COLUMNS = [
+    "processo",
+    "tipo",
+    "numero_act",
+    "numero_termo_encerramento",
+    "parceiro",
+    "vigencia",
+    "objeto",
+    "gestor_titular",
+    "gestor_substituto",
+    "portaria_designacao",
+    "data_assinatura",
+    "data_vencimento",
+    "termo_encerramento_raw",
+    "status_raw",
+    "status_normalizado",
+    "status_categoria",
+    "normalization_status",
+    "missing_fields",
+    "raw_anotacoes",
+]
 
 
 def _empty_dataframe(columns: Iterable[str]) -> pd.DataFrame:
@@ -165,6 +223,30 @@ def _to_float(value: Any) -> float:
         return float(str(value or "").replace(",", ".").strip())
     except Exception:
         return 0.0
+
+
+def _to_money_float(value: Any) -> float:
+    return dashboard_metrics.money_to_float(value)
+
+
+def _parse_project_date(value: Any) -> pd.Timestamp:
+    return dashboard_metrics.parse_date(value)
+
+
+def _format_project_date(value: Any) -> str:
+    return dashboard_metrics.format_date(value)
+
+
+def _days_until(end_date: Any, today: date | pd.Timestamp | None = None) -> int | None:
+    return dashboard_metrics.days_remaining(end_date, today=today)
+
+
+def classify_deadline(end_date: Any, today: date | pd.Timestamp | None = None) -> str:
+    return dashboard_metrics.classify_deadline(end_date, today=today)
+
+
+def _add_deadline_columns(df: pd.DataFrame, end_column: str) -> pd.DataFrame:
+    return dashboard_metrics.add_deadline_columns(df, end_column, indicator_column="indicador_prazo")
 
 
 def _resolve_json_path(raw_path: Any, backend_output_dir: Path, root_dir: Path) -> Path | None:
@@ -270,6 +352,8 @@ def dashboard_source_paths(root_dir: Path) -> List[Path]:
     backend_output_dir = root_dir / "backend" / "output"
     return [
         backend_output_dir / "dashboard_ready_latest.csv",
+        backend_output_dir / "parcerias_vigentes_latest.csv",
+        backend_output_dir / "parcerias_descontinuadas_normalizado_latest.csv",
         backend_output_dir / "pt_normalizado_latest.csv",
         backend_output_dir / "pt_auditoria_latest.csv",
         backend_output_dir / "act_normalizado_latest.csv",
@@ -298,6 +382,11 @@ def build_file_signature(paths: Iterable[Path]) -> tuple[tuple[str, bool, int, i
 def load_dashboard_bundle(root_dir: Path) -> Dict[str, Any]:
     backend_output_dir = root_dir / "backend" / "output"
     overview_df = _prepare_overview_df(_read_csv(backend_output_dir / "dashboard_ready_latest.csv", OVERVIEW_COLUMNS))
+    parcerias_vigentes_df = _read_csv(backend_output_dir / "parcerias_vigentes_latest.csv", PARCERIAS_VIGENTES_COLUMNS)
+    parcerias_descontinuadas_df = _read_csv(
+        backend_output_dir / "parcerias_descontinuadas_normalizado_latest.csv",
+        PARCERIAS_DESCONTINUADAS_COLUMNS,
+    )
     pt_normalized_df = _ensure_pt_columns(_read_csv(backend_output_dir / "pt_normalizado_latest.csv"))
     pt_audit_df = _ensure_pt_columns(_read_csv(backend_output_dir / "pt_auditoria_latest.csv"))
     pt_status_df = _prepare_status_df(_read_csv(backend_output_dir / "pt_status_execucao_latest.csv"))
@@ -313,6 +402,8 @@ def load_dashboard_bundle(root_dir: Path) -> Dict[str, Any]:
         "root_dir": root_dir,
         "backend_output_dir": backend_output_dir,
         "overview": overview_df,
+        "parcerias_vigentes": parcerias_vigentes_df,
+        "parcerias_descontinuadas": parcerias_descontinuadas_df,
         "pt_normalized": pt_normalized_df,
         "pt_audit": pt_audit_df,
         "pt_status": pt_status_df,
@@ -422,6 +513,193 @@ def filter_by_processes(df: pd.DataFrame, processes: Iterable[str]) -> pd.DataFr
     if not selected or "processo" not in df.columns:
         return df.copy()
     return df[df["processo"].isin(selected)].copy()
+
+
+def _ensure_columns(df: pd.DataFrame, columns: Iterable[str]) -> pd.DataFrame:
+    result = df.copy()
+    for column in columns:
+        if column not in result.columns:
+            result[column] = ""
+    return result
+
+
+def _overview_lookup(bundle: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    overview_df = bundle.get("overview", _empty_dataframe([]))
+    if overview_df.empty or "processo" not in overview_df.columns:
+        return {}
+    rows: Dict[str, Dict[str, Any]] = {}
+    for record in overview_df.to_dict(orient="records"):
+        processo = _clean_spaces(record.get("processo", ""))
+        if processo and processo not in rows:
+            rows[processo] = record
+    return rows
+
+
+def project_vigentes_dataframe(bundle: Dict[str, Any]) -> pd.DataFrame:
+    source_df = _ensure_columns(
+        bundle.get("parcerias_vigentes", _empty_dataframe(PARCERIAS_VIGENTES_COLUMNS)),
+        PARCERIAS_VIGENTES_COLUMNS,
+    )
+    overview_by_process = _overview_lookup(bundle)
+    rows: List[Dict[str, Any]] = []
+    for record in source_df.to_dict(orient="records"):
+        processo = _clean_spaces(record.get("processo", ""))
+        overview = overview_by_process.get(processo, {})
+        vigencia_inicio = _clean_spaces(overview.get("best_vigencia_inicio", ""))
+        vigencia_fim = _clean_spaces(overview.get("best_vigencia_fim", ""))
+        data_assinatura = _clean_spaces(overview.get("best_data_assinatura", ""))
+        rows.append(
+            {
+                "processo": processo,
+                "parceiro": _clean_spaces(overview.get("best_parceiro", "")) or _clean_spaces(record.get("parceiro", "")),
+                "numero_act": _clean_spaces(overview.get("best_numero_acordo", "")) or _clean_spaces(record.get("numero_act", "")),
+                "objeto": _clean_spaces(overview.get("best_objeto", "")) or _clean_spaces(record.get("objeto", "")),
+                "data_assinatura": _format_project_date(data_assinatura),
+                "vigencia_inicio": _format_project_date(vigencia_inicio),
+                "vigencia_fim": _format_project_date(vigencia_fim),
+                "vigencia_raw": _clean_spaces(overview.get("best_vigencia_raw", "")) or _clean_spaces(record.get("vigencia", "")),
+            }
+        )
+    result = pd.DataFrame(
+        rows,
+        columns=[
+            "processo",
+            "parceiro",
+            "numero_act",
+            "objeto",
+            "data_assinatura",
+            "vigencia_inicio",
+            "vigencia_fim",
+            "vigencia_raw",
+        ],
+    )
+    return _add_deadline_columns(result, "vigencia_fim")
+
+
+def project_ted_dataframe(bundle: Dict[str, Any]) -> pd.DataFrame:
+    source_df = _ensure_columns(
+        bundle.get("ted_normalized", _empty_dataframe(TED_PROJECT_COLUMNS)),
+        TED_PROJECT_COLUMNS,
+    )
+    rows: List[Dict[str, Any]] = []
+    for record in source_df.to_dict(orient="records"):
+        rows.append(
+            {
+                "processo": _clean_spaces(record.get("processo", "")),
+                "numero_ted": _clean_spaces(record.get("numero_ted", "")),
+                "ano_ted": _clean_spaces(record.get("ano_ted", "")),
+                "objeto": _clean_spaces(record.get("objeto", "")),
+                "unidade_descentralizadora": _clean_spaces(record.get("unidade_descentralizadora", "")),
+                "unidade_descentralizada": _clean_spaces(record.get("unidade_descentralizada", "")),
+                "valor_global": _clean_spaces(record.get("valor_global", "")),
+                "valor_global_num": _to_money_float(record.get("valor_global", "")),
+                "vigencia_inicio": _format_project_date(record.get("vigencia_inicio", "")),
+                "vigencia_fim": _format_project_date(record.get("vigencia_fim", "")),
+            }
+        )
+    result = pd.DataFrame(
+        rows,
+        columns=[
+            "processo",
+            "numero_ted",
+            "ano_ted",
+            "objeto",
+            "unidade_descentralizadora",
+            "unidade_descentralizada",
+            "valor_global",
+            "valor_global_num",
+            "vigencia_inicio",
+            "vigencia_fim",
+        ],
+    )
+    return _add_deadline_columns(result, "vigencia_fim")
+
+
+def project_descontinuadas_dataframe(bundle: Dict[str, Any]) -> pd.DataFrame:
+    source_df = _ensure_columns(
+        bundle.get("parcerias_descontinuadas", _empty_dataframe(PARCERIAS_DESCONTINUADAS_COLUMNS)),
+        PARCERIAS_DESCONTINUADAS_COLUMNS,
+    )
+    rows: List[Dict[str, Any]] = []
+    for record in source_df.to_dict(orient="records"):
+        rows.append(
+            {
+                "processo": _clean_spaces(record.get("processo", "")),
+                "tipo": _clean_spaces(record.get("tipo", "")),
+                "numero_act": _clean_spaces(record.get("numero_act", "")),
+                "parceiro": _clean_spaces(record.get("parceiro", "")),
+                "vigencia": _clean_spaces(record.get("vigencia", "")),
+                "objeto": _clean_spaces(record.get("objeto", "")),
+                "data_assinatura": _format_project_date(record.get("data_assinatura", "")),
+                "data_vencimento": _format_project_date(record.get("data_vencimento", "")),
+                "status_normalizado": _clean_spaces(record.get("status_normalizado", "")),
+                "status_categoria": _clean_spaces(record.get("status_categoria", "")),
+            }
+        )
+    result = pd.DataFrame(
+        rows,
+        columns=[
+            "processo",
+            "tipo",
+            "numero_act",
+            "parceiro",
+            "vigencia",
+            "objeto",
+            "data_assinatura",
+            "data_vencimento",
+            "status_normalizado",
+            "status_categoria",
+        ],
+    )
+    return _add_deadline_columns(result, "data_vencimento")
+
+
+def filter_project_dataframe(
+    df: pd.DataFrame,
+    *,
+    query: str = "",
+    deadline_categories: Iterable[str] | None = None,
+    partners: Iterable[str] | None = None,
+) -> pd.DataFrame:
+    filtered = df.copy()
+    normalized_query = _clean_spaces(query).lower()
+    if normalized_query:
+        searchable_columns = [
+            column
+            for column in (
+                "processo",
+                "parceiro",
+                "objeto",
+                "unidade_descentralizadora",
+                "unidade_descentralizada",
+                "status_normalizado",
+                "status_categoria",
+            )
+            if column in filtered.columns
+        ]
+        if searchable_columns:
+            mask = pd.Series(False, index=filtered.index)
+            for column in searchable_columns:
+                mask = mask | filtered[column].astype(str).str.lower().str.contains(normalized_query, na=False, regex=False)
+            filtered = filtered[mask]
+
+    selected_deadlines = {_clean_spaces(value) for value in (deadline_categories or []) if _clean_spaces(value)}
+    if selected_deadlines and "indicador_prazo" in filtered.columns:
+        filtered = filtered[filtered["indicador_prazo"].isin(selected_deadlines)]
+
+    selected_partners = {_clean_spaces(value) for value in (partners or []) if _clean_spaces(value)}
+    if selected_partners:
+        partner_columns = [
+            column
+            for column in ("parceiro", "unidade_descentralizadora", "unidade_descentralizada")
+            if column in filtered.columns
+        ]
+        if partner_columns:
+            mask = pd.Series(False, index=filtered.index)
+            for column in partner_columns:
+                mask = mask | filtered[column].isin(selected_partners)
+            filtered = filtered[mask]
+    return filtered.copy()
 
 
 def pt_detail_dataframe(bundle: Dict[str, Any]) -> pd.DataFrame:

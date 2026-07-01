@@ -192,6 +192,8 @@ class DashboardExporterTests(unittest.TestCase):
                     "publication_status",
                     "captured_focus_fields",
                     "parceiro",
+                    "data_assinatura",
+                    "datas_assinatura",
                     "vigencia_raw",
                     "vigencia_inicio",
                     "vigencia_fim",
@@ -206,6 +208,8 @@ class DashboardExporterTests(unittest.TestCase):
                         "publication_status": "published_gold",
                         "captured_focus_fields": "6",
                         "parceiro": "PARCEIRO PT 1",
+                        "data_assinatura": "2026-01-01",
+                        "datas_assinatura": "2026-01-01",
                         "vigencia_raw": "2026-01-01 a 2026-12-31",
                         "vigencia_inicio": "2026-01-01",
                         "vigencia_fim": "2026-12-31",
@@ -219,6 +223,8 @@ class DashboardExporterTests(unittest.TestCase):
                         "publication_status": "retained_silver",
                         "captured_focus_fields": "3",
                         "parceiro": "",
+                        "data_assinatura": "",
+                        "datas_assinatura": "",
                         "vigencia_raw": "",
                         "vigencia_inicio": "",
                         "vigencia_fim": "",
@@ -232,6 +238,8 @@ class DashboardExporterTests(unittest.TestCase):
                         "publication_status": "retained_silver",
                         "captured_focus_fields": "4",
                         "parceiro": "PARCEIRO PT SILVER",
+                        "data_assinatura": "2027-02-01",
+                        "datas_assinatura": "2027-02-01",
                         "vigencia_raw": "2027-02-01 a 2028-01-31",
                         "vigencia_inicio": "2027-02-01",
                         "vigencia_fim": "2028-01-31",
@@ -250,6 +258,8 @@ class DashboardExporterTests(unittest.TestCase):
                     "publication_status",
                     "canonical_score",
                     "numero_acordo",
+                    "data_assinatura",
+                    "datas_assinatura",
                     "data_inicio_vigencia",
                     "data_fim_vigencia",
                     "orgao_convenente",
@@ -263,6 +273,8 @@ class DashboardExporterTests(unittest.TestCase):
                         "publication_status": "published_gold",
                         "canonical_score": "180",
                         "numero_acordo": "1/2026",
+                        "data_assinatura": "2026-01-03",
+                        "datas_assinatura": "2026-01-02 | 2026-01-03",
                         "data_inicio_vigencia": "",
                         "data_fim_vigencia": "",
                         "orgao_convenente": "",
@@ -275,6 +287,8 @@ class DashboardExporterTests(unittest.TestCase):
                         "publication_status": "retained_silver",
                         "canonical_score": "120",
                         "numero_acordo": "",
+                        "data_assinatura": "",
+                        "datas_assinatura": "",
                         "data_inicio_vigencia": "",
                         "data_fim_vigencia": "",
                         "orgao_convenente": "",
@@ -293,6 +307,8 @@ class DashboardExporterTests(unittest.TestCase):
                     "processo",
                     "documento",
                     "resolved_document_type",
+                    "data_assinatura",
+                    "datas_assinatura",
                     "selection_reason",
                     "classification_reason",
                     "validation_status",
@@ -307,6 +323,8 @@ class DashboardExporterTests(unittest.TestCase):
                         "processo": "60090.000003/2026-03",
                         "documento": "123",
                         "resolved_document_type": "memorando_entendimentos",
+                        "data_assinatura": "2026-03-30",
+                        "datas_assinatura": "2026-03-29 | 2026-03-30",
                         "selection_reason": "primeiro_resultado_mais_recente",
                         "classification_reason": "cabecalho_memorando",
                         "validation_status": "valid_for_requested_type",
@@ -440,6 +458,10 @@ class DashboardExporterTests(unittest.TestCase):
             self.assertEqual(row_1["best_vigencia_inicio"], "2026-01-01")
             self.assertEqual(row_1["best_vigencia_fim"], "2026-12-31")
             self.assertEqual(row_1["best_vigencia_source"], "pt_gold")
+            self.assertEqual(row_1["act_data_assinatura"], "2026-01-03")
+            self.assertEqual(row_1["best_data_assinatura"], "2026-01-03")
+            self.assertEqual(row_1["best_datas_assinatura"], "2026-01-02 | 2026-01-03")
+            self.assertEqual(row_1["best_data_assinatura_source"], "act_gold")
             self.assertEqual(row_1["best_objeto"], "Objeto PT gold")
             self.assertEqual(row_1["best_objeto_source"], "pt_gold")
 
@@ -460,6 +482,8 @@ class DashboardExporterTests(unittest.TestCase):
             row_3 = next(row for row in rows if row["processo"] == "60090.000003/2026-03")
             self.assertEqual(row_3["memorando_gold"], "True")
             self.assertEqual(row_3["memorando_json_path"], "output/memorando_entendimentos_60090.000003_2026-03.json")
+            self.assertEqual(row_3["best_data_assinatura"], "2026-03-30")
+            self.assertEqual(row_3["best_data_assinatura_source"], "memorando_gold")
 
             row_4 = next(row for row in rows if row["processo"] == "60090.000004/2026-04")
             self.assertEqual(row_4["ted_gold"], "True")
@@ -477,6 +501,8 @@ class DashboardExporterTests(unittest.TestCase):
             self.assertEqual(row_5["best_vigencia_inicio"], "2027-02-01")
             self.assertEqual(row_5["best_vigencia_fim"], "2028-01-31")
             self.assertEqual(row_5["best_vigencia_source"], "pt_silver_structured")
+            self.assertEqual(row_5["best_data_assinatura"], "2027-02-01")
+            self.assertEqual(row_5["best_data_assinatura_source"], "pt_silver_structured")
             self.assertEqual(row_5["best_objeto"], "Objeto PT silver")
             self.assertEqual(row_5["best_objeto_source"], "pt_silver_structured")
 

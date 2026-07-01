@@ -403,6 +403,14 @@ def _signature_dates(text: str) -> List[str]:
     return dates
 
 
+def _signature_dates_value(dates: List[str]) -> str:
+    return " | ".join(_clean_spaces(date_value) for date_value in dates if _clean_spaces(date_value))
+
+
+def _signature_date_value(dates: List[str]) -> str:
+    return max(dates) if dates else ""
+
+
 def _looks_like_relative_signature_reference(value: str) -> bool:
     normalized = _normalize_text(value)
     return bool(
@@ -943,6 +951,7 @@ def _build_contract_fields(
     period_source = _clean_spaces(record.get("period_source", ""))
     period_source_type = _period_source_type(period_source)
     period_confidence = CONFIDENCE_HIGH if period_source == PERIOD_SOURCE_DIRECT else CONFIDENCE_MEDIUM
+    data_assinatura = _clean_spaces(record.get("data_assinatura", ""))
 
     return {
         "parceiro": _field_or_missing(
@@ -968,6 +977,13 @@ def _build_contract_fields(
             confidence=period_confidence,
             rule_id=f"pt.vigencia.{period_source or PERIOD_SOURCE_MISSING}",
             warning=record.get("period_warning", ""),
+        ),
+        "data_assinatura": _field_or_missing(
+            value=data_assinatura,
+            raw_value=record.get("datas_assinatura", "") or data_assinatura,
+            source_type=SOURCE_DOCUMENT_TEXT,
+            confidence=CONFIDENCE_MEDIUM,
+            rule_id="pt.data_assinatura.assinaturas_eletronicas_ou_fecho",
         ),
         "objeto": _field_or_missing(
             value=record.get("objeto", ""),
@@ -1012,6 +1028,7 @@ def build_normalized_record(payload: Dict[str, Any], preview: Dict[str, str], js
     atribuicoes = _extract_atribuicoes(snapshot)
     metas = _extract_metas(snapshot)
     acoes = _extract_acoes(snapshot)
+    signature_dates = _signature_dates(str(snapshot.get("text", "") or ""))
     record = {
         "captured_at": _clean_spaces(str(payload.get("captured_at", "") or "")),
         "requested_type": _clean_spaces(str(payload.get("requested_type", "") or "")) or REQUESTED_TYPE_PT,
@@ -1019,6 +1036,8 @@ def build_normalized_record(payload: Dict[str, Any], preview: Dict[str, str], js
         "processo": _clean_spaces(str(payload.get("processo", "") or "")),
         "documento": _clean_spaces(str(payload.get("documento", "") or "")),
         "parceiro": parceiro,
+        "data_assinatura": _signature_date_value(signature_dates),
+        "datas_assinatura": _signature_dates_value(signature_dates),
         "vigencia_raw": vigencia_raw,
         "vigencia_inicio": period["prazo_inicio"],
         "vigencia_fim": period["prazo_fim"],
@@ -1093,6 +1112,8 @@ def export_normalized_csv(output_dir: Path, logger: Any = None) -> Dict[str, Any
         "processo",
         "documento",
         "parceiro",
+        "data_assinatura",
+        "datas_assinatura",
         "vigencia_raw",
         "vigencia_inicio",
         "vigencia_fim",

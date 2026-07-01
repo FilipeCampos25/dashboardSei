@@ -5,6 +5,8 @@ import json
 import shutil
 import sys
 import unittest
+import uuid
+from datetime import date
 from pathlib import Path
 
 import pandas as pd
@@ -12,11 +14,15 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from backend.app.services.dashboard_streamlit_data import (
+    classify_deadline,
     explode_pt_acoes,
     explode_pt_metas,
     load_dashboard_bundle,
     memorando_detail_dataframe,
     parse_act_rejection_summary,
+    project_descontinuadas_dataframe,
+    project_ted_dataframe,
+    project_vigentes_dataframe,
     pt_process_metrics,
     runtime_for_processes,
     summarize_log_entries,
@@ -47,7 +53,7 @@ def _write_jsonl(path: Path, rows: list[dict[str, object]]) -> None:
 
 class DashboardStreamlitDataTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.root_dir = (Path(__file__).resolve().parent / "_tmp_dashboard_streamlit_data").resolve()
+        self.root_dir = (Path.cwd() / "_tmp_dashboard_streamlit_data" / uuid.uuid4().hex).resolve()
         shutil.rmtree(self.root_dir, ignore_errors=True)
         (self.root_dir / "backend" / "output").mkdir(parents=True, exist_ok=True)
         (self.root_dir / "output").mkdir(parents=True, exist_ok=True)
@@ -173,10 +179,179 @@ class DashboardStreamlitDataTests(unittest.TestCase):
         bundle = load_dashboard_bundle(self.root_dir)
 
         self.assertTrue(bundle["overview"].empty)
+        self.assertTrue(bundle["parcerias_vigentes"].empty)
+        self.assertTrue(bundle["parcerias_descontinuadas"].empty)
         self.assertTrue(bundle["pt_status"].empty)
         self.assertTrue(bundle["act_status"].empty)
         self.assertEqual(bundle["log_entries"], [])
         self.assertEqual(bundle["performance"], {})
+
+    def test_classify_deadline_uses_project_thresholds(self) -> None:
+        today = date(2026, 1, 1)
+
+        self.assertEqual(classify_deadline("2026-01-01", today=today), "vermelho")
+        self.assertEqual(classify_deadline("2026-07-01", today=today), "amarelo")
+        self.assertEqual(classify_deadline("2027-01-02", today=today), "verde")
+        self.assertEqual(classify_deadline("2026-07-03", today=today), "amarelo")
+        self.assertEqual(classify_deadline("2026-06-30", today=today), "vermelho")
+        self.assertEqual(classify_deadline("2027-01-01", today=today), "amarelo")
+        self.assertEqual(classify_deadline("2025-12-31", today=today), "vermelho")
+        self.assertEqual(classify_deadline("", today=today), "sem_data")
+        self.assertEqual(classify_deadline("nao e data", today=today), "sem_data")
+
+    def test_project_dataframes_use_business_sources(self) -> None:
+        backend_output = self.root_dir / "backend" / "output"
+        _write_csv(
+            backend_output / "parcerias_vigentes_latest.csv",
+            ["interno_descricao", "seq", "processo", "parceiro", "vigencia", "numero_act", "objeto"],
+            [
+                {
+                    "interno_descricao": "PARCERIAS VIGENTES",
+                    "seq": "1",
+                    "processo": "60090.000001/2026-01",
+                    "parceiro": "Parceiro preview",
+                    "vigencia": "60 meses",
+                    "numero_act": "1/2026",
+                    "objeto": "Objeto preview",
+                },
+                {
+                    "interno_descricao": "PARCERIAS VIGENTES",
+                    "seq": "2",
+                    "processo": "60090.000002/2026-02",
+                    "parceiro": "Parceiro sem consolidado",
+                    "vigencia": "24 meses",
+                    "numero_act": "2/2026",
+                    "objeto": "Objeto sem consolidado",
+                },
+            ],
+        )
+        _write_csv(
+            backend_output / "dashboard_ready_latest.csv",
+            [
+                "processo",
+                "best_parceiro",
+                "best_numero_acordo",
+                "best_objeto",
+                "best_vigencia_inicio",
+                "best_vigencia_fim",
+                "best_vigencia_raw",
+            ],
+            [
+                {
+                    "processo": "60090.000001/2026-01",
+                    "best_parceiro": "Parceiro consolidado",
+                    "best_numero_acordo": "ACT 1/2026",
+                    "best_objeto": "Objeto consolidado",
+                    "best_vigencia_inicio": "2026-01-01",
+                    "best_vigencia_fim": "2027-12-31",
+                    "best_vigencia_raw": "2026-01-01..2027-12-31",
+                }
+            ],
+        )
+
+        ted_json = backend_output / "termo_execucao_descentralizada_60090.000003_2026-03.json"
+        _write_json(
+            ted_json,
+            {"snapshot": {"api_payload": {"objeto": "Objeto do JSON", "valor_global": "999.00"}}},
+        )
+        _write_csv(
+            backend_output / "ted_normalizado_latest.csv",
+            [
+                "processo",
+                "documento",
+                "numero_ted",
+                "ano_ted",
+                "objeto",
+                "unidade_descentralizadora",
+                "unidade_descentralizada",
+                "valor_global",
+                "vigencia_inicio",
+                "vigencia_fim",
+                "json_path",
+            ],
+            [
+                {
+                    "processo": "60090.000003/2026-03",
+                    "documento": "3",
+                    "numero_ted": "3",
+                    "ano_ted": "2026",
+                    "objeto": "Objeto do CSV",
+                    "unidade_descentralizadora": "Unidade A",
+                    "unidade_descentralizada": "Unidade B",
+                    "valor_global": "1.500.000,25",
+                    "vigencia_inicio": "2026-02-01",
+                    "vigencia_fim": "2028-02-01",
+                    "json_path": str(ted_json),
+                }
+            ],
+        )
+        _write_csv(
+            backend_output / "parcerias_descontinuadas_normalizado_latest.csv",
+            [
+                "processo",
+                "tipo",
+                "numero_act",
+                "numero_termo_encerramento",
+                "parceiro",
+                "vigencia",
+                "objeto",
+                "gestor_titular",
+                "gestor_substituto",
+                "portaria_designacao",
+                "data_assinatura",
+                "data_vencimento",
+                "termo_encerramento_raw",
+                "status_raw",
+                "status_normalizado",
+                "status_categoria",
+                "normalization_status",
+                "missing_fields",
+                "raw_anotacoes",
+            ],
+            [
+                {
+                    "processo": "60090.000004/2026-04",
+                    "tipo": "ACT",
+                    "numero_act": "4/2026",
+                    "numero_termo_encerramento": "",
+                    "parceiro": "Parceiro encerrado",
+                    "vigencia": "31/12/2026",
+                    "objeto": "Objeto encerrado",
+                    "gestor_titular": "",
+                    "gestor_substituto": "",
+                    "portaria_designacao": "",
+                    "data_assinatura": "01/01/2024",
+                    "data_vencimento": "31/12/2026",
+                    "termo_encerramento_raw": "",
+                    "status_raw": "Encerrado",
+                    "status_normalizado": "Encerrado",
+                    "status_categoria": "encerrado",
+                    "normalization_status": "completo",
+                    "missing_fields": "",
+                    "raw_anotacoes": "",
+                }
+            ],
+        )
+
+        bundle = load_dashboard_bundle(self.root_dir)
+        vigentes_df = project_vigentes_dataframe(bundle)
+        ted_df = project_ted_dataframe(bundle)
+        descontinuadas_df = project_descontinuadas_dataframe(bundle)
+
+        self.assertEqual(len(vigentes_df), 2)
+        self.assertEqual(vigentes_df.iloc[0]["parceiro"], "Parceiro consolidado")
+        self.assertEqual(vigentes_df.iloc[0]["numero_act"], "ACT 1/2026")
+        self.assertEqual(vigentes_df.iloc[1]["parceiro"], "Parceiro sem consolidado")
+
+        self.assertEqual(len(ted_df), 1)
+        self.assertEqual(ted_df.iloc[0]["objeto"], "Objeto do CSV")
+        self.assertEqual(ted_df.iloc[0]["unidade_descentralizadora"], "Unidade A")
+        self.assertAlmostEqual(float(ted_df.iloc[0]["valor_global_num"]), 1500000.25)
+
+        self.assertEqual(len(descontinuadas_df), 1)
+        self.assertEqual(descontinuadas_df.iloc[0]["status_categoria"], "encerrado")
+        self.assertEqual(descontinuadas_df.iloc[0]["data_vencimento"], "2026-12-31")
+        self.assertIn("indicador_prazo", descontinuadas_df.columns)
 
     def test_pt_explosions_break_out_metas_and_acoes(self) -> None:
         pt_df = pd.DataFrame(

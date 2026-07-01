@@ -161,6 +161,8 @@ class PTNormalizerTests(unittest.TestCase):
             "objeto": "oportunidade de vivencia interdisciplinar",
         }
         record = build_normalized_record(payload, preview, Path("plano_trabalho_60092.000220_2021-16.json"))
+        self.assertEqual(record["data_assinatura"], "2022-08-04")
+        self.assertEqual(record["datas_assinatura"], "2022-08-04")
         self.assertEqual(record["vigencia_inicio"], "2022-08-04")
         self.assertEqual(record["vigencia_fim"], "2027-08-04")
         self.assertEqual(record["period_source"], PERIOD_SOURCE_SIGNATURE)
@@ -349,6 +351,8 @@ class PTNormalizerTests(unittest.TestCase):
             "objeto": "integracao de esforcos",
         }
         record = build_normalized_record(payload, preview, Path("plano_trabalho_60090.000269_2020-16.json"))
+        self.assertEqual(record["data_assinatura"], "2021-12-20")
+        self.assertEqual(record["datas_assinatura"], "2021-12-14 | 2021-12-20")
         self.assertEqual(record["prazo_inicio"], "2021-12-14")
         self.assertEqual(record["prazo_fim"], "2026-12-14")
         self.assertEqual(record["period_source"], PERIOD_SOURCE_SIGNATURE)

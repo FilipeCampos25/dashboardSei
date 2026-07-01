@@ -1587,6 +1587,7 @@ def build_normalized_record(payload: Dict[str, Any], json_path: Path) -> Dict[st
 
     numero_acordo = ""
     data_assinatura = ""
+    datas_assinatura = ""
     data_publicacao = ""
     vigencia_raw = ""
     data_inicio_vigencia = ""
@@ -1613,14 +1614,16 @@ def build_normalized_record(payload: Dict[str, Any], json_path: Path) -> Dict[st
             numero_acordo = ""
             field_source_numero_acordo = ""
             numero_warning = "numero_placeholder"
-        data_assinatura = _extract_data_assinatura(snapshot)
+        signature_dates = _extract_signature_dates(str(snapshot.get("text", "") or ""))
+        data_assinatura = max(signature_dates) if signature_dates else ""
+        datas_assinatura = " | ".join(signature_dates)
         data_publicacao = _extract_data_publicacao(snapshot)
         vigencia_raw = _extract_vigencia_raw(snapshot)
         resolved_vigencia = resolve_act_vigencia(
             vigencia_raw,
             data_assinatura=data_assinatura,
             data_publicacao=data_publicacao,
-            outras_datas=_extract_signature_dates(str(snapshot.get("text", "") or "")),
+            outras_datas=signature_dates,
         )
         data_inicio_vigencia = resolved_vigencia["vigencia_inicio"]
         data_fim_vigencia = resolved_vigencia["vigencia_fim"]
@@ -1651,6 +1654,7 @@ def build_normalized_record(payload: Dict[str, Any], json_path: Path) -> Dict[st
         "numero_acordo": numero_acordo,
         "processo": processo,
         "data_assinatura": data_assinatura,
+        "datas_assinatura": datas_assinatura,
         "data_publicacao": data_publicacao,
         "vigencia_raw": vigencia_raw,
         "vigencia_inicio": data_inicio_vigencia,
@@ -1840,6 +1844,7 @@ def export_normalized_csv(output_dir: Path, logger: Any = None) -> Dict[str, Any
         "classification_reason",
         "canon_rejection_reason",
         "data_assinatura",
+        "datas_assinatura",
         "data_publicacao",
         "vigencia_raw",
         "vigencia_inicio",
@@ -1881,6 +1886,7 @@ def export_normalized_csv(output_dir: Path, logger: Any = None) -> Dict[str, Any
         "numero_acordo",
         "processo",
         "data_assinatura",
+        "datas_assinatura",
         "data_publicacao",
         "vigencia_raw",
         "vigencia_inicio",

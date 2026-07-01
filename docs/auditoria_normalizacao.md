@@ -87,7 +87,7 @@ No snapshot JSON:
 `pt_auditoria_latest.csv`, `pt_normalizado_latest.csv` e `pt_normalizado_completo_latest.csv` usam:
 
 - Identificacao: `captured_at`, `requested_type`, `resolved_document_type`, `processo`, `documento`.
-- Conteudo: `parceiro`, `vigencia_raw`, `vigencia_inicio`, `vigencia_fim`, `objeto`, `atribuições_raw`, `metas_raw`, `acoes_raw`.
+- Conteudo: `parceiro`, `data_assinatura`, `datas_assinatura`, `vigencia_raw`, `vigencia_inicio`, `vigencia_fim`, `objeto`, `atribuições_raw`, `metas_raw`, `acoes_raw`.
 - Prazo: `prazo_inicio_raw`, `prazo_inicio`, `prazo_fim_raw`, `prazo_fim`, `period_source`, `period_warning`.
 - Auditoria: `selection_reason`, `classification_reason`, `validation_status`, `publication_status`, `snapshot_mode`, `preview_numero_act`, `normalization_status`, `captured_focus_fields`, `json_path`.
 
@@ -191,7 +191,7 @@ Mesmo conjunto comum de snapshot e `analysis` da familia de cooperacao:
 `documento_administrativo_normalizado_latest.csv` publica documentos administrativos encontrados com:
 
 - Identificacao/classificacao: `captured_at`, `requested_type`, `processo`, `documento`, `resolved_document_type`, `funcao_administrativa`.
-- Campos extraidos: `origem`, `destino`, `data`, `assunto`, `resumo`, `acao_solicitada`, `prazo`, `documentos_mencionados`.
+- Campos extraidos: `origem`, `destino`, `data`, `data_assinatura`, `datas_assinatura`, `assunto`, `resumo`, `acao_solicitada`, `prazo`, `documentos_mencionados`.
 - Auditoria: `selection_reason`, `classification_reason`, `validation_status`, `publication_status`, `snapshot_mode`, `json_path`.
 
 `memorando_normalizado_latest.csv` contem somente a visao filtrada de `documento_administrativo_normalizado_latest.csv` para `doc_class=memorando`.
@@ -270,7 +270,7 @@ Para cada processo consolidado, ele cruza:
 - `ted_normalizado_latest.csv`, considerando TED gold somente quando `publication_status=published_gold`, `validation_status=valid_for_requested_type` e `json_path` existe.
 - `ted_status_execucao_latest.csv`.
 
-O arquivo `dashboard_ready_latest.csv` calcula presenca gold, caminhos JSON, qualidade por tipo, melhores valores consolidados (`best_numero_acordo`, `best_parceiro`, `best_vigencia`, `best_objeto`) e `normalization_issues`.
+O arquivo `dashboard_ready_latest.csv` calcula presenca gold, caminhos JSON, qualidade por tipo, melhores valores consolidados (`best_numero_acordo`, `best_parceiro`, `best_vigencia`, `best_data_assinatura`, `best_datas_assinatura`, `best_objeto`) e `normalization_issues`.
 
 O arquivo `divergence_matrix_latest.csv` e um recorte de auditoria de divergencias, com qualidade PT/ACT/TED, `ted_gold`, `ted_json_path`, universo de origem (`parcerias_vigentes` ou `ted_normalizado`), chave de join canonica, validade da chave, tentativas ACT, campos faltantes, comparacao previa x ACT/PT e fontes escolhidas.
 

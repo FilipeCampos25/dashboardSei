@@ -9,6 +9,7 @@ from app.output import csv_writer
 from app.services.act_normalizer import (
     DOC_CLASS_MEMORANDO,
     PUBLICATION_STATUS_GOLD,
+    _extract_signature_dates,
     classify_cooperation_snapshot,
 )
 
@@ -25,6 +26,8 @@ NORMALIZED_COLUMNS = [
     "origem",
     "destino",
     "data",
+    "data_assinatura",
+    "datas_assinatura",
     "assunto",
     "resumo",
     "acao_solicitada",
@@ -148,6 +151,8 @@ def build_normalized_record(payload: Dict[str, Any], json_path: Path, fallback_r
     origem = _line_value(text, ("De", "Origem", "Remetente"))
     destino = _line_value(text, ("Para", "Ao", "A", "Destino", "Destinatario", "Destinatário"))
 
+    signature_dates = _extract_signature_dates(text)
+
     return {
         "captured_at": _clean_spaces(collection.get("captured_at") or fallback_record.get("captured_at")),
         "requested_type": "memorando",
@@ -158,6 +163,8 @@ def build_normalized_record(payload: Dict[str, Any], json_path: Path, fallback_r
         "origem": origem,
         "destino": destino,
         "data": _extract_data(text),
+        "data_assinatura": max(signature_dates) if signature_dates else "",
+        "datas_assinatura": " | ".join(signature_dates),
         "assunto": _extract_assunto(snapshot, text),
         "resumo": _extract_resumo(text),
         "acao_solicitada": _extract_acao_solicitada(text),

@@ -106,7 +106,7 @@ streamlit run dashboard_streamlit.py
 
 Por padrao, o Streamlit sobe em `http://localhost:8501`.
 
-A dashboard tambem permite disparar uma coleta pela aba `Coleta`. Esse botao executa `python backend/main.py --manual-login`, repassando os tipos documentais selecionados pela interface via `DOCUMENT_TYPES`.
+A dashboard e uma interface de leitura da ultima rodada. Para executar nova coleta, rode o backend pela CLI e depois recarregue a pagina do Streamlit.
 
 ### Testes
 
@@ -204,6 +204,8 @@ Campos principais:
 - documento
 - parceiro
 - objeto
+- data de assinatura
+- datas de assinatura
 - vigencia
 - prazo de inicio e fim
 - atribuicoes
@@ -255,6 +257,8 @@ Campos principais:
 - documento
 - modo de extracao
 - texto/snapshot
+- data de assinatura
+- datas de assinatura
 - status de validacao/publicacao
 
 Saidas principais:
@@ -308,45 +312,43 @@ Saidas principais:
 - `parcerias_descontinuadas_latest.csv`
 - `parcerias_descontinuadas_normalizado_latest.csv`
 
-Observacao: esses arquivos existem na rodada, mas a dashboard atual nao os consome diretamente.
+Observacao: esses registros entram somente na aba `Parcerias Descontinuadas / Nao Realizadas`. Eles nao alimentam alertas de prazo da carteira ativa.
 
 ## Dashboard
 
-A dashboard le a ultima rodada a partir dos arquivos `latest`. Nao ha historico entre execucoes.
+A dashboard le a ultima rodada a partir dos arquivos `latest`. Nao ha historico entre execucoes e a data exibida no cabecalho vem de `output/execution_log_latest.json`, com fallback para metadados reais dos arquivos.
 
-Fontes consumidas:
+Fontes consumidas pela nova camada gerencial:
 
-- `backend/output/dashboard_ready_latest.csv`
-- `backend/output/pt_normalizado_latest.csv`
-- `backend/output/pt_auditoria_latest.csv`
+- `backend/output/parcerias_vigentes_latest.csv`
+- `backend/output/dashboard_ready_latest.csv` apenas para enriquecimento de parcerias vigentes
+- `backend/output/ted_normalizado_latest.csv`
+- `backend/output/parcerias_descontinuadas_normalizado_latest.csv`
+- `backend/output/parcerias_descontinuadas_latest.csv` apenas no detalhe historico
+- `backend/output/pt_normalizado_latest.csv` e `backend/output/pt_auditoria_latest.csv`
 - `backend/output/act_normalizado_latest.csv`
 - `backend/output/memorando_normalizado_latest.csv`
-- `backend/output/ted_normalizado_latest.csv`
-- `backend/output/pt_status_execucao_latest.csv`
-- `backend/output/act_status_execucao_latest.csv`
-- `backend/output/memorando_status_execucao_latest.csv`
-- `backend/output/ted_status_execucao_latest.csv`
-- `backend/output/performance_analysis.json`
+- `backend/output/documento_administrativo_normalizado_latest.csv`
 - `output/execution_log_latest.json`
 
-Abas disponiveis:
+Abas principais:
 
-- `Coleta`: executa nova coleta, mostra status, PID, retorno, tempo total, tempo medio e ultimas linhas do log.
-- `Visao Geral`: mostra processos, tempo, warnings/errors, cobertura PT/ACT/Memorando/TED, qualidade geral, tabela consolidada e explorador por processo.
-- `PT`: mostra encontrados, gold/silver/not found, metas, acoes, prazos e tabelas detalhadas.
-- `ACT`: mostra candidatos, gold completo/parcial, silver, not found, divergencias e rejeicoes.
-- `Memorando`: mostra encontrados/publicados/nao encontrados e detalhes do snapshot.
-- `TED`: mostra encontrados/publicados, motivos de ausencia, valor global, situacao e UF.
+- `Parcerias Vigentes`: consulta de processo, instrumento, parceiro, objeto e vigencia, com regra centralizada de situacao por prazo.
+- `Termo de Execucao Descentralizada`: consulta independente de TEDs, valor global, vigencia, objeto e unidades quando houver cobertura.
+- `Parcerias Descontinuadas / Nao Realizadas`: consulta historica por status normalizado, sem alertas de vigencia.
 
-Filtros globais:
+Filtros por aba:
 
 - processo
 - parceiro
-- qualidade geral
-- presenca de PT
-- presenca de ACT
-- presenca de Memorando
-- presenca de TED
+- documento
+- situacao de vigencia apenas em parcerias vigentes e TEDs
+- presenca de PT/TED apenas em parcerias vigentes
+- faixa de valor apenas em TEDs
+- status/categoria e intervalo de datas apenas no historico
+- busca textual
+
+A implementacao da interface fica em `dashboard_streamlit.py`; leitura, limpeza, regras de negocio e modelos por categoria ficam no pacote `dashboard/`. A regra verde/amarelo/vermelho fica centralizada em `dashboard/vigencia_rules.py`.
 
 ## Informacoes validas para levantar em uma analise
 
@@ -354,6 +356,7 @@ Para diagnosticar uma rodada, os pontos mais uteis sao:
 
 - tempo total e tempo medio por processo em `performance_analysis.json`;
 - total de linhas, warnings e errors em `output/execution_log_latest.json`;
+- quantidade de processos ativos, historicos e inconsistentes na carteira canonica;
 - quantidade de processos no `dashboard_ready_latest.csv`;
 - cobertura por tipo documental: PT, ACT, Memorando e TED;
 - quantidade de gold, silver, partial, not_found e extraction_failure por tipo;
@@ -362,7 +365,7 @@ Para diagnosticar uma rodada, os pontos mais uteis sao:
 - PT com metas, acoes e prazo estruturado;
 - TED sem numero de instrumento, sem ACT previo ou sem resultado de API;
 - campos ausentes nos normalizados e diagnostics;
-- data/hora de geracao dos arquivos `*_latest`;
+- data real da ultima coleta registrada no log ou nos artefatos `*_latest`;
 - se `parcerias_descontinuadas` foi coletado e quantos registros foram normalizados.
 
 ## Artefatos da rodada
@@ -377,7 +380,7 @@ Camadas:
 
 Arquivos consolidados importantes:
 
-- `dashboard_ready_latest.csv`: base principal da dashboard por processo.
+- `dashboard_ready_latest.csv`: base principal da dashboard por processo, incluindo melhores datas de assinatura e vigencia consolidadas.
 - `divergence_matrix_latest.csv`: matriz de divergencias entre previa, PT, ACT e TED.
 - `normalization_review_queue_latest.csv`: fila de pontos para revisao.
 - `performance_analysis.json`: tempos, spans e eventos de performance.

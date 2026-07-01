@@ -264,6 +264,7 @@ class ACTNormalizerTests(unittest.TestCase):
         self.assertEqual(record["numero_acordo"], "1/2021")
         self.assertEqual(record["processo"], "60090.000269/2020-16")
         self.assertEqual(record["data_assinatura"], "2021-12-20")
+        self.assertEqual(record["datas_assinatura"], "2021-12-14 | 2021-12-20")
         self.assertEqual(record["data_publicacao"], "")
         self.assertIn("5 (cinco) anos", record["vigencia_raw"])
         self.assertEqual(record["vigencia_inicio"], "2021-12-20")

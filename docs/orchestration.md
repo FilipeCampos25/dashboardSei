@@ -7,7 +7,7 @@ A orquestracao continua baseada em execucao manual de dois comandos separados:
 1. `python backend/main.py`
 2. `streamlit run dashboard_streamlit.py`
 
-O backend agora executa uma rodada multi-documento no SEI, gera artefatos em camadas `bronze/silver/gold` dentro de `backend/output/`, mas ainda nao publica automaticamente o contrato final consumido pelo dashboard em `output/sei_dashboard.csv`.
+O backend executa uma rodada multi-documento no SEI e gera artefatos em camadas `bronze/silver/gold` dentro de `backend/output/`. A dashboard consome esses artefatos diretamente, junto com `output/execution_log_latest.json`.
 
 ## Fluxo operacional real
 
@@ -36,8 +36,9 @@ O backend agora executa uma rodada multi-documento no SEI, gera artefatos em cam
 ### Etapa 2. Dashboard
 
 1. Operador executa `streamlit run dashboard_streamlit.py`.
-2. O dashboard tenta ler `output/sei_dashboard.csv`.
-3. Se nao encontrar esse arquivo, usa um dataset de exemplo.
+2. O dashboard le os arquivos `backend/output/*_latest` e o log da ultima rodada.
+3. O dashboard monta a carteira canonica, separa ativos, historico e inconsistencias.
+4. Se alguma fonte estiver ausente ou vazia, mostra estado vazio e cobertura, sem usar dados artificiais.
 
 ## Familias documentais processadas hoje
 
@@ -100,6 +101,8 @@ Arquivos principais:
 
 Hoje nao ha publicacao gold para TED porque a rodada mais recente nao localizou candidatos canonicos.
 
+Observacao: quando `ted_normalizado_latest.csv` existir, a dashboard usa seus campos financeiros e de vigencia na aba `Termo de Execucao Descentralizada`.
+
 ## Comportamento de depuracao
 
 O backend possui um desvio util para investigacao manual:
@@ -130,49 +133,62 @@ Arquivos principais:
 - `memorando_status_execucao_latest.csv`
 - `memorando_normalizado_latest.csv`
 - `ted_status_execucao_latest.csv`
+- `ted_normalizado_latest.csv`
+- `dashboard_ready_latest.csv`
+- `divergence_matrix_latest.csv`
+- `normalization_review_queue_latest.csv`
+- `parcerias_descontinuadas_normalizado_latest.csv`
 
-### Contrato esperado pelo dashboard
+### Contrato consumido pelo dashboard
 
-Arquivo:
+Arquivos:
 
-- `output/sei_dashboard.csv`
+- `backend/output/dashboard_ready_latest.csv`
+- `backend/output/*_normalizado_latest.csv`
+- `backend/output/*_status_execucao_latest.csv`
+- `backend/output/divergence_matrix_latest.csv`
+- `backend/output/normalization_review_queue_latest.csv`
+- `backend/output/performance_analysis.json`
+- `output/execution_log_latest.json`
 
-Schema canonico:
+Modelo canonico em memoria:
 
 - `processo`
-- `documento`
+- `processo_normalizado`
+- `chave_canonica`
+- `situacao_carteira`
+- `documento_principal_tipo`
+- `documento_principal_numero`
+- `documentos_relacionados`
 - `parceiro`
+- `objeto_resumo`
+- `objeto_completo`
 - `vigencia_inicio`
 - `vigencia_fim`
-- `objeto`
-- `atribuicao`
-- `meta`
-- `acao`
-- `prazo`
-- `status`
-- `fonte`
-- `collected_at`
+- `dias_restantes`
+- `indicador_vigencia`
+- campos especializados de PT, TED, memorando, qualidade, origem e conflitos
 
-## Gargalo atual
+## Separacao atual
 
-O gargalo de orquestracao nao esta na navegacao do SEI. Ele esta na ausencia de uma etapa de publicacao que consolide a gold do backend no contrato do dashboard.
+O pipeline de coleta permanece separado da visao gerencial. A consolidacao da carteira acontece na camada de leitura da dashboard e nao reescreve os arquivos gold.
 
 Hoje a sequencia correta e:
 
 - coleta assistida e classificacao no backend;
 - analise dos artefatos em `backend/output/`;
-- opcionalmente, transformacao externa para `output/sei_dashboard.csv`.
+- execucao da dashboard gerencial sobre a ultima rodada.
 
 ## Proxima etapa recomendada
 
-Criar um passo de publicacao pos-coleta com as seguintes responsabilidades:
+Se for necessario persistir a carteira canonica no futuro, criar um passo aditivo de publicacao pos-coleta com as seguintes responsabilidades:
 
-1. Ler a gold relevante em `backend/output/`.
-2. Mapear os registros para o schema canonico do dashboard.
-3. Definir a precedencia entre PT e familias de cooperacao.
-4. Popular `documento`, `fonte`, `status` e `collected_at`.
-5. Gerar `output/sei_dashboard.csv` na raiz.
-6. Validar colunas e tipos antes de publicar.
+1. Ler as fontes `latest` em `backend/output/`.
+2. Reusar as regras de `dashboard_portfolio.py` e `dashboard_metrics.py`.
+3. Preservar a separacao entre ativos, historico e inconsistencias.
+4. Popular origem, qualidade, conflitos e `data_ultima_coleta`.
+5. Gerar um artefato novo sem substituir os outputs atuais.
+6. Validar colunas, tipos e contagens antes de publicar.
 
 ## Validacoes operacionais recomendadas
 

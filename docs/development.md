@@ -180,6 +180,12 @@ Para focar so no PT:
 python -m unittest tests.test_pt_normalizer
 ```
 
+Para validar as regras da dashboard gerencial:
+
+```bash
+python -B -m unittest tests.test_dashboard_rebuild tests.test_dashboard_metrics tests.test_dashboard_data tests.test_dashboard_portfolio tests.test_dashboard_quality tests.test_dashboard_streamlit_data
+```
+
 ## Dashboard
 
 Execucao:
@@ -190,19 +196,21 @@ streamlit run dashboard_streamlit.py
 
 Entrada esperada:
 
-- `output/sei_dashboard.csv`
+- arquivos `backend/output/*_latest`
+- `output/execution_log_latest.json`
 
-Se o arquivo nao existir:
+Se uma fonte nao existir:
 
-- o app mostra warning;
-- usa dados de exemplo embutidos.
+- o app mostra estado vazio ou cobertura zerada;
+- nao usa dados de exemplo embutidos.
 
-## Gap atual de integracao
+## Integracao atual
 
-O backend ainda nao grava automaticamente `output/sei_dashboard.csv`.
+O backend continua gravando bronze, silver e gold em `backend/output/`. A dashboard le esses artefatos diretamente e monta uma carteira canonica em memoria.
 
-Hoje o estado correto do projeto e:
+Estado correto do projeto:
 
 - backend gera bronze, silver e gold em `backend/output/`;
-- dashboard consome um CSV canonico na raiz;
-- falta uma etapa de publicacao entre esses dois contratos.
+- dashboard consome os arquivos `latest` e o log da ultima rodada;
+- regras gerenciais novas ficam em `dashboard/vigencia_rules.py`, `dashboard/partnerships_active.py`, `dashboard/ted_metrics.py` e `dashboard/historical_partnerships.py`;
+- `dashboard_streamlit.py` renderiza exatamente tres abas principais: `Parcerias Vigentes`, `Termo de Execucao Descentralizada` e `Parcerias Descontinuadas / Nao Realizadas`.

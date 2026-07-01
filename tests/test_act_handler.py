@@ -291,7 +291,11 @@ class ACTHandlerTests(unittest.TestCase):
         handler = spec.handler
         handler.reset_run()
         snapshot = {
-            "text": "Memorando de Entendimentos no 1 que entre si celebram a Uniao e o Estado de Roraima.",
+            "text": (
+                "Memorando de Entendimentos no 1 que entre si celebram a Uniao e o Estado de Roraima.\n"
+                "Documento assinado eletronicamente por Franklin Fernando Teixeira, em 07/06/2023.\n"
+                "Documento assinado eletronicamente por Antonio Oliveiro Garcia de Almeida, em 14/06/2023."
+            ),
             "tables": [],
             "extraction_mode": "html_dom",
             "title": "Memorando de Entendimentos",
@@ -353,6 +357,8 @@ class ACTHandlerTests(unittest.TestCase):
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0]["requested_type"], "memorando")
             self.assertEqual(rows[0]["publication_status"], "published_gold")
+            self.assertEqual(rows[0]["data_assinatura"], "2023-06-14")
+            self.assertEqual(rows[0]["datas_assinatura"], "2023-06-07 | 2023-06-14")
         finally:
             shutil.rmtree(output_dir, ignore_errors=True)
 

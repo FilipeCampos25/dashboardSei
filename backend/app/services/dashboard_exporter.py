@@ -396,6 +396,54 @@ def _best_vigencia(preview: Dict[str, str], pt_row: Dict[str, str], act_row: Dic
     return {"inicio": "", "fim": "", "raw": "", "source": "missing", "confidence": "missing"}
 
 
+def _last_signature_date(datas_assinatura: str) -> str:
+    dates = [_clean_spaces(value) for value in datas_assinatura.split("|") if _clean_spaces(value)]
+    return max(dates) if dates else ""
+
+
+def _best_data_assinatura(
+    pt_row: Dict[str, str],
+    act_row: Dict[str, str],
+    memorando_row: Dict[str, str],
+    *,
+    act_gold: bool,
+    pt_gold: bool,
+    memorando_gold: bool,
+) -> Dict[str, str]:
+    act_data = _clean_spaces(act_row.get("data_assinatura", "")) if act_gold else ""
+    act_datas = _clean_spaces(act_row.get("datas_assinatura", "")) if act_gold else ""
+    if act_data or act_datas:
+        return {
+            "data": act_data or _last_signature_date(act_datas),
+            "datas": act_datas or act_data,
+            "source": "act_gold",
+            "confidence": "high",
+        }
+
+    pt_data = _clean_spaces(pt_row.get("data_assinatura", ""))
+    pt_datas = _clean_spaces(pt_row.get("datas_assinatura", ""))
+    if pt_data or pt_datas:
+        source = "pt_gold" if pt_gold else "pt_silver_structured"
+        return {
+            "data": pt_data or _last_signature_date(pt_datas),
+            "datas": pt_datas or pt_data,
+            "source": source,
+            "confidence": _confidence(source),
+        }
+
+    memorando_data = _clean_spaces(memorando_row.get("data_assinatura", "")) if memorando_gold else ""
+    memorando_datas = _clean_spaces(memorando_row.get("datas_assinatura", "")) if memorando_gold else ""
+    if memorando_data or memorando_datas:
+        return {
+            "data": memorando_data or _last_signature_date(memorando_datas),
+            "datas": memorando_datas or memorando_data,
+            "source": "memorando_gold",
+            "confidence": "medium",
+        }
+
+    return {"data": "", "datas": "", "source": "missing", "confidence": "missing"}
+
+
 def _has_process_mismatch(act_row: Dict[str, str]) -> bool:
     warning = _clean_spaces(act_row.get("validation_warning", ""))
     return "processo_divergente_documento=" in warning or "processo_referencia_externa_documento=" in warning
@@ -470,6 +518,14 @@ def export_dashboard_ready_csv(output_dir: Path, logger: Any = None) -> Dict[str
         best_numero = _best_numero(preview, act_row, act_gold)
         best_parceiro = _best_partner(preview, pt_row, act_row, act_gold=act_gold, pt_gold=pt_gold)
         best_vigencia = _best_vigencia(preview, pt_row, act_row, act_gold=act_gold, pt_gold=pt_gold)
+        best_data_assinatura = _best_data_assinatura(
+            pt_row,
+            act_row,
+            memorando_row,
+            act_gold=act_gold,
+            pt_gold=pt_gold,
+            memorando_gold=memorando_gold,
+        )
         best_objeto = _best_object(preview, pt_row, act_row, act_gold=act_gold, pt_gold=pt_gold)
 
         notes: List[str] = []
@@ -524,12 +580,14 @@ def export_dashboard_ready_csv(output_dir: Path, logger: Any = None) -> Dict[str
                 "preview_vigencia": _clean_spaces(preview.get("vigencia", "")),
                 "pt_gold": pt_gold,
                 "pt_json_path": pt_row.get("json_path", "") if pt_gold else "",
+                "pt_data_assinatura": pt_row.get("data_assinatura", "") if pt_row else "",
                 "pt_vigencia_inicio": pt_row.get("vigencia_inicio", "") if pt_gold else "",
                 "pt_vigencia_fim": pt_row.get("vigencia_fim", "") if pt_gold else "",
                 "pt_quality": pt_quality,
                 "act_gold": act_gold,
                 "act_json_path": act_row.get("json_path", "") if act_gold else "",
                 "act_numero_acordo": act_row.get("numero_acordo", "") if act_gold else "",
+                "act_data_assinatura": act_row.get("data_assinatura", "") if act_gold else "",
                 "act_data_inicio_vigencia": act_row.get("data_inicio_vigencia", "") if act_gold else "",
                 "act_data_fim_vigencia": act_row.get("data_fim_vigencia", "") if act_gold else "",
                 "act_orgao_convenente": act_orgao,
@@ -540,6 +598,7 @@ def export_dashboard_ready_csv(output_dir: Path, logger: Any = None) -> Dict[str
                 "source_act_parceiro": source_act_parceiro,
                 "memorando_gold": memorando_gold,
                 "memorando_json_path": memorando_row.get("json_path", "") if memorando_gold else "",
+                "memorando_data_assinatura": memorando_row.get("data_assinatura", "") if memorando_gold else "",
                 "ted_quality": ted_quality,
                 "ted_gold": ted_gold,
                 "ted_json_path": ted_row.get("json_path", "") if ted_gold else "",
@@ -568,6 +627,10 @@ def export_dashboard_ready_csv(output_dir: Path, logger: Any = None) -> Dict[str
                 "best_vigencia_raw": best_vigencia["raw"],
                 "best_vigencia_source": best_vigencia["source"],
                 "best_vigencia_confidence": best_vigencia["confidence"],
+                "best_data_assinatura": best_data_assinatura["data"],
+                "best_datas_assinatura": best_data_assinatura["datas"],
+                "best_data_assinatura_source": best_data_assinatura["source"],
+                "best_data_assinatura_confidence": best_data_assinatura["confidence"],
                 "best_objeto": best_objeto["value"],
                 "best_objeto_source": best_objeto["source"],
                 "best_objeto_confidence": best_objeto["confidence"],
@@ -618,12 +681,14 @@ def export_dashboard_ready_csv(output_dir: Path, logger: Any = None) -> Dict[str
         "preview_vigencia",
         "pt_gold",
         "pt_json_path",
+        "pt_data_assinatura",
         "pt_vigencia_inicio",
         "pt_vigencia_fim",
         "pt_quality",
         "act_gold",
         "act_json_path",
         "act_numero_acordo",
+        "act_data_assinatura",
         "act_data_inicio_vigencia",
         "act_data_fim_vigencia",
         "act_orgao_convenente",
@@ -634,6 +699,7 @@ def export_dashboard_ready_csv(output_dir: Path, logger: Any = None) -> Dict[str
         "source_act_parceiro",
         "memorando_gold",
         "memorando_json_path",
+        "memorando_data_assinatura",
         "ted_quality",
         "ted_gold",
         "ted_json_path",
@@ -656,6 +722,10 @@ def export_dashboard_ready_csv(output_dir: Path, logger: Any = None) -> Dict[str
         "best_vigencia_raw",
         "best_vigencia_source",
         "best_vigencia_confidence",
+        "best_data_assinatura",
+        "best_datas_assinatura",
+        "best_data_assinatura_source",
+        "best_data_assinatura_confidence",
         "best_objeto",
         "best_objeto_source",
         "best_objeto_confidence",
