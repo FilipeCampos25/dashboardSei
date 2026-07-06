@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import csv
+import json
+import shutil
 import sys
 import unittest
 from pathlib import Path
@@ -19,8 +22,10 @@ from app.services.pt_normalizer import (
     PERIOD_SOURCE_SIGNATURE,
     PUBLICATION_STATUS_GOLD,
     PUBLICATION_STATUS_SILVER,
+    VALIDATION_STATUS_VALID,
     VALIDATION_STATUS_NON_CANONICAL,
     build_normalized_record,
+    export_normalized_csv,
     normalize_pt_period,
 )
 from app.rpa.sei.document_text_extractor import parse_prazos
@@ -199,6 +204,97 @@ class PTNormalizerTests(unittest.TestCase):
         self.assertTrue(record["acoes_raw"])
         self.assertEqual(record["normalization_status"], "completo_padronizado")
 
+    def test_tabela_execucao_com_titulo_antes_do_cabecalho(self) -> None:
+        payload = _payload(
+            "60090.000445/2023-54",
+            """
+            PLANO DE TRABALHO - PT.
+            Periodo de Execucao AGO/2023 a AGO/2026.
+            """,
+            tables=[
+                {
+                    "rows": [
+                        ["10. PLANO DE ACAO E CRONOGRAMA DE EXECUCAO"],
+                        ["METAS", "ACAO", "RESPONSAVEL", "2023", "2024-2027", "SITUACAO"],
+                        ["1", "Alinhamento entre as equipes do Censipam e Visiona.", "Reuniao", "CENSIPAM/Visiona", "", "X", "", "X", "Ja realizada"],
+                        ["2", "Desenvolvimento de metodologia para recebimento de imagens.", "-", "CENSIPAM/Visiona", "", "X", "", "", ""],
+                        ["6", "Difusao de conhecimentos e geracao conjunta de produtos.", "-", "CENSIPAM/Visiona", "", "X", "X", "X", ""],
+                    ]
+                }
+            ],
+            prazos={"inicio_raw": "01/08/2023", "termino_raw": "31/08/2026"},
+        )
+        preview = {
+            "parceiro": "Visiona Tecnologia Espacial S/A",
+            "vigencia": "60 meses.",
+            "objeto": "execucao da cooperacao tecnica e operacional entre as participes",
+        }
+        record = build_normalized_record(payload, preview, Path("plano_trabalho_60090.000445_2023-54.json"))
+        self.assertIn("1 | Alinhamento entre as equipes", record["metas_raw"])
+        self.assertIn("6 | Difusao de conhecimentos", record["metas_raw"])
+        self.assertIn("Reuniao | CENSIPAM/Visiona", record["acoes_raw"])
+        self.assertEqual(record["normalization_status"], "completo_padronizado")
+        self.assertEqual(record["publication_status"], PUBLICATION_STATUS_GOLD)
+
+    def test_tabela_execucao_com_cabecalho_dividido_em_duas_linhas(self) -> None:
+        payload = _payload(
+            "60093.000183/2021-36",
+            """
+            PLANO DE TRABALHO.
+            Periodo de Execucao MAR/2023 a MAR/2028.
+            """,
+            tables=[
+                {
+                    "rows": [
+                        ["ACAO E CRONOGRAMA", "INDICADOR FISICO", "CRONOGRAMA DE EXECUCAO", "RESPONSAVEL"],
+                        ["METAS", "ETAPA", "ESPECIFICACAO", "UNID", "QUANT", "Inicio", "Termino"],
+                        ["1 NIVELAMENTO DE PROCEDIMENTOS", "1.1", "Reuniao tecnica para definicao dos cenarios.", "Reuniao", "2", "MAR/23", "MAR/27", "COHIDRO/CPRM"],
+                        ["1.2", "Construcao de agenda de capacitacao.", "Agenda", "1", "ABR/23", "ABR/26", "COHIDRO/CPRM"],
+                        ["2 PRODUTOS HIDROMETEOROLOGICOS", "2.1", "Analise espaco temporal dos niveis.", "Relatorio", "1", "MAR/23", "ABR/26", "COHIDRO/CPRM"],
+                    ]
+                }
+            ],
+            prazos={"inicio_raw": "01/03/2023", "termino_raw": "31/03/2028"},
+        )
+        preview = {
+            "parceiro": "CPRM",
+            "vigencia": "60 meses.",
+            "objeto": "intercambio de informacoes para monitoramento hidrometeorologico",
+        }
+        record = build_normalized_record(payload, preview, Path("plano_trabalho_60093.000183_2021-36.json"))
+        self.assertIn("1 NIVELAMENTO DE PROCEDIMENTOS", record["metas_raw"])
+        self.assertIn("2 PRODUTOS HIDROMETEOROLOGICOS", record["metas_raw"])
+        self.assertIn("1.2 | Construcao de agenda de capacitacao", record["acoes_raw"])
+        self.assertEqual(record["normalization_status"], "completo_padronizado")
+        self.assertEqual(record["publication_status"], PUBLICATION_STATUS_GOLD)
+
+    def test_tabela_generica_nao_vira_execucao_sem_cabecalho_forte(self) -> None:
+        payload = _payload(
+            "60090.000033/2021-52",
+            """
+            PLANO DE TRABALHO.
+            Periodo de Execucao OUT/2021 a OUT/2025.
+            """,
+            tables=[
+                {
+                    "rows": [
+                        ["Responsavel", "Acoes previstas"],
+                        ["CENSIPAM", "Apoiar as atividades administrativas do acordo."],
+                    ]
+                }
+            ],
+        )
+        preview = {
+            "parceiro": "COMAE",
+            "vigencia": "48 meses",
+            "objeto": "cooperacao entre Censipam e COMAE",
+        }
+        record = build_normalized_record(payload, preview, Path("plano_trabalho_60090.000033_2021-52.json"))
+        self.assertEqual(record["metas_raw"], "")
+        self.assertEqual(record["acoes_raw"], "")
+        self.assertNotEqual(record["normalization_status"], "completo_padronizado")
+        self.assertEqual(record["publication_status"], PUBLICATION_STATUS_SILVER)
+
     def test_pdf_native_sem_vigencia_global_permanece_parcial(self) -> None:
         payload = _payload(
             "60090.000702/2025-10",
@@ -360,6 +456,90 @@ class PTNormalizerTests(unittest.TestCase):
         self.assertEqual(record["rule_amount"], "5")
         self.assertEqual(record["rule_unit"], "anos")
         self.assertEqual(record["rule_anchor"], "assinatura")
+
+    def test_export_normalized_csv_publica_apenas_melhor_pt_por_processo(self) -> None:
+        processo = "60090.000100/2026-00"
+        base_text = """
+            PLANO DE TRABALHO
+            OBJETO: cooperacao tecnica para pesquisa aplicada.
+            Periodo de Execucao 1 de janeiro de 2026 a 31 de dezembro de 2026.
+            Meta 1 - Implantar rotina de acompanhamento.
+            Acao 1 - Realizar reunioes tecnicas.
+        """
+        stronger_text = base_text + """
+            Meta 2 - Consolidar indicadores de desempenho.
+            Acao 2 - Publicar relatorio tecnico de acompanhamento.
+            8. PREVISAO DE INICIO E TERMINO.
+        """
+        output_dir = Path.cwd() / "tests" / "_tmp_pt_normalizer_export"
+        if output_dir.exists():
+            shutil.rmtree(output_dir, ignore_errors=True)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            preview_path = output_dir / "parcerias_vigentes_latest.csv"
+            with preview_path.open("w", encoding="utf-8-sig", newline="") as file_obj:
+                writer = csv.DictWriter(
+                    file_obj,
+                    fieldnames=["processo", "parceiro", "vigencia", "objeto", "numero_act"],
+                )
+                writer.writeheader()
+                writer.writerow(
+                    {
+                        "processo": processo,
+                        "parceiro": "UNIVERSIDADE FEDERAL DE TESTE",
+                        "vigencia": "12 meses",
+                        "objeto": "cooperacao tecnica para pesquisa aplicada",
+                        "numero_act": "01/2026",
+                    }
+                )
+
+            weak_payload = _payload(
+                processo,
+                base_text,
+                analysis={
+                    "validation_status": VALIDATION_STATUS_VALID,
+                    "is_canonical_candidate": True,
+                    "internal_content_score": 3,
+                },
+            )
+            weak_payload["documento"] = "PT-FRACO"
+            strong_payload = _payload(
+                processo,
+                stronger_text,
+                analysis={
+                    "validation_status": VALIDATION_STATUS_VALID,
+                    "is_canonical_candidate": True,
+                    "internal_content_score": 7,
+                },
+            )
+            strong_payload["documento"] = "PT-FORTE"
+
+            (output_dir / "plano_trabalho_60090.000100_2026-00_tree_rank_001.json").write_text(
+                json.dumps(weak_payload, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            (output_dir / "plano_trabalho_60090.000100_2026-00_tree_rank_002.json").write_text(
+                json.dumps(strong_payload, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            result = export_normalized_csv(output_dir)
+
+            self.assertEqual(result["records"], 1)
+            with (output_dir / "pt_auditoria_latest.csv").open("r", encoding="utf-8-sig", newline="") as file_obj:
+                audit_rows = list(csv.DictReader(file_obj))
+            with (output_dir / "pt_normalizado_latest.csv").open("r", encoding="utf-8-sig", newline="") as file_obj:
+                published_rows = list(csv.DictReader(file_obj))
+        finally:
+            shutil.rmtree(output_dir, ignore_errors=True)
+
+        self.assertEqual(len(audit_rows), 2)
+        self.assertEqual(len(published_rows), 1)
+        self.assertEqual(published_rows[0]["documento"], "PT-FORTE")
+        self.assertGreater(
+            int(published_rows[0]["canonical_score"]),
+            int(next(row["canonical_score"] for row in audit_rows if row["documento"] == "PT-FRACO")),
+        )
 
     def test_normalize_pt_period_classifica_60_meses_sem_data_base(self) -> None:
         period = normalize_pt_period("", "60 meses", {})

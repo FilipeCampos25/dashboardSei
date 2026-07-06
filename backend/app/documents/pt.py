@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import csv
+import hashlib
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -200,6 +202,11 @@ class PTDocumentHandler:
             snapshot=snapshot,
             output_dir=output_dir,
             logger=logger,
+            filename_suffix=self._build_pt_candidate_filename_suffix(
+                snapshot=snapshot,
+                collection_context=collection_context,
+                analysis=analysis or {},
+            ),
             extra_payload={
                 "document_family": "pt",
                 "resolved_document_type": "plano_trabalho",
@@ -209,6 +216,48 @@ class PTDocumentHandler:
                 "analysis": analysis or {},
             },
         )
+
+    def _build_pt_candidate_filename_suffix(
+        self,
+        *,
+        snapshot: Dict[str, Any],
+        collection_context: Optional[Dict[str, Any]],
+        analysis: Dict[str, Any],
+    ) -> str:
+        context = collection_context or {}
+        found_in = str(context.get("found_in", "") or "unknown")
+        selection_detail = str(context.get("selection_detail", "") or "")
+        rank = ""
+        for pattern in (r"\bposition=(\d+)", r"\brank=(\d+)"):
+            match = re.search(pattern, selection_detail)
+            if match:
+                rank = match.group(1).zfill(3)
+                break
+        if not rank:
+            rank = "000"
+
+        url = str(snapshot.get("url", "") or "")
+        document_id = ""
+        for key in ("id_documento", "id_anexo", "id_procedimento"):
+            match = re.search(rf"[?&]{key}=([^&]+)", url)
+            if match and match.group(1):
+                document_id = f"{key}_{match.group(1)}"
+                break
+        if not document_id:
+            digest_source = "|".join(
+                str(part or "")
+                for part in (
+                    found_in,
+                    selection_detail,
+                    context.get("chosen_documento", ""),
+                    snapshot.get("title", ""),
+                    url,
+                )
+            )
+            document_id = hashlib.sha1(digest_source.encode("utf-8", errors="ignore")).hexdigest()[:10]
+
+        doc_class = str(analysis.get("doc_class", "") or "plano_trabalho")
+        return f"{found_in}_rank_{rank}_{document_id}_{doc_class}"
 
     def _register_tracking_record(
         self,
@@ -409,4 +458,5 @@ def build_pt_document_type() -> DocumentTypeSpec:
         ),
         handler=PTDocumentHandler(),
         filter_type_aliases=("Plano de Trabalho - PT", "Plano de Trabalho"),
+        max_filter_candidates=5,
     )

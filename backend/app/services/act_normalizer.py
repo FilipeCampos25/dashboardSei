@@ -159,6 +159,30 @@ TREE_PENALTY_MARKERS = (
     " pt ",
 )
 
+PUBLICATION_CONTEXT_MARKERS = (
+    "extrato",
+    "acordo",
+    "instrumento",
+    "termo",
+    "ajuste",
+    "publicacao do acordo",
+    "publicacao do instrumento",
+    "publicacao do termo",
+    "publicacao do presente",
+    "publicacao deste",
+)
+
+NOMINATION_PUBLICATION_MARKERS = (
+    "nomeado",
+    "nomeada",
+    "nomeacao",
+    "portaria",
+    "representado",
+    "representada",
+    "ato de nomeacao",
+    "boletim de comunicacoes administrativas",
+)
+
 HEADER_REJECTION_MARKERS = {
     "minuta": (DOC_CLASS_MINUTA, "cabecalho_minuta"),
     "extrato": (DOC_CLASS_EXTRATO, "cabecalho_extrato"),
@@ -408,6 +432,12 @@ def _classify_snapshot_core(
 
     if "clique aqui para visualizar o conteudo deste documento" in opening_blob:
         return _classification_record(DOC_CLASS_STUB, "stub_visualizacao")
+
+    title_or_selected_blob = " ".join(
+        part for part in (blobs["normalized_title"], blobs["normalized_selected"]) if part
+    )
+    if "e-mail" in title_or_selected_blob or "email" in title_or_selected_blob:
+        return _classification_record(DOC_CLASS_EMAIL_OUTRO, "email_ou_mensagem")
 
     for marker, (doc_class, reason) in ADMINISTRATIVE_HEADER_MARKERS.items():
         if marker not in rejection_blob:
@@ -755,23 +785,82 @@ def _extract_data_assinatura(snapshot: Dict[str, Any]) -> str:
     return max(signatures) if signatures else ""
 
 
-def _extract_data_publicacao(snapshot: Dict[str, Any]) -> str:
+def _date_before(left: str, right: str) -> bool:
+    try:
+        return bool(left and right and date.fromisoformat(left) < date.fromisoformat(right))
+    except ValueError:
+        return False
+
+
+def _first_clause_index(text: str) -> int:
+    match = re.search(r"\bCL[\u00c1A]USULA\b", text, flags=re.IGNORECASE)
+    return match.start() if match else -1
+
+
+def _publication_context(text: str, token_start: int) -> str:
+    start = max(0, token_start - 260)
+    end = min(len(text), token_start + 420)
+    return text[start:end]
+
+
+def _publication_rejection_reason(
+    *,
+    text: str,
+    token_start: int,
+    publication_date: str,
+    data_assinatura: str,
+) -> str:
+    context = _publication_context(text, token_start)
+    normalized_context = _normalize_text(context)
+    first_clause = _first_clause_index(text)
+    is_preamble = first_clause >= 0 and token_start < first_clause
+    has_publication_marker = any(
+        marker in normalized_context
+        for marker in ("publicad", "publicacao", "dou", "diario oficial")
+    )
+    has_nomination_marker = any(marker in normalized_context for marker in NOMINATION_PUBLICATION_MARKERS)
+    if is_preamble and has_publication_marker and has_nomination_marker:
+        return "data_publicacao_descartada_preambulo_nomeacao"
+    if _date_before(publication_date, data_assinatura):
+        return "data_publicacao_descartada_anterior_assinatura"
+    if not any(marker in normalized_context for marker in PUBLICATION_CONTEXT_MARKERS):
+        return "data_publicacao_descartada_contexto_incompativel"
+    return ""
+
+
+def _extract_data_publicacao_info(snapshot: Dict[str, Any], data_assinatura: str = "") -> Dict[str, str]:
     text = _prepare_text(str(snapshot.get("text", "") or ""))
     if not text:
-        return ""
+        return {"data_publicacao": "", "warning": ""}
     patterns = (
         rf"(?:publicad[oa]|publicacao|publica[cç][aã]o)[^\n. ]*(?:[^\n.]{{0,180}}?){DATE_PATTERN}",
         rf"(?:diario oficial da uniao|dou)[^\n. ]*(?:[^\n.]{{0,180}}?){DATE_PATTERN}",
         rf"{DATE_PATTERN}[^\n.]{{0,120}}?(?:diario oficial da uniao|dou)",
     )
-    dates: List[str] = []
+    candidates: List[Tuple[str, int, str]] = []
+    rejected_reasons: List[str] = []
     for pattern in patterns:
         for match in re.finditer(pattern, text, flags=re.IGNORECASE):
             token = match.group(1)
             iso = _normalize_date_token(token)
             if iso:
-                dates.append(iso)
-    return min(_dedupe(dates)) if dates else ""
+                candidates.append((iso, match.start(1), token))
+    for publication_date, token_start, _ in sorted(candidates, key=lambda item: item[0]):
+        rejection = _publication_rejection_reason(
+            text=text,
+            token_start=token_start,
+            publication_date=publication_date,
+            data_assinatura=data_assinatura,
+        )
+        if rejection:
+            rejected_reasons.append(rejection)
+            continue
+        return {"data_publicacao": publication_date, "warning": ""}
+    return {"data_publicacao": "", "warning": "; ".join(_dedupe(rejected_reasons))}
+
+
+def _extract_data_publicacao(snapshot: Dict[str, Any], data_assinatura: str = "") -> str:
+    return _extract_data_publicacao_info(snapshot, data_assinatura=data_assinatura)["data_publicacao"]
 
 
 def _extract_preamble(text: str) -> str:
@@ -972,6 +1061,11 @@ def resolve_act_vigencia(
             data_publicacao = _extract_first_date_after_marker(prepared, "publicacao")
         if not data_publicacao:
             return {**result, "warning": "vigencia_dependente_publicacao_sem_data"}
+        if _date_before(data_publicacao, data_assinatura):
+            return {
+                **result,
+                "warning": "vigencia_dependente_publicacao_sem_data; data_publicacao_descartada_anterior_assinatura",
+            }
         return {
             **result,
             "vigencia_inicio": data_publicacao,
@@ -1056,6 +1150,15 @@ def _extract_vigencia_legacy(snapshot: Dict[str, Any]) -> Tuple[str, str, str, s
         publication_date = _extract_first_date_after_marker(prepared, "publicacao")
         if not publication_date:
             return ("", "", "", "vigencia_dependente_publicacao_sem_data")
+        signatures = _extract_signature_dates(text)
+        signature_date = max(signatures) if signatures else ""
+        if _date_before(publication_date, signature_date):
+            return (
+                "",
+                "",
+                "",
+                "vigencia_dependente_publicacao_sem_data; data_publicacao_descartada_anterior_assinatura",
+            )
         if duration:
             end_iso = _add_duration(publication_date, duration.group(1), duration.group(2))
             return (publication_date, end_iso, "clausula_vigencia_publicacao_explicita", "")
@@ -1066,10 +1169,11 @@ def _extract_vigencia_legacy(snapshot: Dict[str, Any]) -> Tuple[str, str, str, s
 
 def _extract_vigencia(snapshot: Dict[str, Any]) -> Tuple[str, str, str, str]:
     raw = _extract_vigencia_raw(snapshot)
+    data_assinatura = _extract_data_assinatura(snapshot)
     resolved = resolve_act_vigencia(
         raw,
-        data_assinatura=_extract_data_assinatura(snapshot),
-        data_publicacao=_extract_data_publicacao(snapshot),
+        data_assinatura=data_assinatura,
+        data_publicacao=_extract_data_publicacao(snapshot, data_assinatura=data_assinatura),
         outras_datas=_extract_signature_dates(str(snapshot.get("text", "") or "")),
     )
     return (
@@ -1607,6 +1711,7 @@ def build_normalized_record(payload: Dict[str, Any], json_path: Path) -> Dict[st
     vigencia_warning = ""
     vigencia_rule = {"amount": "", "unit": "", "anchor": ""}
     numero_warning = ""
+    data_publicacao_warning = ""
 
     if analysis.get("doc_class") == DOC_CLASS_ACT_FINAL:
         numero_acordo, field_source_numero_acordo = _extract_numero_acordo(snapshot)
@@ -1617,7 +1722,9 @@ def build_normalized_record(payload: Dict[str, Any], json_path: Path) -> Dict[st
         signature_dates = _extract_signature_dates(str(snapshot.get("text", "") or ""))
         data_assinatura = max(signature_dates) if signature_dates else ""
         datas_assinatura = " | ".join(signature_dates)
-        data_publicacao = _extract_data_publicacao(snapshot)
+        publicacao_info = _extract_data_publicacao_info(snapshot, data_assinatura=data_assinatura)
+        data_publicacao = publicacao_info["data_publicacao"]
+        data_publicacao_warning = publicacao_info["warning"]
         vigencia_raw = _extract_vigencia_raw(snapshot)
         resolved_vigencia = resolve_act_vigencia(
             vigencia_raw,
@@ -1646,6 +1753,8 @@ def build_normalized_record(payload: Dict[str, Any], json_path: Path) -> Dict[st
         field_source_gestao = gestor_source or unidade_source
 
     validation_warning = _collect_validation_warnings(payload, analysis, vigencia_warning)
+    if data_publicacao_warning:
+        validation_warning = "; ".join(part for part in (validation_warning, data_publicacao_warning) if part)
     if numero_warning:
         validation_warning = "; ".join(part for part in (validation_warning, numero_warning) if part)
     document_processos = analysis.get("document_processos", []) or []

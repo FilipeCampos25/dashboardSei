@@ -111,11 +111,38 @@ def render_dataframe(df: pd.DataFrame, *, empty_message: str) -> None:
     st.dataframe(df, width="stretch", hide_index=True)
 
 
+def _vigencia_color_map() -> dict[str, str]:
+    color_map = {VIGENCIA_LABELS[key]: value for key, value in VIGENCIA_COLORS.items()}
+    color_map.update(VIGENCIA_COLORS)
+    return color_map
+
+
+def _vigencia_cell_style(value: Any) -> str:
+    color = _vigencia_color_map().get(str(value or "").strip())
+    if not color:
+        return ""
+    return f"background-color: {color}; color: #FFFFFF; font-weight: 700;"
+
+
+def render_vigencia_dataframe(df: pd.DataFrame, *, empty_message: str) -> None:
+    if df.empty:
+        st.info(empty_message)
+        return
+    if "Situação" not in df.columns:
+        st.dataframe(df, width="stretch", hide_index=True)
+        return
+    styler = df.style
+    if hasattr(styler, "map"):
+        styler = styler.map(_vigencia_cell_style, subset=["Situação"])
+    else:
+        styler = styler.applymap(_vigencia_cell_style, subset=["Situação"])
+    st.dataframe(styler, width="stretch", hide_index=True)
+
+
 def plot_bar(df: pd.DataFrame, *, x: str, y: str, title: str, color: str | None = None, text: str | None = None, key: str) -> None:
     if df.empty:
         st.info("Não há dados suficientes para o gráfico.")
         return
-    color_map = {VIGENCIA_LABELS[key]: value for key, value in VIGENCIA_COLORS.items()}
     fig = px.bar(
         df,
         x=x,
@@ -123,7 +150,7 @@ def plot_bar(df: pd.DataFrame, *, x: str, y: str, title: str, color: str | None 
         color=color,
         text=text,
         title=title,
-        color_discrete_map=color_map,
+        color_discrete_map=_vigencia_color_map(),
     )
     fig.update_layout(
         template="plotly_white",
@@ -136,6 +163,40 @@ def plot_bar(df: pd.DataFrame, *, x: str, y: str, title: str, color: str | None 
     )
     fig.update_xaxes(showgrid=False, zeroline=False)
     fig.update_yaxes(showgrid=True, gridcolor="#E5E7EB", zeroline=False)
+    st.plotly_chart(fig, width="stretch", key=key, config={"displayModeBar": False, "responsive": True})
+
+
+def plot_pie(
+    df: pd.DataFrame,
+    *,
+    names: str,
+    values: str,
+    title: str,
+    color: str | None = None,
+    key: str,
+) -> None:
+    if df.empty:
+        st.info("Não há dados suficientes para o gráfico.")
+        return
+    fig = px.pie(
+        df,
+        names=names,
+        values=values,
+        color=color or names,
+        title=title,
+        hole=0.35,
+        color_discrete_map=_vigencia_color_map(),
+    )
+    fig.update_traces(textposition="inside", textinfo="percent+label", sort=False)
+    fig.update_layout(
+        template="plotly_white",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="#FFFFFF",
+        font={"family": "Inter, sans-serif", "size": 13},
+        title={"x": 0, "font": {"size": 16}},
+        margin={"l": 10, "r": 10, "t": 48, "b": 10},
+        legend={"orientation": "h", "y": -0.05},
+    )
     st.plotly_chart(fig, width="stretch", key=key, config={"displayModeBar": False, "responsive": True})
 
 

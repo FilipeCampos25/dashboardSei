@@ -15,7 +15,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from dashboard.data_sources import empty_dataframe, load_dashboard_bundle, read_csv_safe, read_json_safe
 from dashboard.historical_partnerships import build_historical_partnerships, display_table as history_display_table, history_metrics
-from dashboard.partnerships_active import active_metrics, build_active_partnerships, filter_active_partnerships
+from dashboard.partnerships_active import (
+    active_metrics,
+    build_active_partnerships,
+    build_workplan_table,
+    display_table as active_display_table,
+    display_workplan_table,
+    filter_active_partnerships,
+    status_table,
+)
 from dashboard.ted_metrics import build_teds, chartable_dimension, filter_teds, ted_metrics
 from dashboard.vigencia_rules import classify_vigencia, days_remaining
 
@@ -255,6 +263,144 @@ class DashboardRebuildModelTests(unittest.TestCase):
 
         self.assertLess(len(active_df.iloc[0]["objeto_resumo"]), len(long_object))
         self.assertEqual(active_df.iloc[0]["objeto_completo"], long_object)
+
+    def test_active_display_removes_days_and_status_table_preserves_situation(self) -> None:
+        active_df = build_active_partnerships(
+            _bundle(
+                parcerias_vigentes=pd.DataFrame(
+                    [
+                        {
+                            "seq": "1",
+                            "processo": "60090.000001/2026-01",
+                            "numero_act": "1/2026",
+                            "parceiro": "Parceiro",
+                            "objeto": "Objeto",
+                        }
+                    ]
+                ),
+                dashboard_ready=pd.DataFrame(
+                    [
+                        {
+                            "processo": "60090.000001/2026-01",
+                            "best_numero_acordo": "1/2026",
+                            "best_parceiro": "Parceiro",
+                            "best_objeto": "Objeto",
+                            "best_vigencia_inicio": "2026-01-01",
+                            "best_vigencia_fim": "2026-07-01",
+                        }
+                    ]
+                ),
+            ),
+            today=date(2026, 1, 1),
+        )
+
+        consultation = active_display_table(active_df)
+        self.assertNotIn("Dias Restantes", consultation.columns)
+        self.assertIn("Situação", consultation.columns)
+
+        status = status_table(active_df)
+        self.assertEqual(
+            list(status.columns),
+            ["Processo", "Documento / Instrumento", "Parceiro", "Início da Vigência", "Fim da Vigência", "Situação"],
+        )
+        self.assertEqual(status.iloc[0]["Situação"], "Amarelo")
+
+    def test_workplan_table_prefers_audit_falls_back_to_normalized_and_respects_filters(self) -> None:
+        bundle = _bundle(
+            parcerias_vigentes=pd.DataFrame(
+                [
+                    {"seq": "1", "processo": "60090.000001/2026-01", "numero_act": "1/2026", "parceiro": "Parceiro 1"},
+                    {"seq": "2", "processo": "60090.000002/2026-02", "numero_act": "2/2026", "parceiro": "Parceiro 2"},
+                    {"seq": "3", "processo": "60090.000003/2026-03", "numero_act": "3/2026", "parceiro": "Parceiro 3"},
+                ]
+            ),
+            pt_audit=pd.DataFrame(
+                [
+                    {
+                        "processo": "60090.000001/2026-01",
+                        "documento": "PT auditado",
+                        "parceiro": "Parceiro auditado",
+                        "metas_raw": "Meta auditada",
+                        "acoes_raw": "Ação auditada",
+                        "prazo_inicio": "2026-01-01",
+                        "prazo_fim": "2026-12-31",
+                    }
+                ]
+            ),
+            pt_normalized=pd.DataFrame(
+                [
+                    {
+                        "processo": "60090.000001/2026-01",
+                        "documento": "PT normalizado",
+                        "metas_raw": "Meta normalizada",
+                        "acoes_raw": "Ação normalizada",
+                        "prazo_fim": "2027-12-31",
+                    },
+                    {
+                        "processo": "60090.000002/2026-02",
+                        "documento": "PT fallback",
+                        "metas_raw": "Meta fallback",
+                        "acoes_raw": "Ação fallback",
+                        "prazo_fim_raw": "até dezembro de 2026",
+                    },
+                    {
+                        "processo": "60090.000003/2026-03",
+                        "documento": "PT fora do filtro",
+                        "metas_raw": "Meta fora",
+                        "acoes_raw": "Ação fora",
+                    },
+                ]
+            ),
+        )
+        active_df = build_active_partnerships(bundle)
+        filtered = active_df[active_df["processo"].isin(["60090.000001/2026-01", "60090.000002/2026-02"])].reset_index(drop=True)
+
+        workplans = build_workplan_table(bundle, filtered)
+        by_process = {row["processo"]: row for row in workplans.to_dict(orient="records")}
+
+        self.assertEqual(set(by_process), {"60090.000001/2026-01", "60090.000002/2026-02"})
+        self.assertIn("Meta auditada", by_process["60090.000001/2026-01"]["metas"])
+        self.assertNotIn("Meta normalizada", by_process["60090.000001/2026-01"]["metas"])
+        self.assertIn("Meta fallback", by_process["60090.000002/2026-02"]["metas"])
+        self.assertIn("até dezembro de 2026", by_process["60090.000002/2026-02"]["prazos"])
+
+        display = display_workplan_table(workplans)
+        self.assertEqual(list(display.columns), ["Processo", "Documento PT", "Parceiro", "Metas", "Ações", "Prazos"])
+
+    def test_workplan_table_marks_missing_metas_acoes_and_prazos(self) -> None:
+        bundle = _bundle(
+            parcerias_vigentes=pd.DataFrame(
+                [
+                    {
+                        "seq": "1",
+                        "processo": "60090.000001/2026-01",
+                        "numero_act": "1/2026",
+                        "parceiro": "Parceiro",
+                    }
+                ]
+            ),
+            pt_audit=pd.DataFrame(
+                [
+                    {
+                        "processo": "60090.000001/2026-01",
+                        "documento": "PT sem estrutura",
+                        "metas_raw": "",
+                        "acoes_raw": "",
+                        "prazo_inicio": "",
+                        "prazo_fim": "",
+                        "prazo_inicio_raw": "",
+                        "prazo_fim_raw": "",
+                    }
+                ]
+            ),
+        )
+        active_df = build_active_partnerships(bundle)
+
+        display = display_workplan_table(build_workplan_table(bundle, active_df))
+
+        self.assertEqual(display.iloc[0]["Metas"], "Não identificado")
+        self.assertEqual(display.iloc[0]["Ações"], "Não identificado")
+        self.assertEqual(display.iloc[0]["Prazos"], "Não identificado")
 
     def test_filters_do_not_mix_categories(self) -> None:
         active_df = build_active_partnerships(

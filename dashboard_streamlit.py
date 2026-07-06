@@ -14,12 +14,14 @@ from dashboard.category_models import MAIN_TABS, VIGENCIA_LABELS
 from dashboard.dashboard_components import (
     plot_bar,
     plot_horizontal_value_ranking,
+    plot_pie,
     render_authenticated_header,
     render_active_detail,
     render_dataframe,
     render_history_detail,
     render_metric_cards,
     render_ted_detail,
+    render_vigencia_dataframe,
 )
 from dashboard.dashboard_styles import inject_css
 from dashboard.data_sources import build_file_signature, dashboard_source_paths, load_dashboard_bundle
@@ -46,7 +48,7 @@ def _non_empty_options(df: pd.DataFrame, column: str) -> list[str]:
     return sorted(value for value in df[column].dropna().astype(str).str.strip().unique().tolist() if value)
 
 
-def _render_active_tab(df: pd.DataFrame) -> None:
+def _render_active_tab(df: pd.DataFrame, bundle: dict[str, Any]) -> None:
     st.subheader("Parcerias Vigentes")
     if df.empty:
         st.info("Nenhuma parceria vigente encontrada na última coleta.")
@@ -89,16 +91,23 @@ def _render_active_tab(df: pd.DataFrame) -> None:
         ]
     )
 
+    left, right = st.columns([1, 1.4])
     dist = active.deadline_distribution(filtered)
-    plot_bar(
-        dist,
-        x="Situação",
-        y="Total",
-        color="Situação",
-        text="Total",
-        title="Distribuição das parcerias vigentes por situação de vigência",
-        key="active_deadline_distribution",
-    )
+    with left:
+        plot_pie(
+            dist,
+            names="Situação",
+            values="Total",
+            color="Situação",
+            title="Distribuição das parcerias vigentes por situação de vigência",
+            key="active_deadline_distribution",
+        )
+    with right:
+        st.markdown("**Parcerias por situação de vigência**")
+        render_vigencia_dataframe(
+            active.status_table(filtered),
+            empty_message="Nenhuma parceria vigente para os filtros atuais.",
+        )
 
     fallback_rows = filtered[filtered["fontes_origem"].astype(str).str.contains("preview_fallback", na=False)]
     if not fallback_rows.empty:
@@ -106,6 +115,9 @@ def _render_active_tab(df: pd.DataFrame) -> None:
 
     st.subheader("Tabela de consulta")
     render_dataframe(active.display_table(filtered), empty_message="Nenhuma parceria vigente para os filtros atuais.")
+    st.subheader("Planos de Trabalho")
+    workplan_table = active.build_workplan_table(bundle, filtered)
+    render_dataframe(active.display_workplan_table(workplan_table), empty_message="Nenhum Plano de Trabalho para os filtros atuais.")
     if filtered.empty:
         return
     selected = st.selectbox(
@@ -264,7 +276,7 @@ def main() -> None:
 
     tabs = st.tabs(MAIN_TABS)
     with tabs[0]:
-        _render_active_tab(active_df)
+        _render_active_tab(active_df, bundle)
     with tabs[1]:
         _render_ted_tab(ted_df)
     with tabs[2]:

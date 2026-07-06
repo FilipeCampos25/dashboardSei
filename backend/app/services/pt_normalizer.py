@@ -738,7 +738,7 @@ def _extract_pattern_fragments(text: str, patterns: Iterable[str], max_len: int 
     return out
 
 
-def _execution_from_tables(snapshot: Dict[str, Any]) -> Tuple[str, str]:
+def _execution_from_primary_table_headers(snapshot: Dict[str, Any]) -> Tuple[str, str]:
     metas: List[str] = []
     acoes: List[str] = []
     for table in snapshot.get("tables", []) or []:
@@ -769,6 +769,133 @@ def _execution_from_tables(snapshot: Dict[str, Any]) -> Tuple[str, str]:
             else:
                 acoes.append(row_text)
     return (" || ".join(dict.fromkeys(metas)), " || ".join(dict.fromkeys(acoes)))
+
+
+def _table_cells(row: Any) -> List[str]:
+    values = row if isinstance(row, (list, tuple)) else [row]
+    return [_clean_spaces(str(cell or "")) for cell in values if _clean_spaces(str(cell or ""))]
+
+
+def _normalized_row_text(row: Any) -> str:
+    return " | ".join(_normalize_text(cell) for cell in _table_cells(row))
+
+
+def _has_normalized_word(text: str, word: str) -> bool:
+    return bool(re.search(rf"(?<![a-z0-9]){re.escape(word)}(?![a-z0-9])", text))
+
+
+def _is_execution_table_header(header: str) -> bool:
+    has_meta = _has_normalized_word(header, "meta") or _has_normalized_word(header, "metas")
+    has_action = any(
+        _has_normalized_word(header, word)
+        for word in ("acao", "acoes", "etapa", "descricao", "especificacao", "atividade")
+    )
+    has_context = any(
+        _has_normalized_word(header, word)
+        for word in ("responsavel", "periodo", "cronograma", "situacao")
+    ) or bool(re.search(r"(?<!\d)20\d{2}(?!\d)", header))
+    return (has_meta and has_action and has_context) or (
+        _has_normalized_word(header, "etapa")
+        and _has_normalized_word(header, "descricao")
+        and (_has_normalized_word(header, "cronograma") or _has_normalized_word(header, "periodo"))
+    )
+
+
+def _is_execution_header_prefix(header: str) -> bool:
+    if not header:
+        return False
+    has_action = _has_normalized_word(header, "acao") or _has_normalized_word(header, "acoes")
+    has_schedule = _has_normalized_word(header, "cronograma")
+    return (
+        (_has_normalized_word(header, "plano") and has_action and has_schedule)
+        or (has_action and has_schedule)
+        or (has_schedule and _has_normalized_word(header, "execucao"))
+    )
+
+
+def _previous_nonempty_row_text(rows: List[Any], index: int) -> str:
+    for current in range(index - 1, -1, -1):
+        text = _normalized_row_text(rows[current])
+        if text:
+            return text
+    return ""
+
+
+def _execution_header_index(rows: List[Any]) -> Optional[int]:
+    scan_limit = min(4, len(rows))
+    for index in range(scan_limit):
+        header = _normalized_row_text(rows[index])
+        if _is_execution_table_header(header) and (index == 0 or _is_execution_header_prefix(_previous_nonempty_row_text(rows, index))):
+            return index
+    for index in range(max(scan_limit - 1, 0)):
+        prefix = _normalized_row_text(rows[index])
+        combined = " | ".join(part for part in (prefix, _normalized_row_text(rows[index + 1])) if part)
+        if _is_execution_header_prefix(prefix) and _is_execution_table_header(combined):
+            return index + 1
+    return None
+
+
+def _is_execution_footer_row(cells: List[str]) -> bool:
+    normalized = _normalize_text(" ".join(cells))
+    return (
+        normalized.startswith("documento assinado")
+        or normalized.startswith("a autenticidade")
+        or "codigo verificador" in normalized
+        or "controlador externo" in normalized
+    )
+
+
+def _execution_from_shifted_table_headers(snapshot: Dict[str, Any]) -> Tuple[str, str]:
+    metas: List[str] = []
+    acoes: List[str] = []
+    for table in snapshot.get("tables", []) or []:
+        rows = table.get("rows", []) if isinstance(table, dict) else table
+        rows = rows or []
+        if not rows:
+            continue
+        header_index = _execution_header_index(rows)
+        if header_index is None:
+            continue
+        saw_data_row = False
+        for row in rows[header_index + 1 :]:
+            cells = _table_cells(row)
+            if not cells:
+                continue
+            if _is_execution_footer_row(cells):
+                break
+            row_header = _normalized_row_text(cells)
+            if _is_execution_table_header(row_header):
+                continue
+            row_text = " | ".join(cells)
+            first = _normalize_text(cells[0])
+            first_is_number = bool(re.fullmatch(r"\d+[.)]?", first))
+            first_starts_numbered_text = bool(re.match(r"\d+\s+\S", first))
+            first_is_labeled = first.startswith(("meta", "fase", "etapa"))
+            if first_is_number and len(cells) >= 2:
+                metas.append(f"{cells[0]} | {cells[1]}")
+                if len(cells) >= 3:
+                    acoes.append(" | ".join(cells[1:]))
+                saw_data_row = True
+            elif first_starts_numbered_text:
+                metas.append(cells[0])
+                if len(cells) > 1:
+                    acoes.append(" | ".join(cells[1:]))
+                saw_data_row = True
+            elif first_is_labeled:
+                metas.append(row_text)
+                if len(cells) > 1:
+                    acoes.append(" | ".join(cells[1:]))
+                saw_data_row = True
+            elif saw_data_row and len(cells) >= 2:
+                acoes.append(row_text)
+    return (" || ".join(dict.fromkeys(metas)), " || ".join(dict.fromkeys(acoes)))
+
+
+def _execution_from_tables(snapshot: Dict[str, Any]) -> Tuple[str, str]:
+    metas, acoes = _execution_from_primary_table_headers(snapshot)
+    if _has_content(metas) or _has_content(acoes):
+        return metas, acoes
+    return _execution_from_shifted_table_headers(snapshot)
 
 
 def _extract_execution_section(text: str) -> str:
@@ -906,6 +1033,95 @@ def _classify_record(record: Dict[str, str]) -> Tuple[str, int]:
     if has_objeto and sum([1 if has_partner else 0, 1 if has_period else 0, 1 if (has_metas or has_acoes) else 0]) >= 2:
         return ("parcial_padronizado", captured)
     return ("extraido_sem_padrao", captured)
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(str(value or "").strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def _pt_canonical_score(payload: Dict[str, Any], record: Dict[str, str]) -> int:
+    snapshot = payload.get("snapshot", {}) or {}
+    analysis = payload.get("analysis", {}) or {}
+    tables = snapshot.get("tables", [])
+    tables_count = len(tables) if isinstance(tables, list) else 0
+    text_chars = len(str(snapshot.get("text", "") or ""))
+
+    score = 0
+    if record.get("publication_status") == PUBLICATION_STATUS_GOLD:
+        score += 300
+    elif record.get("normalization_status") == "parcial_padronizado":
+        score += 100
+    else:
+        score -= 200
+
+    score += _safe_int(record.get("captured_focus_fields", "")) * 40
+    if _has_content(record.get("parceiro", ""), min_alpha=4):
+        score += 25
+    if _has_content(record.get("objeto", "")):
+        score += 35
+    if _has_content(record.get("metas_raw", "")):
+        score += 45
+    if _has_content(record.get("acoes_raw", "")):
+        score += 45
+    if record.get("prazo_inicio") and record.get("prazo_fim"):
+        score += 50
+    elif record.get("prazo_inicio") or record.get("prazo_fim"):
+        score += 10
+    if record.get("data_assinatura"):
+        score += 10
+
+    period_source = record.get("period_source", "")
+    if period_source in {PERIOD_SOURCE_DIRECT, PERIOD_SOURCE_SIGNATURE}:
+        score += 50
+    elif period_source in {PERIOD_SOURCE_NOISE, PERIOD_SOURCE_MISSING}:
+        score -= 60
+    if record.get("period_warning"):
+        score -= 35
+    if record.get("missing_base_date") == "true":
+        score -= 60
+
+    score += _safe_int(analysis.get("internal_content_score", "")) * 20
+    if str(analysis.get("internal_content_penalties", "") or "").strip():
+        score -= 250
+    if record.get("validation_status") != VALIDATION_STATUS_VALID:
+        score -= 500
+
+    score += min(text_chars // 2500, 20)
+    score += min(tables_count * 5, 20)
+    return score
+
+
+def _select_published_pt_rows(records: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    grouped: Dict[str, List[Dict[str, str]]] = {}
+    for record in records:
+        grouped.setdefault(record.get("processo", ""), []).append(record)
+
+    published_rows: List[Dict[str, str]] = []
+    for processo_records in grouped.values():
+        gold_candidates = [
+            record
+            for record in processo_records
+            if record.get("publication_status") == PUBLICATION_STATUS_GOLD
+            and record.get("validation_status") == VALIDATION_STATUS_VALID
+        ]
+        if not gold_candidates:
+            continue
+        published_rows.append(
+            max(
+                gold_candidates,
+                key=lambda record: (
+                    _safe_int(record.get("canonical_score", "")),
+                    _safe_int(record.get("captured_focus_fields", "")),
+                    len(record.get("metas_raw", "")),
+                    len(record.get("acoes_raw", "")),
+                    len(record.get("objeto", "")),
+                ),
+            )
+        )
+    return published_rows
 
 
 def _field_or_missing(
@@ -1071,6 +1287,7 @@ def build_normalized_record(payload: Dict[str, Any], preview: Dict[str, str], js
         if is_canonical_candidate and status == "completo_padronizado"
         else PUBLICATION_STATUS_SILVER
     )
+    record["canonical_score"] = str(_pt_canonical_score(payload, record))
     contract_fields = _build_contract_fields(record=record, preview=preview, snapshot=snapshot)
     record["normalization_contract"] = build_document_contract(
         processo=record["processo"],
@@ -1140,6 +1357,7 @@ def export_normalized_csv(output_dir: Path, logger: Any = None) -> Dict[str, Any
         "preview_numero_act",
         "normalization_status",
         "captured_focus_fields",
+        "canonical_score",
         "json_path",
     ]
 
@@ -1162,12 +1380,13 @@ def export_normalized_csv(output_dir: Path, logger: Any = None) -> Dict[str, Any
         "period_warning",
         "normalization_status",
         "publication_status",
+        "canonical_score",
         "json_path",
     ]
     diagnostics_path = output_dir / "pt_period_diagnostics_latest.csv"
     csv_writer.write_csv(records, diagnostics_path, columns=diagnostic_columns)
 
-    published_rows = [record for record in records if record.get("publication_status") == PUBLICATION_STATUS_GOLD]
+    published_rows = _select_published_pt_rows(records)
     csv_path = output_dir / "pt_normalizado_latest.csv"
     complete_path = output_dir / "pt_normalizado_completo_latest.csv"
     # Ambos os arquivos publicam apenas o subconjunto gold; a dashboard deve consumir o export consolidado.

@@ -2547,7 +2547,7 @@ class WaitOptimizationTests(unittest.TestCase):
         self.assertEqual(opened_positions, [3])
         self.assertEqual(scraper.candidatos_descartados_pre_abertura, 2)
 
-    def test_busca_act_registra_early_stop_apos_primeiro_snapshot_valido(self) -> None:
+    def test_busca_act_coleta_candidato_valido_para_desempate(self) -> None:
         scraper = scraping.SEIScraper.__new__(scraping.SEIScraper)
         scraper.logger = Mock()
         scraper.timeout_seconds = 20
@@ -2620,8 +2620,18 @@ class WaitOptimizationTests(unittest.TestCase):
         self.assertTrue(result)
         self.assertEqual(scraper.abrir_documento_no_filtro.call_count, 2)
         scraper.logger.info.assert_any_call(
-            "Processo %s: ACT early stop após candidato válido",
+            "Processo %s: %s candidato valido coletado para disputa por conteudo (%s %d/%d).",
             "60091.000060/2023-87",
+            "ACT",
+            "filter",
+            2,
+            3,
+        )
+        scraper.logger.info.assert_any_call(
+            "Processo %s: %s coletou %d candidato(s) valido(s) pelo filtro; normalizador fara o desempate por conteudo.",
+            "60091.000060/2023-87",
+            "ACT",
+            1,
         )
 
     def test_get_document_types_for_process_reorders_ted_after_act(self) -> None:
@@ -2848,6 +2858,92 @@ class WaitOptimizationTests(unittest.TestCase):
         self.assertIsNotNone(analysis)
         self.assertEqual(analysis["doc_class"], "email_outro")
         self.assertEqual(analysis["validation_status"], "rejected_snapshot")
+
+    def test_validate_snapshot_aceita_pt_com_sinais_internos_estruturados(self) -> None:
+        scraper = scraping.SEIScraper.__new__(scraping.SEIScraper)
+        scraper._normalize_text = scraping.SEIScraper._normalize_text.__get__(scraper, scraping.SEIScraper)
+        document_type = DocumentTypeSpec(
+            key="pt",
+            display_name="Plano de Trabalho",
+            search_terms=("Plano de Trabalho",),
+            tree_match_terms=("PLANO DE TRABALHO",),
+            snapshot_prefix="plano_trabalho",
+            log_label="PT",
+            cleanup_patterns=(),
+            handler=DummyHandler(),
+        )
+        snapshot = {
+            "title": "Plano de Trabalho",
+            "url": "https://sei.defesa.gov.br/pt",
+            "text": (
+                "PLANO DE TRABALHO\n"
+                "IDENTIFICAÇÃO DO OBJETO\n"
+                "Objeto: cooperação técnica para atividades conjuntas.\n"
+                "PREVISÃO DE INÍCIO E TÉRMINO: 01/01/2026 a 31/12/2026.\n"
+                "METAS A SEREM ATINGIDAS\n"
+                "Meta 1 - Estruturar fluxo operacional.\n"
+                "Ação 1 - Reuniões técnicas.\n"
+            ),
+            "tables": [],
+        }
+
+        is_valid, reason, analysis = scraping.SEIScraper._validate_snapshot_for_document_type(
+            scraper,
+            "60090.000010/2026-00",
+            document_type,
+            snapshot,
+            {"chosen_documento": "Plano de Trabalho (123456)"},
+        )
+
+        self.assertTrue(is_valid)
+        self.assertEqual(reason, "plano_trabalho")
+        self.assertIsNotNone(analysis)
+        self.assertTrue(analysis["is_canonical_candidate"])
+        self.assertEqual(analysis["validation_status"], "valid_for_requested_type")
+        self.assertGreaterEqual(int(analysis["internal_content_score"]), 3)
+
+    def test_validate_snapshot_rebaixa_pt_modelo_placeholder_pelo_conteudo_interno(self) -> None:
+        scraper = scraping.SEIScraper.__new__(scraping.SEIScraper)
+        scraper._normalize_text = scraping.SEIScraper._normalize_text.__get__(scraper, scraping.SEIScraper)
+        document_type = DocumentTypeSpec(
+            key="pt",
+            display_name="Plano de Trabalho",
+            search_terms=("Plano de Trabalho",),
+            tree_match_terms=("PLANO DE TRABALHO",),
+            snapshot_prefix="plano_trabalho",
+            log_label="PT",
+            cleanup_patterns=(),
+            handler=DummyHandler(),
+        )
+        snapshot = {
+            "title": "Acordo de Cooperação Técnica / Plano de Trabalho COMAE",
+            "url": "https://sei.defesa.gov.br/pt-modelo",
+            "text": (
+                "MODELO DE ACORDO DE COOPERAÇÃO TÉCNICA\n"
+                "Acordo de Cooperação Técnica nº XX/20XX\n"
+                "PROCESSO No XXXXX.XXXXXX/XXXX-XX\n"
+                "CLÁUSULA SEGUNDA - DO PLANO DE TRABALHO\n"
+                "O plano de trabalho integra o presente acordo.\n"
+                "Brasília, na data de assinatura.\n"
+            ),
+            "tables": [],
+        }
+
+        is_valid, reason, analysis = scraping.SEIScraper._validate_snapshot_for_document_type(
+            scraper,
+            "60090.000033/2021-52",
+            document_type,
+            snapshot,
+            {"chosen_documento": "Acordo de Cooperação Técnica / Plano de Trabalho COMAE (5130526)"},
+        )
+
+        self.assertTrue(is_valid)
+        self.assertEqual(reason, "pt_conteudo_interno_insuficiente")
+        self.assertIsNotNone(analysis)
+        self.assertFalse(analysis["is_canonical_candidate"])
+        self.assertEqual(analysis["validation_status"], "related_but_not_canonical")
+        self.assertEqual(analysis["classification_reason"], "pt_conteudo_interno_insuficiente")
+        self.assertIn("placeholder", analysis["internal_content_penalties"])
 
     def test_switch_to_pesquisa_context_reabre_form_when_current_state_is_search_results(self) -> None:
         logger = Mock()

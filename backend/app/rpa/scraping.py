@@ -1744,6 +1744,27 @@ class SEIScraper:
         if document_type.key == "act":
             self.logger.info("Processo %s: ACT early stop após candidato válido", processo)
 
+    def _should_collect_competing_candidates(self, document_type: DocumentTypeSpec) -> bool:
+        return document_type.key in {"act", "pt"}
+
+    def _log_valid_candidate_collected_for_competition(
+        self,
+        processo: str,
+        document_type: DocumentTypeSpec,
+        *,
+        candidate_index: int,
+        total_candidates: int,
+        source: str = "tree",
+    ) -> None:
+        self.logger.info(
+            "Processo %s: %s candidato valido coletado para disputa por conteudo (%s %d/%d).",
+            processo,
+            document_type.log_label,
+            source,
+            candidate_index,
+            total_candidates,
+        )
+
     def _dedupe_terms(self, terms: Tuple[str, ...] | List[str]) -> List[str]:
         unique_terms: List[str] = []
         seen: Set[str] = set()
@@ -2352,6 +2373,8 @@ class SEIScraper:
             return False
 
         base_process_url = (process_url or self.driver.current_url or "").strip()
+        collect_competing_candidates = self._should_collect_competing_candidates(document_type)
+        collected_valid_candidates = 0
         for attempt_index, candidate in enumerate(candidates, start=1):
             candidate_text = str(candidate.get("text", "") or "")
             if self._should_skip_candidate_pre_open(candidate_text):
@@ -2378,6 +2401,14 @@ class SEIScraper:
                         document_type.log_label,
                         exc,
                     )
+                    if collected_valid_candidates:
+                        self.logger.warning(
+                            "Processo %s: %s encerrando disputa pela arvore com %d candidato(s) valido(s) ja coletado(s).",
+                            processo,
+                            document_type.log_label,
+                            collected_valid_candidates,
+                        )
+                        return True
                     return False
 
             link = self._locate_tree_link_by_text(str(candidate.get("text", "")))
@@ -2444,6 +2475,15 @@ class SEIScraper:
                 collection_context=collection_context,
             )
             if snapshot_saved:
+                if collect_competing_candidates:
+                    collected_valid_candidates += 1
+                    self._log_valid_candidate_collected_for_competition(
+                        processo,
+                        document_type,
+                        candidate_index=attempt_index,
+                        total_candidates=len(candidates),
+                    )
+                    continue
                 self._log_valid_candidate_early_stop(processo, document_type)
                 try:
                     self._restore_process_base_context(
@@ -2480,6 +2520,14 @@ class SEIScraper:
                 document_type.display_name,
                 exc,
             )
+        if collected_valid_candidates:
+            self.logger.info(
+                "Processo %s: %s coletou %d candidato(s) valido(s) pela arvore; normalizador fara o desempate por conteudo.",
+                processo,
+                document_type.log_label,
+                collected_valid_candidates,
+            )
+            return True
         return False
 
     def _buscar_e_abrir_documento_pela_arvore(
@@ -2575,6 +2623,8 @@ class SEIScraper:
                 )
             found_any_filter_candidate = False
             saw_invalid_filter_candidate = False
+            collect_competing_candidates = self._should_collect_competing_candidates(document_type)
+            collected_valid_filter_candidates = 0
 
             for term_index, termo in enumerate(filter_terms):
                 if term_index > 0:
@@ -2767,6 +2817,16 @@ class SEIScraper:
                             collection_context=attempt_context,
                         )
                         if snapshot_saved:
+                            if collect_competing_candidates:
+                                collected_valid_filter_candidates += 1
+                                self._log_valid_candidate_collected_for_competition(
+                                    processo,
+                                    document_type,
+                                    candidate_index=hit.selected_position,
+                                    total_candidates=hit.total_resultados,
+                                    source="filter",
+                                )
+                                continue
                             self._log_valid_candidate_early_stop(processo, document_type)
                             return True
                         saw_invalid_filter_candidate = True
@@ -2785,6 +2845,15 @@ class SEIScraper:
                             opened_doc_handles=attempt_opened_doc_handles,
                             preferred_return_handle=processo_handle,
                         )
+
+            if collected_valid_filter_candidates:
+                self.logger.info(
+                    "Processo %s: %s coletou %d candidato(s) valido(s) pelo filtro; normalizador fara o desempate por conteudo.",
+                    processo,
+                    document_type.log_label,
+                    collected_valid_filter_candidates,
+                )
+                return True
 
             attempted_tree_fallback = False
             if self._should_use_tree_fallback(document_type):
@@ -3988,6 +4057,78 @@ class SEIScraper:
             candidate_text,
         )
 
+    def _pt_internal_content_score(
+        self,
+        snapshot: Dict[str, Any],
+        collection_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        chosen_documento = self._normalize_text(str((collection_context or {}).get("chosen_documento", "") or ""))
+        title_blob = self._normalize_text(str(snapshot.get("title", "") or ""))
+        text = str(snapshot.get("text", "") or "")
+        text_head = self._normalize_text(text[:6000])
+        title_context = " ".join(part for part in (chosen_documento, title_blob) if part)
+        tables = snapshot.get("tables", [])
+        tables_count = len(tables) if isinstance(tables, list) else 0
+
+        signals: List[str] = []
+        score = 0
+
+        def add_signal(name: str, points: int, condition: bool) -> None:
+            nonlocal score
+            if condition:
+                signals.append(name)
+                score += points
+
+        add_signal("marcador_plano_trabalho", 1, "PLANO DE TRABALHO" in text_head or "PLANO DE TRABALHO" in title_context)
+        add_signal(
+            "objeto",
+            1,
+            any(marker in text_head for marker in ("IDENTIFICACAO DO OBJETO", "OBJETO:", "OBJETO DO PRESENTE")),
+        )
+        add_signal(
+            "metas",
+            1,
+            any(marker in text_head for marker in ("META", "METAS", "METAS A SEREM ATINGIDAS")),
+        )
+        add_signal(
+            "acoes_cronograma",
+            1,
+            any(marker in text_head for marker in ("ACAO", "ACOES", "ATIVIDADE", "ATIVIDADES", "ETAPA", "CRONOGRAMA")),
+        )
+        add_signal(
+            "prazo_periodo",
+            1,
+            any(
+                marker in text_head
+                for marker in (
+                    "PREVISAO DE INICIO",
+                    "PERIODO DE EXECUCAO",
+                    "INICIO",
+                    "TERMINO",
+                    "VIGORARA PELO PRAZO",
+                    "VIGENCIA",
+                )
+            ),
+        )
+        add_signal("data_explicita", 1, bool(re.search(r"\b\d{1,2}/\d{1,2}/\d{4}\b", text)))
+        add_signal("tabelas", 1, tables_count > 0)
+
+        penalties: List[str] = []
+        if "MODELO DE ACORDO DE COOPERACAO TECNICA" in text_head:
+            penalties.append("modelo_act")
+        if "XX/20XX" in text_head or "XXXXX.XXXXXX/XXXX-XX" in text_head:
+            penalties.append("placeholder")
+        if "INSERIR PREVISAO" in text_head or ("INSERIR" in text_head and "PREVISAO DE INICIO" in text_head):
+            penalties.append("instrucao_placeholder")
+        if penalties:
+            score -= 3
+
+        return {
+            "internal_content_score": score,
+            "internal_content_signals": "|".join(signals),
+            "internal_content_penalties": "|".join(penalties),
+        }
+
     def _describe_candidate_for_logs(
         self,
         protocolo_documento: str,
@@ -4077,6 +4218,7 @@ class SEIScraper:
         )
 
         is_non_canonical = has_plano_marker and (has_minuta_text or (has_documentacao_marker and has_minuta_marker))
+        content_quality = self._pt_internal_content_score(snapshot, collection_context)
         if is_non_canonical:
             return {
                 "doc_class": "pt_minuta_documentacao",
@@ -4087,6 +4229,22 @@ class SEIScraper:
                 "publication_status": "retained_silver",
                 "discard_reason": "minuta_documentacao",
                 "classification_reason": CLASSIFICATION_REASON_MINUTA_DOCUMENTACAO,
+                **content_quality,
+            }
+
+        internal_score = int(content_quality.get("internal_content_score", 0) or 0)
+        internal_penalties = str(content_quality.get("internal_content_penalties", "") or "")
+        if internal_score < 3 or internal_penalties:
+            return {
+                "doc_class": "pt_conteudo_interno_insuficiente",
+                "requested_type": REQUESTED_TYPE_PT,
+                "resolved_document_type": RESOLVED_TYPE_PT,
+                "is_canonical_candidate": False,
+                "validation_status": VALIDATION_STATUS_NON_CANONICAL,
+                "publication_status": "retained_silver",
+                "discard_reason": "conteudo_interno_insuficiente",
+                "classification_reason": "pt_conteudo_interno_insuficiente",
+                **content_quality,
             }
 
         return {
@@ -4098,6 +4256,7 @@ class SEIScraper:
             "publication_status": "",
             "discard_reason": "",
             "classification_reason": "",
+            **content_quality,
         }
 
     def _validate_snapshot_for_document_type(

@@ -451,6 +451,115 @@ class ACTNormalizerTests(unittest.TestCase):
         self.assertEqual(record["vigencia_rule_unit"], "anos")
         self.assertEqual(record["vigencia_rule_anchor"], "publicacao")
 
+    def test_build_normalized_record_discards_nomination_publication_from_preamble(self) -> None:
+        payload = {
+            "processo": "60090.000445/2023-54",
+            "snapshot": {
+                "title": "SEI - 6467241 - Acordo de Cooperacao Tecnica",
+                "extraction_mode": "html_dom",
+                "text": """
+                    Acordo de Cooperacao Tecnica no 3/2023
+                    PROCESSO No 60090.000445/2023-54
+                    ACORDO DE COOPERACAO TECNICA QUE ENTRE SI CELEBRAM A UNIAO, POR INTERMEDIO DO
+                    CENTRO GESTOR E OPERACIONAL DO SISTEMA DE PROTECAO DA AMAZONIA - CENSIPAM,
+                    E A VISIONA TECNOLOGIA ESPACIAL S/A, PARA OS FINS QUE ESPECIFICA.
+                    As partes resolvem celebrar o presente instrumento para regular a cooperacao institucional,
+                    o intercambio tecnico e as demais condicoes operacionais estabelecidas neste documento.
+                    A Uniao, representada pelo CENSIPAM, neste ato representada por seu Diretor-Geral,
+                    nomeado por meio da Portaria no 471/CC/PR, de 2 de outubro de 2020,
+                    publicada no DOU no 191, de 5 de outubro de 2020, e a VISIONA TECNOLOGIA ESPACIAL S/A
+                    resolvem celebrar o presente Acordo de Cooperacao Tecnica.
+
+                    CLAUSULA PRIMEIRA - DO OBJETO
+                    O objeto do presente Acordo de Cooperacao Tecnica e a execucao da cooperacao tecnica e operacional.
+
+                    CLAUSULA SETIMA - DO PRAZO E VIGENCIA
+                    O prazo de vigencia deste Acordo de Cooperacao Tecnica sera de 03 anos a partir da publicacao no Diario Oficial da Uniao.
+
+                    Documento assinado eletronicamente por Fulano, em 10/08/2023.
+                    Documento assinado eletronicamente por Beltrano, em 11/08/2023.
+                """,
+            },
+            "collection": {"chosen_documento": "Acordo de Cooperacao Tecnica 3 (6467241)"},
+        }
+
+        record = build_normalized_record(payload, Path("acordo_cooperacao_tecnica_60090.000445_2023-54.json"))
+        self.assertEqual(record["data_publicacao"], "")
+        self.assertEqual(record["data_inicio_vigencia"], "")
+        self.assertEqual(record["data_fim_vigencia"], "")
+        self.assertIn("vigencia_dependente_publicacao_sem_data", record["validation_warning"])
+        self.assertIn("data_publicacao_descartada_preambulo_nomeacao", record["validation_warning"])
+        self.assertEqual(record["vigencia_rule_anchor"], "publicacao")
+
+    def test_build_normalized_record_keeps_real_instrument_publication_after_signature(self) -> None:
+        payload = {
+            "processo": "60090.000445/2023-54",
+            "snapshot": {
+                "title": "SEI - 6467241 - Acordo de Cooperacao Tecnica",
+                "extraction_mode": "html_dom",
+                "text": """
+                    Acordo de Cooperacao Tecnica no 3/2023
+                    PROCESSO No 60090.000445/2023-54
+                    Acordo de Cooperacao Tecnica que entre si celebram o CENSIPAM e a VISIONA TECNOLOGIA ESPACIAL S/A.
+
+                    CLAUSULA PRIMEIRA - DO OBJETO
+                    O objeto do presente Acordo de Cooperacao Tecnica e a execucao da cooperacao tecnica e operacional.
+
+                    CLAUSULA SETIMA - DO PRAZO E VIGENCIA
+                    O prazo de vigencia deste Acordo de Cooperacao Tecnica sera de 24 meses a partir da publicacao no Diario Oficial da Uniao.
+
+                    Documento assinado eletronicamente por Fulano, em 10/02/2024.
+                    Extrato de publicacao do Acordo de Cooperacao Tecnica publicado no DOU em 05/03/2024.
+                """,
+            },
+            "collection": {"chosen_documento": "Acordo de Cooperacao Tecnica 3 (6467241)"},
+        }
+
+        record = build_normalized_record(payload, Path("acordo_cooperacao_tecnica_60090.000445_2023-54.json"))
+        self.assertEqual(record["data_publicacao"], "2024-03-05")
+        self.assertEqual(record["data_inicio_vigencia"], "2024-03-05")
+        self.assertEqual(record["data_fim_vigencia"], "2026-03-04")
+        self.assertEqual(record["field_source_vigencia"], "clausula_vigencia_publicacao")
+        self.assertEqual(record["validation_warning"], "")
+
+    def test_build_normalized_record_keeps_signature_vigencia_when_preamble_publication_is_suspect(self) -> None:
+        payload = {
+            "processo": "60090.000572/2024-34",
+            "snapshot": {
+                "title": "SEI - Acordo de Cooperacao Tecnica",
+                "extraction_mode": "html_dom",
+                "text": """
+                    Acordo de Cooperacao Tecnica no 3/2024
+                    PROCESSO No 60090.000572/2024-34
+                    ACORDO DE COOPERACAO TECNICA QUE ENTRE SI CELEBRAM A UNIAO, POR INTERMEDIO DO
+                    CENTRO GESTOR E OPERACIONAL DO SISTEMA DE PROTECAO DA AMAZONIA - CENSIPAM,
+                    E A UNIVERSIDADE FEDERAL DO AMAZONAS, PARA OS FINS QUE ESPECIFICA.
+                    As partes resolvem celebrar o presente instrumento para regular a cooperacao institucional,
+                    o intercambio tecnico e as demais condicoes operacionais estabelecidas neste documento.
+                    A Uniao, representada pelo CENSIPAM, neste ato representada por seu Diretor-Geral,
+                    nomeado por meio da Portaria no 471/CC/PR, de 2 de outubro de 2020,
+                    publicada no DOU no 191, de 5 de outubro de 2020, e a UNIVERSIDADE FEDERAL DO AMAZONAS
+                    resolvem celebrar o presente Acordo de Cooperacao Tecnica.
+
+                    CLAUSULA PRIMEIRA - DO OBJETO
+                    O objeto do presente Acordo de Cooperacao Tecnica e a cooperacao institucional.
+
+                    CLAUSULA SETIMA - DO PRAZO E VIGENCIA
+                    O prazo de vigencia deste Acordo de Cooperacao Tecnica sera de 5 anos a partir da assinatura.
+
+                    Documento assinado eletronicamente por Fulano, em 18/12/2024.
+                """,
+            },
+            "collection": {"chosen_documento": "Acordo de Cooperacao Tecnica 3/2024"},
+        }
+
+        record = build_normalized_record(payload, Path("acordo_cooperacao_tecnica_60090.000572_2024-34.json"))
+        self.assertEqual(record["data_publicacao"], "")
+        self.assertEqual(record["data_inicio_vigencia"], "2024-12-18")
+        self.assertEqual(record["data_fim_vigencia"], "2029-12-17")
+        self.assertEqual(record["field_source_vigencia"], "clausula_vigencia_assinatura")
+        self.assertIn("data_publicacao_descartada_preambulo_nomeacao", record["validation_warning"])
+
     def test_build_normalized_record_rejects_placeholder_number_and_splits_partner(self) -> None:
         payload = {
             "processo": "60090.000033/2021-52",

@@ -216,6 +216,7 @@ def _best_pt_row(rows: List[Dict[str, str]]) -> Dict[str, str]:
         rows,
         key=lambda row: (
             row.get("publication_status", "") == PT_PUBLICATION_STATUS_GOLD,
+            _safe_int(row.get("canonical_score", "")),
             _safe_int(row.get("captured_focus_fields", "")),
             len(row.get("objeto", "")),
         ),

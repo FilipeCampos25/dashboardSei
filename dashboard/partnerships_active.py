@@ -52,6 +52,15 @@ ACTIVE_COLUMNS = [
     "vigencia_raw",
 ]
 
+WORKPLAN_COLUMNS = [
+    "processo",
+    "documento_pt",
+    "parceiro",
+    "metas",
+    "acoes",
+    "prazos",
+]
+
 
 def _records_by_process(df: pd.DataFrame) -> dict[str, list[dict[str, Any]]]:
     if df.empty or "processo" not in df.columns:
@@ -253,6 +262,116 @@ def deadline_distribution(df: pd.DataFrame) -> pd.DataFrame:
     return counts[counts["Total"] > 0]
 
 
+def status_table(df: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "processo",
+        "documento_instrumento",
+        "parceiro",
+        "vigencia_inicio_display",
+        "vigencia_fim_display",
+        "situacao_display",
+    ]
+    labels = {
+        "processo": "Processo",
+        "documento_instrumento": "Documento / Instrumento",
+        "parceiro": "Parceiro",
+        "vigencia_inicio_display": "Início da Vigência",
+        "vigencia_fim_display": "Fim da Vigência",
+        "situacao_display": "Situação",
+    }
+    if df.empty:
+        return pd.DataFrame(columns=list(labels.values()))
+    return df[columns].copy().rename(columns=labels)
+
+
+def _split_workplan_items(values: Iterable[Any]) -> list[str]:
+    items: list[str] = []
+    for value in values:
+        for part in str(value or "").split("||"):
+            cleaned = clean_spaces(part)
+            if cleaned and cleaned not in items:
+                items.append(cleaned)
+    return items
+
+
+def _summarize_workplan_items(values: Iterable[Any], *, limit: int = 320) -> str:
+    return summarize_text("; ".join(_split_workplan_items(values)), limit)
+
+
+def _workplan_date_display(value: Any, raw_value: Any) -> str:
+    iso_value = format_date_iso(value)
+    if iso_value:
+        return format_date_display(iso_value)
+    return clean_spaces(raw_value)
+
+
+def _workplan_period(record: dict[str, Any]) -> str:
+    start = _workplan_date_display(record.get("prazo_inicio", ""), record.get("prazo_inicio_raw", ""))
+    end = _workplan_date_display(record.get("prazo_fim", ""), record.get("prazo_fim_raw", ""))
+    if start and end:
+        return f"{start} a {end}"
+    return end or start
+
+
+def _workplan_periods(records: list[dict[str, Any]]) -> str:
+    periods: list[str] = []
+    for record in records:
+        period = _workplan_period(record)
+        if period and period not in periods:
+            periods.append(period)
+    return display_text("; ".join(periods))
+
+
+def build_workplan_table(bundle: dict[str, Any], filtered_active_df: pd.DataFrame) -> pd.DataFrame:
+    if filtered_active_df.empty or "processo" not in filtered_active_df.columns:
+        return empty_dataframe(WORKPLAN_COLUMNS)
+
+    active_rows_by_process: dict[str, dict[str, Any]] = {}
+    process_order: list[str] = []
+    for record in filtered_active_df.to_dict(orient="records"):
+        processo = normalize_processo(record.get("processo", ""))
+        if processo and processo not in active_rows_by_process:
+            active_rows_by_process[processo] = record
+            process_order.append(processo)
+
+    audit_by_process = _records_by_process(bundle.get("pt_audit", empty_dataframe([])))
+    normalized_by_process = _records_by_process(bundle.get("pt_normalized", empty_dataframe([])))
+
+    rows: list[dict[str, Any]] = []
+    for processo in process_order:
+        records = audit_by_process.get(processo) or normalized_by_process.get(processo, [])
+        if not records:
+            continue
+        active_row = active_rows_by_process.get(processo, {})
+        document_candidates = [record.get("documento", "") for record in records]
+        partner_candidates = [record.get("parceiro", "") for record in records]
+        rows.append(
+            {
+                "processo": processo,
+                "documento_pt": first_non_empty(*(document_candidates + ["Plano de Trabalho"])),
+                "parceiro": first_non_empty(*(partner_candidates + [active_row.get("parceiro", "")])),
+                "metas": _summarize_workplan_items(record.get("metas_raw", "") for record in records),
+                "acoes": _summarize_workplan_items(record.get("acoes_raw", "") for record in records),
+                "prazos": _workplan_periods(records),
+            }
+        )
+    return pd.DataFrame(rows, columns=WORKPLAN_COLUMNS)
+
+
+def display_workplan_table(df: pd.DataFrame) -> pd.DataFrame:
+    labels = {
+        "processo": "Processo",
+        "documento_pt": "Documento PT",
+        "parceiro": "Parceiro",
+        "metas": "Metas",
+        "acoes": "Ações",
+        "prazos": "Prazos",
+    }
+    if df.empty:
+        return pd.DataFrame(columns=list(labels.values()))
+    return df[WORKPLAN_COLUMNS].copy().rename(columns=labels)
+
+
 def filter_active_partnerships(
     df: pd.DataFrame,
     *,
@@ -309,25 +428,21 @@ def display_table(df: pd.DataFrame) -> pd.DataFrame:
         "objeto_resumo",
         "vigencia_inicio_display",
         "vigencia_fim_display",
-        "dias_restantes",
         "situacao_display",
     ]
+    labels = {
+        "processo": "Processo",
+        "documento_instrumento": "Documento / Instrumento",
+        "parceiro": "Parceiro",
+        "objeto_resumo": "Objeto / Atribuição",
+        "vigencia_inicio_display": "Início da Vigência",
+        "vigencia_fim_display": "Fim da Vigência",
+        "situacao_display": "Situação",
+    }
     if df.empty:
-        return pd.DataFrame(columns=columns)
+        return pd.DataFrame(columns=list(labels.values()))
     table = df[columns].copy()
-    table["dias_restantes"] = table["dias_restantes"].apply(lambda value: "" if pd.isna(value) else str(int(value)))
-    return table.rename(
-        columns={
-            "processo": "Processo",
-            "documento_instrumento": "Documento / Instrumento",
-            "parceiro": "Parceiro",
-            "objeto_resumo": "Objeto / Atribuição",
-            "vigencia_inicio_display": "Início da Vigência",
-            "vigencia_fim_display": "Fim da Vigência",
-            "dias_restantes": "Dias Restantes",
-            "situacao_display": "Situação",
-        }
-    )
+    return table.rename(columns=labels)
 
 
 def detail_options(df: pd.DataFrame) -> list[str]:
