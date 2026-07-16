@@ -102,6 +102,96 @@ class ACTNormalizerTests(unittest.TestCase):
                 record = build_normalized_record(payload, Path("act.json"))
                 self.assertEqual(record["numero_acordo"], expected)
 
+    def test_numero_acordo_uses_contextual_header_before_selected_title(self) -> None:
+        payload = {
+            "processo": "60093.000125/2020-21",
+            "snapshot": {
+                "title": "SEI/MD - Acordo de Cooperacao Tecnica",
+                "text": """
+                    Acordo de Cooperação Técnica / Centro Gestor e Operacional do Sistema de Proteção da Amazônia - Censipam nº 09/2020
+                    PROCESSO Nº 60093.000125/2020-21
+                    ACORDO DE COOPERAÇÃO TÉCNICA QUE ENTRE SI CELEBRAM O CENSIPAM E A SEDAM.
+                    CLÁUSULA PRIMEIRA - DO OBJETO
+                    O objeto do presente Acordo de Cooperação Técnica é a cooperação institucional.
+                """,
+            },
+            "collection": {"chosen_documento": "Acordo de Cooperação Técnica 9/2020 (2966550)"},
+        }
+        record = build_normalized_record(payload, Path("act.json"))
+        self.assertEqual(record["numero_acordo"], "09/2020")
+        self.assertEqual(record["numero_acordo_source_type"], "document_text")
+        self.assertEqual(record["field_source_numero_acordo"], "act.numero.header.contextual")
+        self.assertNotIn("numero_acordo_conflict", record["validation_warning"])
+        self.assertGreaterEqual(len(record["numero_acordo_evidences"]), 2)
+
+    def test_numero_acordo_falls_back_to_selected_document_title(self) -> None:
+        payload = {
+            "processo": "60093.000183/2021-36",
+            "snapshot": {
+                "title": "SEI/MD - Acordo de Cooperação Técnica",
+                "text": """
+                    Acordo de Cooperação Técnica Censipam e CPRM/2023
+                    PROCESSO Nº 60093.000183/2021-36
+                    ACORDO DE COOPERAÇÃO TÉCNICA QUE ENTRE SI CELEBRAM O CENSIPAM E A CPRM.
+                    CLÁUSULA PRIMEIRA - DO OBJETO
+                    O objeto do presente Acordo de Cooperação Técnica é a cooperação institucional.
+                """,
+            },
+            "collection": {"chosen_documento": "Acordo de Cooperação Técnica 1/2023 (6150021)"},
+        }
+        record = build_normalized_record(payload, Path("act.json"))
+        self.assertEqual(record["numero_acordo"], "1/2023")
+        self.assertEqual(record["numero_acordo_source_type"], "document_title")
+        self.assertEqual(record["numero_acordo_confidence"], "medium")
+
+    def test_numero_acordo_preserves_higher_priority_value_and_warns_on_conflict(self) -> None:
+        payload = {
+            "processo": "60090.000111/2024-10",
+            "snapshot": {
+                "title": "SEI - Acordo de Cooperação Técnica 8/2024",
+                "text": """
+                    ACORDO DE COOPERAÇÃO TÉCNICA Nº 7/2024 QUE ENTRE SI CELEBRAM O CENSIPAM E A UNIVERSIDADE.
+                    CLÁUSULA PRIMEIRA - DO OBJETO
+                    O objeto do presente Acordo de Cooperação Técnica é a cooperação institucional.
+                """,
+            },
+            "collection": {"chosen_documento": "Acordo de Cooperação Técnica 8/2024"},
+        }
+        record = build_normalized_record(payload, Path("act.json"))
+        self.assertEqual(record["numero_acordo"], "7/2024")
+        self.assertIn("numero_acordo_conflict", record["validation_warning"])
+        self.assertIn("document_title=8/2024", record["numero_acordo_warning"])
+
+    def test_numero_acordo_does_not_use_unmarked_numbers_or_noncanonical_title(self) -> None:
+        canonical_payload = {
+            "processo": "60090.000111/2024-10",
+            "snapshot": {
+                "title": "SEI - Acordo de Cooperação Técnica",
+                "text": """
+                    ACORDO DE COOPERAÇÃO TÉCNICA QUE ENTRE SI CELEBRAM O CENSIPAM E A CPRM/2023.
+                    PROCESSO Nº 60090.000111/2024-10. PORTARIA Nº 77/2024. CONTRATO Nº 8/2024.
+                    Referência externa: ACT sem número formal, 109/2022.
+                    CLÁUSULA PRIMEIRA - DO OBJETO
+                    O objeto do presente Acordo de Cooperação Técnica é a cooperação institucional.
+                """,
+            },
+            "collection": {"chosen_documento": "Acordo de Cooperação Técnica"},
+        }
+        record = build_normalized_record(canonical_payload, Path("act.json"))
+        self.assertEqual(record["numero_acordo"], "")
+
+        minuta_payload = {
+            **canonical_payload,
+            "snapshot": {
+                "title": "Minuta de Acordo de Cooperação Técnica",
+                "text": "Minuta de ACT nº 109/2022 para análise do CENSIPAM.",
+            },
+            "collection": {"chosen_documento": "Acordo de Cooperação Técnica 109/2022"},
+        }
+        minuta = build_normalized_record(minuta_payload, Path("minuta.json"))
+        self.assertNotEqual(minuta["doc_class"], DOC_CLASS_ACT_FINAL)
+        self.assertEqual(minuta["numero_acordo"], "")
+
     def test_classify_act_snapshot_identifies_known_classes(self) -> None:
         cases = [
             (
@@ -278,7 +368,7 @@ class ACTNormalizerTests(unittest.TestCase):
         self.assertEqual(record["unidade_responsavel"], "")
         self.assertEqual(record["classificacao"], DOC_CLASS_ACT_FINAL)
         self.assertTrue(record["relatorio_encerramento"])
-        self.assertEqual(record["field_source_numero_acordo"], "cabecalho_act_tecnica")
+        self.assertEqual(record["field_source_numero_acordo"], "act.numero.header.adjacent")
         self.assertEqual(record["field_source_objeto"], "clausula_objeto")
         self.assertEqual(record["field_source_vigencia"], "clausula_vigencia_ultima_assinatura")
         self.assertEqual(record["validation_warning"], "")
@@ -597,6 +687,130 @@ class ACTNormalizerTests(unittest.TestCase):
         self.assertEqual(record["vigencia_rule_unit"], "meses")
         self.assertEqual(record["vigencia_rule_anchor"], "publicacao")
 
+    def test_extracts_prf_without_article_and_audits_structural_evidence(self) -> None:
+        payload = {
+            "processo": "08650.063489/2021-11",
+            "snapshot": {
+                "title": "SEI - Acordo de Cooperacao Tecnica",
+                "extraction_mode": "html_dom",
+                "tables": [{"rows": [["", "Acordo que entre si celebram o Censipam e Policia Rodoviaria Federal (PRF), para os fins que especifica."]]}],
+                "text": """
+                    Acordo de Cooperacao Tecnica no 2/2023
+                    PROCESSO No 08650.063489/2021-11
+                    Acordo de Cooperacao Tecnica que entre si celebram a Uniao, representada pelo Ministerio da Defesa,
+                    por intermedio do Centro Gestor e Operacional do Sistema de Protecao da Amazonia - Censipam
+                    e Policia Rodoviaria Federal (PRF), para os fins que especifica.
+
+                    A UNIAO, representada pelo CENSIPAM, doravante denominado CENSIPAM, e a POLICIA RODOVIARIA
+                    FEDERAL, doravante denominada PRF, resolvem celebrar o presente acordo.
+
+                    CLAUSULA TERCEIRA - DAS OBRIGACOES COMUNS
+                    Para viabilizar o objeto, o Censipam e a PRF ficam obrigados a executar as acoes.
+
+                    Diretor-Geral (PRF)
+                """,
+            },
+            "collection": {"chosen_documento": "Acordo de Cooperacao Tecnica 2 PRF"},
+        }
+        record = build_normalized_record(payload, Path("act_prf.json"))
+        self.assertEqual(record["numero_acordo"], "2/2023")
+        self.assertEqual(record["orgao_convenente"], "POLICIA RODOVIARIA FEDERAL - PRF")
+        self.assertEqual(record["orgao_convenente_sigla"], "PRF")
+        audit = record["party_extraction"]
+        self.assertEqual(audit["source_scope"], "snapshot_act_canonico")
+        self.assertEqual(audit["internal_party"]["role"], "parte_interna")
+        self.assertIn("qualificacao_inicial", audit["selected_counterparty"]["zones"])
+
+    def test_multiple_direct_parties_tied_stay_blank_and_audited(self) -> None:
+        payload = {
+            "processo": "60090.001500/2026-10",
+            "snapshot": {
+                "title": "Acordo de Cooperacao Tecnica",
+                "extraction_mode": "html_dom",
+                "tables": [{"rows": [["Participe 1", "CENSIPAM"], ["Participe 2", "Universidade Federal Alfa - UFA"], ["Participe 3", "Instituto Federal Beta - IFB"]]}],
+                "text": """
+                    ACORDO DE COOPERACAO TECNICA No 8/2026 QUE ENTRE SI CELEBRAM O CENSIPAM E AS INSTITUICOES IDENTIFICADAS.
+                    A Uniao, por intermedio do CENSIPAM, resolve celebrar o presente Acordo de Cooperacao Tecnica
+                    para integrar capacidades tecnicas, compartilhar conhecimentos e executar atividades conjuntas
+                    segundo as responsabilidades e condicoes definidas pelos participes neste instrumento.
+                    CLAUSULA PRIMEIRA - DO OBJETO
+                    Cooperacao institucional definida no plano de trabalho.
+                """,
+            },
+            "collection": {"chosen_documento": "Acordo de Cooperacao Tecnica 8/2026"},
+        }
+        record = build_normalized_record(payload, Path("act_multipartes.json"))
+        self.assertEqual(record["orgao_convenente"], "")
+        self.assertEqual(record["party_extraction"]["warning"], "multiplos_participes_ambiguos")
+        direct = [item for item in record["party_extraction"]["candidates"] if item["role"] == "participe_direto"]
+        self.assertEqual(len([item for item in direct if item["confidence"] == "high"]), 2)
+        self.assertIn("multiplos_participes_ambiguos", record["validation_warning"])
+
+    def test_intervenient_and_beneficiary_are_not_promoted(self) -> None:
+        payload = {
+            "processo": "60090.001501/2026-64",
+            "snapshot": {
+                "title": "Acordo de Cooperacao Tecnica",
+                "extraction_mode": "html_dom",
+                "text": """
+                    ACORDO DE COOPERACAO TECNICA No 9/2026 QUE ENTRE SI CELEBRAM O CENSIPAM E A UNIVERSIDADE ALFA - UFA.
+                    INTERVENIENTE: FUNDACAO DE APOIO TESTE.
+                    BENEFICIARIO: INSTITUTO COMUNITARIO GAMA.
+                    CLAUSULA PRIMEIRA - DO OBJETO
+                    Cooperacao para apoiar o Instituto Comunitario Gama.
+                """,
+            },
+            "collection": {"chosen_documento": "Acordo de Cooperacao Tecnica 9/2026"},
+        }
+        record = build_normalized_record(payload, Path("act_interveniente.json"))
+        self.assertEqual(record["orgao_convenente"], "UNIVERSIDADE ALFA - UFA")
+        roles = {item["role"] for item in record["party_extraction"]["candidates"]}
+        self.assertIn("interveniente", roles)
+        self.assertIn("beneficiario", roles)
+
+    def test_organization_mentioned_only_in_object_is_not_partner(self) -> None:
+        payload = {
+            "processo": "60090.001502/2026-17",
+            "snapshot": {
+                "title": "Acordo de Cooperacao Tecnica",
+                "extraction_mode": "html_dom",
+                "text": """
+                    ACORDO DE COOPERACAO TECNICA No 10/2026
+                    A UNIAO, POR INTERMEDIO DO CENSIPAM, RESOLVE CELEBRAR O PRESENTE ACORDO DE COOPERACAO TECNICA.
+                    CLAUSULA PRIMEIRA - DO OBJETO
+                    O objeto e fornecer informacoes ao IBAMA e apoiar a POLICIA FEDERAL.
+                """,
+            },
+            "collection": {"chosen_documento": "Acordo de Cooperacao Tecnica 10/2026"},
+        }
+        record = build_normalized_record(payload, Path("act_mencao.json"))
+        self.assertEqual(record["orgao_convenente"], "")
+        values = " ".join(item["normalized_value"] for item in record["party_extraction"]["candidates"])
+        self.assertNotIn("IBAMA", values)
+        self.assertNotIn("POLICIA FEDERAL", values)
+
+    def test_explicit_institutional_signature_is_low_confidence_fallback(self) -> None:
+        payload = {
+            "processo": "60090.001503/2026-53",
+            "snapshot": {
+                "title": "Acordo de Cooperacao Tecnica",
+                "extraction_mode": "html_dom",
+                "text": """
+                    ACORDO DE COOPERACAO TECNICA No 11/2026
+                    A UNIAO, POR INTERMEDIO DO CENSIPAM, RESOLVE CELEBRAR O PRESENTE ACORDO DE COOPERACAO TECNICA.
+                    CLAUSULA PRIMEIRA - DO OBJETO
+                    Cooperacao institucional.
+
+                    Documento assinado eletronicamente por Fulano de Tal, em 01/02/2026.
+                    Representante da Universidade Federal Delta - UFD
+                """,
+            },
+            "collection": {"chosen_documento": "Acordo de Cooperacao Tecnica 11/2026"},
+        }
+        record = build_normalized_record(payload, Path("act_assinatura.json"))
+        self.assertEqual(record["orgao_convenente"], "Universidade Federal Delta - UFD")
+        self.assertEqual(record["party_extraction"]["selected_counterparty"]["confidence"], "low")
+
     def test_relatorio_encerramento_ignora_relatorio_periodico_sem_fecho(self) -> None:
         payload = {
             "processo": "60090.001000/2026-01",
@@ -696,15 +910,25 @@ class ACTNormalizerTests(unittest.TestCase):
             normalized_path = output_dir / "act_normalizado_latest.csv"
             audit_path = output_dir / "act_classificacao_latest.csv"
             diagnostics_path = output_dir / "act_field_diagnostics_latest.csv"
+            affinity_path = output_dir / "act_process_affinity_shadow_latest.csv"
             self.assertTrue(normalized_path.exists())
             self.assertTrue(audit_path.exists())
             self.assertTrue(diagnostics_path.exists())
+            self.assertTrue(affinity_path.exists())
+            self.assertEqual(export_result["affinity_path"], affinity_path)
 
             with normalized_path.open("r", encoding="utf-8-sig", newline="") as file_obj:
                 rows = list(csv.DictReader(file_obj))
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0]["processo"], "08650.063489/2021-11")
             self.assertEqual(rows[0]["classificacao"], DOC_CLASS_ACT_FINAL)
+            alias_payload = json.loads(
+                (output_dir / "acordo_cooperacao_tecnica_08650.063489_2021-11.json").read_text(encoding="utf-8")
+            )
+            self.assertIn("party_extraction", alias_payload["analysis"])
+            self.assertEqual(alias_payload["analysis"]["party_extraction"]["source_scope"], "snapshot_act_canonico")
+            self.assertIn("process_affinity", alias_payload["analysis"])
+            self.assertTrue(alias_payload["analysis"]["process_affinity"]["shadow_only"])
 
             with audit_path.open("r", encoding="utf-8-sig", newline="") as file_obj:
                 audit_rows = list(csv.DictReader(file_obj))
@@ -716,6 +940,12 @@ class ACTNormalizerTests(unittest.TestCase):
             self.assertIn("canon_rejection_reason", audit_rows[0])
             self.assertIn("field_source_vigencia", audit_rows[0])
             self.assertIn("validation_warning", audit_rows[0])
+            self.assertIn("affinity_status", audit_rows[0])
+
+            with affinity_path.open("r", encoding="utf-8-sig", newline="") as file_obj:
+                affinity_rows = list(csv.DictReader(file_obj))
+            self.assertEqual(len(affinity_rows), 2)
+            self.assertTrue(all(row["shadow_only"] == "True" for row in affinity_rows))
 
             with diagnostics_path.open("r", encoding="utf-8-sig", newline="") as file_obj:
                 diagnostic_rows = list(csv.DictReader(file_obj))

@@ -128,6 +128,39 @@ class DashboardPortfolioTests(unittest.TestCase):
         self.assertEqual(model["portfolio"].iloc[0]["situacao_carteira"], SITUACAO_ATIVA)
         self.assertEqual(len(model["active"]), 1)
 
+    def test_exported_document_contract_is_preferred_and_legacy_ted_fallback_remains(self) -> None:
+        processo_new = "60092.000169/2023-12"
+        new_row = _overview_row(processo_new, "2027-01-02", numero="")
+        new_row.update(
+            {
+                "source_universe": "ted_normalizado",
+                "documento_principal_tipo": "TED",
+                "documento_principal_numero": "06/2023",
+                "ted_gold": True,
+            }
+        )
+        processo_legacy = "60090.000840/2025-07"
+        legacy_row = _overview_row(processo_legacy, "2027-01-02", numero="")
+        legacy_row["ted_gold"] = True
+        ted_rows = pd.DataFrame(
+            [
+                {"processo": processo_new, "numero_ted": "99", "ano_ted": "2099"},
+                {"processo": processo_legacy, "numero_ted": "04", "ano_ted": "2025"},
+            ]
+        )
+        divergence = pd.DataFrame([{"processo": processo_legacy, "source_universe": "ted_normalizado"}])
+
+        model = build_dashboard_model(
+            _bundle(overview=pd.DataFrame([new_row, legacy_row]), ted_normalized=ted_rows, divergence=divergence),
+            today=date(2026, 1, 1),
+        )
+        portfolio = model["portfolio"].set_index("processo")
+
+        self.assertEqual(portfolio.loc[processo_new, "documento_principal_tipo"], "TED")
+        self.assertEqual(portfolio.loc[processo_new, "documento_principal_numero"], "06/2023")
+        self.assertEqual(portfolio.loc[processo_legacy, "documento_principal_tipo"], "TED")
+        self.assertEqual(portfolio.loc[processo_legacy, "documento_principal_numero"], "04/2025")
+
     def test_missing_fields_use_canonical_names(self) -> None:
         row = _overview_row("60090.000005/2026-05", "", numero="")
         row["best_parceiro"] = ""

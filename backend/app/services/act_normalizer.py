@@ -14,12 +14,15 @@ from app.services.normalization_contract import (
     CONFIDENCE_LOW,
     CONFIDENCE_MEDIUM,
     SOURCE_DERIVED,
+    SOURCE_DOCUMENT_METADATA,
     SOURCE_DOCUMENT_TEXT,
+    SOURCE_DOCUMENT_TITLE,
     SOURCE_MISSING,
     build_document_contract,
     make_field,
     make_missing_field,
 )
+from app.services.act_process_affinity import assess_act_process_affinity
 
 DOC_CLASS_ACT_FINAL = "act_final"
 DOC_CLASS_MEMORANDO = "memorando"
@@ -607,7 +610,7 @@ def classify_cooperation_snapshot(
     if publication_status == PUBLICATION_STATUS_GOLD:
         normalization_status = "publicado_canonico"
 
-    return {
+    result = {
         **base,
         "requested_type": requested,
         "accepted_doc_classes": accepted_doc_classes,
@@ -623,6 +626,13 @@ def classify_cooperation_snapshot(
         "document_processo": process_alignment["document_processo"],
         "document_processos": process_alignment["document_processos"],
     }
+    if requested == "act":
+        result["process_affinity"] = assess_act_process_affinity(
+            snapshot,
+            current_process=processo,
+            collection=collection_context,
+        )
+    return result
 
 
 def classify_act_snapshot(
@@ -659,11 +669,28 @@ def _collect_act_snapshot_paths(output_dir: Path) -> List[Path]:
     return sorted(output_dir.glob(f"{SNAPSHOT_PREFIX_ACT}_*.json"))
 
 
-def _publish_act_alias(output_dir: Path, source_path: Path, processo: str) -> Path:
+def _publish_act_alias(
+    output_dir: Path,
+    source_path: Path,
+    processo: str,
+    party_extraction: Optional[Dict[str, Any]] = None,
+    process_affinity: Optional[Dict[str, Any]] = None,
+) -> Path:
     alias_path = _act_alias_path(output_dir, processo)
     if source_path.resolve() != alias_path.resolve():
         alias_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source_path, alias_path)
+    if party_extraction is not None or process_affinity is not None:
+        payload = _read_json(alias_path)
+        analysis = payload.get("analysis")
+        if not isinstance(analysis, dict):
+            analysis = {}
+            payload["analysis"] = analysis
+        if party_extraction is not None:
+            analysis["party_extraction"] = party_extraction
+        if process_affinity is not None:
+            analysis["process_affinity"] = process_affinity
+        alias_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return alias_path
 
 
@@ -905,33 +932,128 @@ def _clean_clause_value(value: str) -> str:
     return _clean_spaces(cleaned)
 
 
-def _extract_numero_acordo(snapshot: Dict[str, Any]) -> Tuple[str, str]:
-    sources = (
-        ("cabecalho_titulo", _prepare_text(str(snapshot.get("title", "") or ""))),
-        ("cabecalho_documento", _trim_noise(str(snapshot.get("text", "") or ""))[:HEADER_SCAN_CHARS]),
-    )
-    patterns = (
-        ("cabecalho_act_sigla", r"\bact\s*(?:n(?:o|\.|umero)?|no)?\s*[:o.]?\s*([a-z0-9./-]*\d[a-z0-9./-]*)"),
-        (
-            "cabecalho_act_tecnica",
-            r"acordo de cooperacao tecnica\s*(?:n(?:o|\.|umero)?|no)?\s*[:o.]?\s*([a-z0-9./-]*\d[a-z0-9./-]*)",
-        ),
-        ("cabecalho_act_tecnica", r"acordo de cooperacao tecnica\s+([0-9]{1,4}/[0-9]{2,4})"),
-        (
-            "cabecalho_act_generico",
-            r"acordo de cooperacao\s*(?:n(?:o|\.|umero)?|no)?\s*[:o.]?\s*([a-z0-9./-]*\d[a-z0-9./-]*)",
-        ),
-        ("cabecalho_act_generico", r"acordo de cooperacao\s+(?!tecnica\b)([0-9]{1,4}/[0-9]{2,4})"),
-    )
-    for _, source in sources:
-        normalized_source = _normalize_text(source)
-        if not normalized_source:
+ACT_NUMBER_VALUE_PATTERN = (
+    r"(?:\d{1,4}\s*/\s*\d{2,4}"
+    r"|\d{1,4}-\d{4}(?:/[a-z0-9.-]+)+)"
+)
+ACT_NUMBER_MARKER_PATTERN = r"(?:\bact\b|\bacordo de cooperacao tecnica\b|\bacordo de cooperacao\b)"
+ACT_NUMBER_LABEL_PATTERN = r"(?:n\s*(?:o|\.|umero)|numero)"
+
+
+def _numero_comparison_key(value: str) -> str:
+    normalized = _normalize_text(value).replace(" ", "")
+    match = re.fullmatch(r"0*(\d+)/(0*\d+)", normalized)
+    if match:
+        return f"{int(match.group(1))}/{int(match.group(2))}"
+    return normalized
+
+
+def _numero_evidence(
+    *, value: str, source_type: str, evidence: str, rule_id: str, confidence: str, priority: int
+) -> Dict[str, Any]:
+    return {
+        "value": _clean_spaces(value).rstrip(".,;:"),
+        "source_type": source_type,
+        "evidence": _clean_spaces(evidence)[:300],
+        "rule_id": rule_id,
+        "confidence": confidence,
+        "priority": priority,
+    }
+
+
+def _collect_numero_from_source(
+    source: str,
+    *,
+    source_type: str,
+    confidence: str,
+    priority: int,
+    rule_prefix: str,
+    contextual: bool = False,
+) -> List[Dict[str, Any]]:
+    evidences: List[Dict[str, Any]] = []
+    prepared = _prepare_text(source)
+    if not prepared:
+        return evidences
+    chunks = prepared.splitlines() if contextual else [prepared]
+    direct_pattern = rf"{ACT_NUMBER_MARKER_PATTERN}\s*(?:{ACT_NUMBER_LABEL_PATTERN})?\s*[:.\-]?\s*({ACT_NUMBER_VALUE_PATTERN})"
+    contextual_pattern = rf"{ACT_NUMBER_MARKER_PATTERN}.{{0,160}}?{ACT_NUMBER_LABEL_PATTERN}\s*[:.\-]?\s*({ACT_NUMBER_VALUE_PATTERN})"
+    placeholder_pattern = rf"{ACT_NUMBER_MARKER_PATTERN}\s*(?:{ACT_NUMBER_LABEL_PATTERN})?\s*[:.\-]?\s*((?:x+[/.-]?x+|x+/20xx|s\s*/\s*n(?:umero|o)?))"
+    for chunk in chunks:
+        normalized = _normalize_text(chunk)
+        if not normalized:
             continue
-        for field_source, pattern in patterns:
-            match = re.search(pattern, normalized_source, flags=re.IGNORECASE)
-            if match:
-                return (_clean_spaces(match.group(1).rstrip(".,;:")), field_source)
-    return ("", "")
+        patterns = [(f"{rule_prefix}.adjacent", direct_pattern)]
+        if contextual:
+            patterns.append((f"{rule_prefix}.contextual", contextual_pattern))
+        patterns.append((f"{rule_prefix}.placeholder", placeholder_pattern))
+        for rule_id, pattern in patterns:
+            for match in re.finditer(pattern, normalized, flags=re.IGNORECASE):
+                evidence = _numero_evidence(
+                    value=match.group(1),
+                    source_type=source_type,
+                    evidence=chunk,
+                    rule_id=rule_id,
+                    confidence=confidence,
+                    priority=priority,
+                )
+                if not any(
+                    item["rule_id"] == evidence["rule_id"]
+                    and _numero_comparison_key(item["value"]) == _numero_comparison_key(evidence["value"])
+                    for item in evidences
+                ):
+                    evidences.append(evidence)
+    return evidences
+
+
+def _extract_numero_acordo(snapshot: Dict[str, Any], collection: Dict[str, Any]) -> Dict[str, Any]:
+    evidences: List[Dict[str, Any]] = []
+    evidences.extend(
+        _collect_numero_from_source(
+            _trim_noise(str(snapshot.get("text", "") or ""))[:HEADER_SCAN_CHARS],
+            source_type=SOURCE_DOCUMENT_TEXT,
+            confidence=CONFIDENCE_HIGH,
+            priority=300,
+            rule_prefix="act.numero.header",
+            contextual=True,
+        )
+    )
+    evidences.extend(
+        _collect_numero_from_source(
+            str(collection.get("chosen_documento", "") or ""),
+            source_type=SOURCE_DOCUMENT_TITLE,
+            confidence=CONFIDENCE_MEDIUM,
+            priority=200,
+            rule_prefix="act.numero.selected_title",
+        )
+    )
+    evidences.extend(
+        _collect_numero_from_source(
+            str(snapshot.get("title", "") or ""),
+            source_type=SOURCE_DOCUMENT_METADATA,
+            confidence=CONFIDENCE_MEDIUM,
+            priority=100,
+            rule_prefix="act.numero.snapshot_title",
+        )
+    )
+    valid = [item for item in evidences if not _is_placeholder_numero_acordo(str(item.get("value", "")))]
+    if not valid:
+        return {"value": "", "field_source": "", "source_type": SOURCE_MISSING, "confidence": CONFIDENCE_LOW, "evidence": "", "warning": "numero_placeholder" if evidences else "", "evidences": evidences}
+    chosen = max(valid, key=lambda item: int(item["priority"]))
+    chosen_key = _numero_comparison_key(chosen["value"])
+    conflicts = [item for item in valid if _numero_comparison_key(item["value"]) != chosen_key]
+    warning = ""
+    if conflicts:
+        details = ", ".join(f"{item['source_type']}={item['value']}" for item in conflicts)
+        warning = f"numero_acordo_conflict: selected={chosen['source_type']}={chosen['value']}; alternatives={details}"
+    return {
+        "value": chosen["value"],
+        "field_source": chosen["rule_id"],
+        "source_type": chosen["source_type"],
+        "confidence": chosen["confidence"],
+        "evidence": chosen["evidence"],
+        "warning": warning,
+        "evidences": evidences,
+    }
 
 
 def _is_placeholder_numero_acordo(value: str) -> bool:
@@ -1239,7 +1361,7 @@ def _looks_like_internal_orgao(value: str) -> bool:
 
 def _clean_party_candidate(value: str) -> str:
     candidate = _clean_spaces(value)
-    candidate = re.sub(r"^(?:a|o|as|os)\s+", "", candidate, flags=re.IGNORECASE)
+    candidate = re.sub(r"^(?:e\s+)?(?:a|o|as|os)\s+", "", candidate, flags=re.IGNORECASE)
     for pattern in (
         r",?\s+por\s+(?:interm[eé]dio|meio)\s+d[aoe]\s+.*$",
         r",\s+neste\s+ato.*$",
@@ -1299,7 +1421,7 @@ def _extract_orgao_intermediario(snapshot: Dict[str, Any]) -> str:
     return "" if _looks_like_internal_orgao(candidate) else candidate
 
 
-def _extract_orgao_convenente(snapshot: Dict[str, Any]) -> Tuple[str, str]:
+def _extract_orgao_convenente_legacy(snapshot: Dict[str, Any]) -> Tuple[str, str]:
     preamble = _extract_preamble(str(snapshot.get("text", "") or ""))
     if not preamble:
         return ("", "")
@@ -1356,6 +1478,272 @@ def _extract_orgao_convenente(snapshot: Dict[str, Any]) -> Tuple[str, str]:
                 return (candidate, "preambulo_partes_fallback")
 
     return ("", "")
+
+
+_PARTY_CONFIDENCE_SCORE = {
+    CONFIDENCE_HIGH: 3,
+    CONFIDENCE_MEDIUM: 2,
+    CONFIDENCE_LOW: 1,
+}
+
+_NON_PARTY_ROLE_PATTERNS = (
+    ("interveniente", r"\binterveniente\b"),
+    ("anuente", r"\banuente\b"),
+    ("beneficiario", r"\bbenefici[aá]ri[oa]\b"),
+    ("executor", r"\bexecutor(?:a)?\b"),
+)
+
+
+def _party_key(value: str) -> str:
+    normalized = _normalize_text(_clean_party_candidate(value))
+    normalized = re.sub(r"\bpara\s+os\s+fins.*$", "", normalized)
+    normalized = re.sub(r"\b(?:a|o|as|os)\b", " ", normalized)
+    return re.sub(r"[^a-z0-9]+", " ", normalized).strip()
+
+
+def _party_sigla(value: str) -> str:
+    prepared = _clean_spaces(_prepare_text(value))
+    match = re.search(
+        r"(?:\(([A-Z0-9]{2,}(?:/[A-Z0-9]{2,})?)\)|[-–—]\s*([A-Z0-9]{2,}(?:/[A-Z0-9]{2,})?)|doravante\s+denominad[oa]\s+([A-Z0-9]{2,}))\s*$",
+        prepared,
+        flags=re.IGNORECASE,
+    )
+    return next((group.upper() for group in match.groups() if group), "") if match else ""
+
+
+def _candidate_role(evidence: str, default: str = "participe_direto") -> str:
+    normalized = _normalize_text(evidence)
+    for role, pattern in _NON_PARTY_ROLE_PATTERNS:
+        if re.search(pattern, normalized, flags=re.IGNORECASE):
+            return role
+    return default
+
+
+def _make_party_candidate(
+    value: str,
+    *,
+    role: str,
+    zone: str,
+    evidence: str,
+    position: int,
+    confidence: str,
+    source_rule: str,
+) -> Optional[Dict[str, Any]]:
+    raw_value = _clean_spaces(value)
+    parts = _split_orgao_candidate(raw_value)
+    cleaned = parts.get("orgao_convenente", "")
+    if not _has_content(cleaned, min_alpha=4):
+        return None
+    resolved_role = "parte_interna" if _looks_like_internal_orgao(cleaned) else role
+    return {
+        "name": parts.get("orgao_convenente_nome", "") or cleaned,
+        "sigla": parts.get("orgao_convenente_sigla", "") or _party_sigla(raw_value),
+        "normalized_value": cleaned,
+        "role": resolved_role,
+        "zone": zone,
+        "evidence": _clean_spaces(evidence)[:700],
+        "position": max(position, 0),
+        "confidence": confidence,
+        "institutional_link": bool(parts.get("orgao_convenente_nome") and (parts.get("orgao_convenente_sigla") or _party_sigla(raw_value))),
+        "source_rule": source_rule,
+        "rejection_reason": "parte_interna" if resolved_role == "parte_interna" else "",
+    }
+
+
+def _extract_party_candidates(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    text = str(snapshot.get("text", "") or "")
+    prepared = _prepare_text(text)
+    preamble = _extract_preamble(text)
+    candidates: List[Dict[str, Any]] = []
+
+    def add(value: str, role: str, zone: str, evidence: str, confidence: str, rule: str) -> None:
+        candidate = _make_party_candidate(
+            value,
+            role=role,
+            zone=zone,
+            evidence=evidence,
+            position=prepared.lower().find(_prepare_text(value).lower()),
+            confidence=confidence,
+            source_rule=rule,
+        )
+        if candidate:
+            candidates.append(candidate)
+
+    # Preserve the proven patterns as a compatibility candidate while richer
+    # qualification evidence is collected below.
+    legacy_value, legacy_source = _extract_orgao_convenente_legacy(snapshot)
+    if legacy_value:
+        confidence = CONFIDENCE_HIGH if legacy_source == "preambulo_paragrafo_partes" else CONFIDENCE_MEDIUM
+        add(legacy_value, "participe_direto", "formula_celebratoria", legacy_value, confidence, legacy_source)
+
+    opening = _prepare_text(preamble or prepared[:OPENING_SCAN_CHARS])
+    opening_normalized = _normalize_text(opening)
+    if "censipam" in opening_normalized or "centro gestor e operacional do sistema de protecao da amazonia" in opening_normalized:
+        add(
+            "Centro Gestor e Operacional do Sistema de Protecao da Amazonia - CENSIPAM",
+            "parte_interna",
+            "qualificacao_inicial",
+            "CENSIPAM",
+            CONFIDENCE_HIGH,
+            "act.partes.interna_censipam",
+        )
+
+    for table in snapshot.get("tables", []) or []:
+        rows = table.get("rows", []) if isinstance(table, dict) else []
+        for row in rows:
+            cells = [_clean_spaces(str(cell or "")) for cell in row] if isinstance(row, list) else []
+            for index, cell in enumerate(cells):
+                label = _normalize_text(cell)
+                if len(label) > 60 or not re.fullmatch(
+                    r"(?:(?:identificacao|qualificacao)\s+d[oa]s?\s+)?(?:participe|parte)\s*(?:1|2|3|i{1,3})?\s*:??",
+                    label,
+                ):
+                    continue
+                value = cells[index + 1] if index + 1 < len(cells) else re.sub(r"^.*?[:\-–—]\s*", "", cell)
+                add(value, _candidate_role(cell), "tabela_identificacao", " | ".join(cells), CONFIDENCE_HIGH, "act.partes.tabela_identificacao")
+
+    # Formula celebratoria: tolerate an omitted article and either ordering of
+    # CENSIPAM and the counterparty. The delimiter prevents body text capture.
+    after_internal_patterns = (
+        (opening, r"\bcensipam\s*,?\s+e\s+(?:(?:a|o|as|os)\s+)?(.+?)(?=(?:,\s*|\s+)(?:para\s+os\s+fins|doravante|neste\s+ato|por\s+(?:meio|interm[eé]dio))|\.\s|$)"),
+        (opening_normalized, r"\bcentro\s+gestor\s+e\s+operacional\s+do\s+sistema\s+de\s+protecao\s+da\s+amazonia\s*[-–—]?\s*censipam\s*,?\s+e\s+(?:(?:a|o|as|os)\s+)?(.+?)(?=(?:,\s*|\s+)(?:para\s+os\s+fins|doravante|neste\s+ato|por\s+(?:meio|intermedio))|\.\s|$)"),
+    )
+    for source, pattern in after_internal_patterns:
+        match = re.search(pattern, source, flags=re.IGNORECASE | re.DOTALL)
+        if match:
+            add(match.group(1), "participe_direto", "formula_celebratoria", match.group(0), CONFIDENCE_MEDIUM, "act.partes.formula_celebratoria")
+
+    before_internal = re.search(
+        r"que\s+entre\s+si\s+celebram\s+(?:(?:a|o|as|os)\s+)?(.+?)\s*,?\s+e\s+(?:(?:a|o)\s+)?(?:centro\s+gestor\s+e\s+operacional\s+do\s+sistema\s+de\s+protecao\s+da\s+amazonia|censipam)",
+        opening_normalized,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if before_internal:
+        add(before_internal.group(1), "participe_direto", "formula_celebratoria", before_internal.group(0), CONFIDENCE_MEDIUM, "act.partes.formula_invertida")
+
+    # Qualification blocks bind full institutional names to their declared
+    # acronym. They outrank a bare celebratory formula.
+    qualification_pattern = re.compile(
+        r"(?:(?:^|[.;:]\s+|,\s+e\s+)(?:a|o|as|os)?\s*)"
+        r"([A-ZÀ-Ý][A-ZÀ-Ý0-9 /&.\-–—\r\n]{5,180}?)"
+        r",\s*doravante\s+denominad[oa]\s+(?:(?:como|simplesmente)\s+)?([A-Z0-9]{2,})\b",
+        flags=re.IGNORECASE | re.MULTILINE,
+    )
+    for match in qualification_pattern.finditer(opening):
+        name = _clean_party_candidate(match.group(1))
+        value = f"{name} - {match.group(2).upper()}"
+        add(value, "participe_direto", "qualificacao_inicial", match.group(0), CONFIDENCE_HIGH, "act.partes.qualificacao_doravante")
+
+    obligations_pattern = re.compile(
+        r"\b(?:o|a)?\s*censipam\s+e\s+(?:(?:a|o|as|os)\s+)?([^.;:]{4,180}?)\s+(?:ficam|ficarao|obrigam-se)\s+(?:obrigad[oa]s?|a\s+)",
+        flags=re.IGNORECASE,
+    )
+    body_without_object = re.sub(
+        r"CL[ÁA]USULA\s+PRIMEIRA.*?(?=CL[ÁA]USULA\s+(?:SEGUNDA|2))",
+        "",
+        prepared,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    for match in obligations_pattern.finditer(body_without_object):
+        add(match.group(1), "participe_direto", "clausula_participes", match.group(0), CONFIDENCE_MEDIUM, "act.partes.clausula_obrigacoes")
+
+    # Explicit non-party roles are retained for audit and can never become the
+    # singular counterparty merely because they occur near the parties.
+    for role, marker in _NON_PARTY_ROLE_PATTERNS:
+        role_pattern = re.compile(
+            rf"(?:{marker})\s*[:\-–—]?\s*(?:(?:a|o)\s+)?([^.;\n]{{4,180}})",
+            flags=re.IGNORECASE,
+        )
+        for match in role_pattern.finditer(opening):
+            add(match.group(1), role, "qualificacao_inicial", match.group(0), CONFIDENCE_HIGH, f"act.partes.{role}")
+
+    # Signature institutions are fallback evidence only. A parenthesized
+    # acronym confirms an already linked institution; it does not turn a
+    # personal name into an organization.
+    signature_start = _normalize_text(prepared).find("documento assinado eletronicamente")
+    signature_text = prepared[signature_start:] if signature_start >= 0 else prepared[-2500:]
+    signature_siglas = {
+        sigla.upper()
+        for sigla in re.findall(r"(?:Diretor|Presidente|Secret[aá]ri[oa]|Representante)[^\n]{0,100}\(([A-Z0-9]{2,})\)", signature_text, flags=re.IGNORECASE)
+    }
+    for candidate in candidates:
+        if candidate.get("sigla", "").upper() in signature_siglas:
+            candidate["signature_confirmation"] = True
+    institutional_signature = re.compile(
+        r"(?:Representante|Diretor(?:a)?(?:-Geral)?|Presidente|Secret[aá]ri[oa])\s+d[ao]\s+"
+        r"([A-ZÀ-Ý][A-Za-zÀ-ÿ0-9 /&.\-–—]{4,100}?)(?=\n|$)",
+        flags=re.IGNORECASE | re.MULTILINE,
+    )
+    for match in institutional_signature.finditer(signature_text):
+        add(match.group(1), "participe_direto", "assinaturas", match.group(0), CONFIDENCE_LOW, "act.partes.assinatura_institucional")
+
+    grouped: Dict[str, Dict[str, Any]] = {}
+    for candidate in candidates:
+        key = _party_key(candidate["normalized_value"])
+        sigla = candidate.get("sigla", "").lower()
+        merge_key = sigla or key
+        existing = next(
+            (
+                item
+                for item in grouped.values()
+                if _party_key(item["normalized_value"]) == key
+                or (sigla and str(item.get("sigla", "")).lower() == sigla)
+            ),
+            None,
+        )
+        if existing is None:
+            candidate["evidences"] = [candidate["evidence"]]
+            candidate["zones"] = [candidate["zone"]]
+            grouped[merge_key] = candidate
+            continue
+        existing["evidences"].append(candidate["evidence"])
+        if candidate["zone"] not in existing["zones"]:
+            existing["zones"].append(candidate["zone"])
+        if (
+            _PARTY_CONFIDENCE_SCORE[candidate["confidence"]] > _PARTY_CONFIDENCE_SCORE[existing["confidence"]]
+            or (candidate.get("institutional_link") and not existing.get("institutional_link"))
+        ):
+            for field in ("name", "sigla", "normalized_value", "role", "zone", "confidence", "source_rule", "institutional_link"):
+                existing[field] = candidate[field]
+        existing["signature_confirmation"] = bool(existing.get("signature_confirmation") or candidate.get("signature_confirmation"))
+
+    resolved = list(grouped.values())
+    direct = [candidate for candidate in resolved if candidate["role"] == "participe_direto" and not _looks_like_internal_orgao(candidate["normalized_value"])]
+    direct.sort(key=lambda item: (-_PARTY_CONFIDENCE_SCORE[item["confidence"]], item["position"]))
+    selected: Optional[Dict[str, Any]] = None
+    warning = ""
+    if direct:
+        top_score = _PARTY_CONFIDENCE_SCORE[direct[0]["confidence"]]
+        tied = [candidate for candidate in direct if _PARTY_CONFIDENCE_SCORE[candidate["confidence"]] == top_score]
+        if len(tied) == 1:
+            selected = tied[0]
+        elif len({_party_key(candidate["normalized_value"]) for candidate in tied}) == 1:
+            selected = tied[0]
+        else:
+            warning = "multiplos_participes_ambiguos"
+            for candidate in tied:
+                candidate["rejection_reason"] = warning
+    if selected and len(direct) > 1:
+        warning = "multiplos_participes_contraparte_priorizada"
+        for candidate in direct:
+            if candidate is not selected and not candidate.get("rejection_reason"):
+                candidate["rejection_reason"] = "menor_confianca_estrutural"
+
+    return {
+        "candidates": resolved,
+        "internal_party": next((candidate for candidate in resolved if candidate["role"] == "parte_interna"), None),
+        "selected_counterparty": selected,
+        "warning": warning,
+        "source_scope": "snapshot_act_canonico",
+    }
+
+
+def _extract_orgao_convenente(snapshot: Dict[str, Any]) -> Tuple[str, str]:
+    extraction = _extract_party_candidates(snapshot)
+    selected = extraction.get("selected_counterparty")
+    if not selected:
+        return ("", "")
+    return (str(selected.get("normalized_value", "") or ""), str(selected.get("source_rule", "") or ""))
 
 
 def _extract_objeto(snapshot: Dict[str, Any]) -> Tuple[str, str]:
@@ -1545,13 +1933,18 @@ def _build_contract_fields(record: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     vigencia_source_type = _vigencia_source_type(vigencia_source)
     vigencia_confidence = CONFIDENCE_MEDIUM if vigencia_source_type == SOURCE_DERIVED else CONFIDENCE_HIGH
     vigencia_warning = _clean_spaces(str(record.get("vigencia_warning", "") or ""))
-    return {
-        "numero_acordo": _field_or_missing(
+    numero_field = _field_or_missing(
             value=str(record.get("numero_acordo", "") or ""),
-            source_type=SOURCE_DOCUMENT_TEXT if record.get("field_source_numero_acordo") else SOURCE_MISSING,
-            confidence=CONFIDENCE_HIGH if record.get("field_source_numero_acordo") else CONFIDENCE_LOW,
+            raw_value=str(record.get("numero_acordo_raw", "") or ""),
+            source_type=str(record.get("numero_acordo_source_type", "") or SOURCE_MISSING),
+            confidence=str(record.get("numero_acordo_confidence", "") or CONFIDENCE_LOW),
             rule_id=str(record.get("field_source_numero_acordo", "") or "act.numero_acordo.missing"),
-        ),
+            warning=str(record.get("numero_acordo_warning", "") or ""),
+        )
+    numero_field["evidence"] = str(record.get("numero_acordo_evidence", "") or "")
+    numero_field["evidences"] = record.get("numero_acordo_evidences", []) or []
+    return {
+        "numero_acordo": numero_field,
         "data_assinatura": _field_or_missing(
             value=str(record.get("data_assinatura", "") or ""),
             source_type=SOURCE_DOCUMENT_TEXT,
@@ -1711,14 +2104,29 @@ def build_normalized_record(payload: Dict[str, Any], json_path: Path) -> Dict[st
     vigencia_warning = ""
     vigencia_rule = {"amount": "", "unit": "", "anchor": ""}
     numero_warning = ""
+    numero_source_type = SOURCE_MISSING
+    numero_confidence = CONFIDENCE_LOW
+    numero_evidence = ""
+    numero_evidences: List[Dict[str, Any]] = []
     data_publicacao_warning = ""
+    party_extraction: Dict[str, Any] = {
+        "candidates": [],
+        "internal_party": None,
+        "selected_counterparty": None,
+        "warning": "",
+        "source_scope": "snapshot_act_canonico",
+    }
 
     if analysis.get("doc_class") == DOC_CLASS_ACT_FINAL:
-        numero_acordo, field_source_numero_acordo = _extract_numero_acordo(snapshot)
-        if _is_placeholder_numero_acordo(numero_acordo):
-            numero_acordo = ""
-            field_source_numero_acordo = ""
-            numero_warning = "numero_placeholder"
+        if analysis.get("is_canonical_candidate"):
+            numero_result = _extract_numero_acordo(snapshot, collection)
+            numero_acordo = str(numero_result.get("value", "") or "")
+            field_source_numero_acordo = str(numero_result.get("field_source", "") or "")
+            numero_source_type = str(numero_result.get("source_type", "") or SOURCE_MISSING)
+            numero_confidence = str(numero_result.get("confidence", "") or CONFIDENCE_LOW)
+            numero_evidence = str(numero_result.get("evidence", "") or "")
+            numero_evidences = list(numero_result.get("evidences", []) or [])
+            numero_warning = str(numero_result.get("warning", "") or "")
         signature_dates = _extract_signature_dates(str(snapshot.get("text", "") or ""))
         data_assinatura = max(signature_dates) if signature_dates else ""
         datas_assinatura = " | ".join(signature_dates)
@@ -1741,7 +2149,9 @@ def build_normalized_record(payload: Dict[str, Any], json_path: Path) -> Dict[st
             "unit": resolved_vigencia["unit"],
             "anchor": resolved_vigencia["anchor"],
         }
-        orgao_raw, _ = _extract_orgao_convenente(snapshot)
+        party_extraction = _extract_party_candidates(snapshot)
+        selected_party = party_extraction.get("selected_counterparty") or {}
+        orgao_raw = str(selected_party.get("normalized_value", "") or "")
         orgao_parts = _split_orgao_candidate(orgao_raw) if orgao_raw else {}
         orgao_convenente = orgao_parts.get("orgao_convenente", "")
         orgao_convenente_nome = orgao_parts.get("orgao_convenente_nome", "")
@@ -1757,7 +2167,11 @@ def build_normalized_record(payload: Dict[str, Any], json_path: Path) -> Dict[st
         validation_warning = "; ".join(part for part in (validation_warning, data_publicacao_warning) if part)
     if numero_warning:
         validation_warning = "; ".join(part for part in (validation_warning, numero_warning) if part)
+    party_warning = str(party_extraction.get("warning", "") or "")
+    if party_warning:
+        validation_warning = "; ".join(part for part in (validation_warning, party_warning) if part)
     document_processos = analysis.get("document_processos", []) or []
+    process_affinity = analysis.get("process_affinity", {}) or {}
     record = {
         "requested_type": requested_type,
         "numero_acordo": numero_acordo,
@@ -1774,6 +2188,7 @@ def build_normalized_record(payload: Dict[str, Any], json_path: Path) -> Dict[st
         "orgao_convenente_nome": orgao_convenente_nome,
         "orgao_convenente_sigla": orgao_convenente_sigla,
         "orgao_intermediario": orgao_intermediario,
+        "party_extraction": party_extraction,
         "objeto": objeto,
         "gestor_titular": gestor_titular,
         "gestor_substituto": gestor_substituto,
@@ -1794,6 +2209,12 @@ def build_normalized_record(payload: Dict[str, Any], json_path: Path) -> Dict[st
         if analysis.get("publication_status") == PUBLICATION_STATUS_GOLD
         else (analysis.get("classification_reason", "") or analysis.get("discard_reason", "")),
         "field_source_numero_acordo": field_source_numero_acordo,
+        "numero_acordo_raw": numero_acordo,
+        "numero_acordo_source_type": numero_source_type,
+        "numero_acordo_confidence": numero_confidence,
+        "numero_acordo_evidence": numero_evidence,
+        "numero_acordo_evidences": numero_evidences,
+        "numero_acordo_warning": numero_warning,
         "field_source_objeto": field_source_objeto,
         "field_source_vigencia": field_source_vigencia,
         "field_source_gestao": field_source_gestao,
@@ -1806,6 +2227,29 @@ def build_normalized_record(payload: Dict[str, Any], json_path: Path) -> Dict[st
         "process_alignment_status": analysis.get("process_alignment_status", ""),
         "document_processo": analysis.get("document_processo", ""),
         "document_processos": " | ".join(document_processos),
+        "process_affinity": process_affinity,
+        "current_process_explicit": json.dumps(
+            process_affinity.get("current_process_explicit", {}), ensure_ascii=False
+        ),
+        "current_process_in_metadata": json.dumps(
+            process_affinity.get("current_process_in_metadata", {}), ensure_ascii=False
+        ),
+        "external_processes_found": json.dumps(
+            process_affinity.get("external_processes_found", []), ensure_ascii=False
+        ),
+        "document_origin_process": str(
+            (process_affinity.get("document_origin_process", {}) or {}).get("process", "")
+        ),
+        "document_origin_source": str(
+            (process_affinity.get("document_origin_process", {}) or {}).get("source", "")
+        ),
+        "document_origin_confidence": str(
+            (process_affinity.get("document_origin_process", {}) or {}).get("confidence", "")
+        ),
+        "affinity_status": str(process_affinity.get("affinity_status", "")),
+        "affinity_confidence": str(process_affinity.get("affinity_confidence", "")),
+        "affinity_evidence": " | ".join(process_affinity.get("affinity_evidence", []) or []),
+        "affinity_rule_version": str(process_affinity.get("affinity_rule_version", "")),
         "snapshot_mode": _clean_spaces(str(snapshot.get("extraction_mode", "") or "")),
         "text_chars": len(str(snapshot.get("text", "") or "")),
         "candidate_json_path": str(json_path),
@@ -1850,6 +2294,9 @@ def _build_field_diagnostics(records: List[Dict[str, Any]]) -> List[Dict[str, st
                     "source_type": _clean_spaces(str(field.get("source_type", "") or "")),
                     "confidence": _clean_spaces(str(field.get("confidence", "") or "")),
                     "warning": _clean_spaces(str(field.get("warning", "") or "")),
+                    "rule_id": _clean_spaces(str(field.get("rule_id", "") or "")),
+                    "evidence": _clean_spaces(str(field.get("evidence", "") or "")),
+                    "evidences": json.dumps(field.get("evidences", []) or [], ensure_ascii=False),
                 }
             )
     return diagnostics
@@ -1912,7 +2359,13 @@ def export_normalized_csv(output_dir: Path, logger: Any = None) -> Dict[str, Any
         for record in records:
             if record is canonical:
                 source_path = Path(str(record.get("candidate_json_path", "") or record.get("json_path", "")))
-                alias_path = _publish_act_alias(output_dir, source_path, processo)
+                alias_path = _publish_act_alias(
+                    output_dir,
+                    source_path,
+                    processo,
+                    party_extraction=record.get("party_extraction", {}),
+                    process_affinity=record.get("process_affinity", {}),
+                )
                 record["json_path"] = str(alias_path)
                 record["normalization_status"] = "publicado_canonico"
                 record["publication_status"] = PUBLICATION_STATUS_GOLD
@@ -1970,6 +2423,11 @@ def export_normalized_csv(output_dir: Path, logger: Any = None) -> Dict[str, Any
         "unidade_responsavel",
         "relatorio_encerramento",
         "field_source_numero_acordo",
+        "numero_acordo_source_type",
+        "numero_acordo_confidence",
+        "numero_acordo_evidence",
+        "numero_acordo_evidences",
+        "numero_acordo_warning",
         "field_source_objeto",
         "field_source_vigencia",
         "field_source_gestao",
@@ -1982,6 +2440,16 @@ def export_normalized_csv(output_dir: Path, logger: Any = None) -> Dict[str, Any
         "process_alignment_status",
         "document_processo",
         "document_processos",
+        "current_process_explicit",
+        "current_process_in_metadata",
+        "external_processes_found",
+        "document_origin_process",
+        "document_origin_source",
+        "document_origin_confidence",
+        "affinity_status",
+        "affinity_confidence",
+        "affinity_evidence",
+        "affinity_rule_version",
         "snapshot_mode",
         "text_chars",
         "canonical_score",
@@ -1990,6 +2458,38 @@ def export_normalized_csv(output_dir: Path, logger: Any = None) -> Dict[str, Any
     ]
     audit_path = output_dir / "act_classificacao_latest.csv"
     csv_writer.write_csv(audit_records, audit_path, columns=audit_columns)
+
+    affinity_columns = [
+        "processo",
+        "candidate_json_path",
+        "publication_status",
+        "is_canonical_candidate",
+        "process_alignment_status",
+        "affinity_status",
+        "affinity_confidence",
+        "document_origin_process",
+        "document_origin_source",
+        "current_process_explicit",
+        "current_process_in_metadata",
+        "external_processes_found",
+        "affinity_evidence",
+        "affinity_rule_version",
+        "shadow_only",
+        "shadow_review_required",
+    ]
+    affinity_rows = []
+    for row in audit_records:
+        affinity_status = str(row.get("affinity_status", "") or "")
+        affinity_rows.append(
+            {
+                **{column: row.get(column, "") for column in affinity_columns},
+                "shadow_only": True,
+                "shadow_review_required": row.get("publication_status") == PUBLICATION_STATUS_GOLD
+                and affinity_status in {"related_document", "ambiguous", "probable_external_document"},
+            }
+        )
+    affinity_path = output_dir / "act_process_affinity_shadow_latest.csv"
+    csv_writer.write_csv(affinity_rows, affinity_path, columns=affinity_columns)
 
     normalized_columns = [
         "numero_acordo",
@@ -2016,7 +2516,10 @@ def export_normalized_csv(output_dir: Path, logger: Any = None) -> Dict[str, Any
     csv_path = output_dir / "act_normalizado_latest.csv"
     public_rows = [{column: row.get(column, "") for column in normalized_columns} for row in canonical_records]
     csv_writer.write_csv(public_rows, csv_path, columns=normalized_columns)
-    diagnostic_columns = ["processo", "campo", "valor", "raw_value", "source_type", "confidence", "warning"]
+    diagnostic_columns = [
+        "processo", "campo", "valor", "raw_value", "source_type", "confidence",
+        "rule_id", "evidence", "evidences", "warning",
+    ]
     diagnostics_path = output_dir / "act_field_diagnostics_latest.csv"
     csv_writer.write_csv(_build_field_diagnostics(audit_records), diagnostics_path, columns=diagnostic_columns)
     _log(
@@ -2031,5 +2534,6 @@ def export_normalized_csv(output_dir: Path, logger: Any = None) -> Dict[str, Any
         "csv_path": csv_path,
         "latest_path": csv_path,
         "audit_path": audit_path,
+        "affinity_path": affinity_path,
         "diagnostics_path": diagnostics_path,
     }

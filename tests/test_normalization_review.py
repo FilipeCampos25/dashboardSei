@@ -77,6 +77,22 @@ class NormalizationReviewTests(unittest.TestCase):
                     "process_alignment_status": "processo_divergente_documento",
                     "json_path": "act-aditivo.json",
                 },
+                {
+                    "processo": "60090.000006/2026-06",
+                    "documento": "ACT externo relacionado",
+                    "numero_acordo": "6/2026",
+                    "data_inicio_vigencia": "2026-01-01",
+                    "data_fim_vigencia": "2027-01-01",
+                    "orgao_convenente": "Orgao parceiro",
+                    "objeto": "Execucao conjunta de atividades operacionais e compartilhamento de dados.",
+                    "doc_class": "act_final",
+                    "validation_status": "valid_for_requested_type",
+                    "publication_status": "published_gold",
+                    "normalization_status": "publicado_canonico",
+                    "process_alignment_status": "external_reference",
+                    "affinity_status": "related_document",
+                    "json_path": "act-related.json",
+                },
             ],
             self.tmp_dir / "act_classificacao_latest.csv",
         )
@@ -126,6 +142,7 @@ class NormalizationReviewTests(unittest.TestCase):
         self.assertIn("amendment_confused_with_main", codes)
         self.assertIn("related_not_canonical", codes)
         self.assertIn("process_mismatch", codes)
+        self.assertIn("act_affinity_shadow_review", codes)
         self.assertIn("object_too_short_or_generic", codes)
         self.assertIn("ted_missing_financial_value", codes)
         self.assertIn("ted_without_application_plan", codes)

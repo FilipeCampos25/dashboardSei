@@ -342,6 +342,21 @@ def _act_issues(rows: List[Dict[str, str]]) -> List[Dict[str, Any]]:
                     row=row,
                 )
             )
+        affinity_status = row.get("affinity_status", "")
+        if _is_gold(row) and affinity_status in {"related_document", "ambiguous", "probable_external_document"}:
+            severity = "high" if affinity_status == "probable_external_document" else "medium"
+            issues.append(
+                _issue(
+                    code="act_affinity_shadow_review",
+                    severity=severity,
+                    field="affinity_status",
+                    message=f"Gold atual sinalizado pelo diagnostico sombra de afinidade: {affinity_status}.",
+                    suggested_action="Revisar origem, juntada e relacao com o processo atual antes de ativar retencao.",
+                    document_type="act",
+                    row=row,
+                    is_gold_missing=True,
+                )
+            )
         warning = _norm(row.get("vigencia_warning", "") + " " + row.get("validation_warning", ""))
         if "sem_data" in warning or "sem data" in warning:
             issues.append(

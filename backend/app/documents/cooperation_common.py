@@ -37,11 +37,41 @@ from app.services.normalization_contract import (
 class CooperationDocumentHandler:
     def __init__(self, *, status_filename: str, export_act_normalized: bool = False) -> None:
         self._tracking_records: List[Dict[str, Any]] = []
+        self._candidate_discoveries: List[Dict[str, Any]] = []
         self._status_filename = status_filename
         self._export_act_normalized = export_act_normalized
 
     def reset_run(self) -> None:
         self._tracking_records = []
+        self._candidate_discoveries = []
+
+    def record_candidate_discovery(
+        self,
+        *,
+        processo: str,
+        title: str,
+        source: str,
+        tree_score: int = 0,
+        matched_terms: Optional[List[str]] = None,
+        disposition: str = "discovered",
+    ) -> None:
+        normalized_key = (processo.strip(), source.strip(), " ".join(title.lower().split()))
+        if any(
+            (str(item.get("processo", "")).strip(), str(item.get("source", "")).strip(), " ".join(str(item.get("title", "")).lower().split()))
+            == normalized_key
+            for item in self._candidate_discoveries
+        ):
+            return
+        self._candidate_discoveries.append(
+            {
+                "processo": processo,
+                "title": title,
+                "source": source,
+                "tree_score": tree_score,
+                "matched_terms": "|".join(matched_terms or []),
+                "disposition": disposition,
+            }
+        )
 
     def process_snapshot(
         self,
@@ -288,6 +318,12 @@ class CooperationDocumentHandler:
         ]
         status_path = output_dir / self._status_filename
         csv_writer.write_csv(self._tracking_records, status_path, columns=columns)
+        if spec.key == "act":
+            csv_writer.write_csv(
+                self._candidate_discoveries,
+                output_dir / "act_candidate_discoveries_latest.csv",
+                columns=["processo", "title", "source", "tree_score", "matched_terms", "disposition"],
+            )
         if spec.key == "memorando":
             csv_writer.write_csv(self._tracking_records, output_dir / "memorando_status_execucao_latest.csv", columns=columns)
         logger.info(
@@ -339,6 +375,12 @@ class CooperationDocumentHandler:
                 )
         except Exception as exc:
             logger.warning("Falha ao gerar CSV %s normalizado (%s).", spec.log_label, exc)
+        try:
+            from app.services.act_shadow_scoring import export_shadow_report
+
+            export_shadow_report(output_dir, logger=logger)
+        except Exception as exc:
+            logger.warning("Falha ao gerar auditoria shadow de ACT (%s).", exc)
         try:
             export_dashboard_ready_csv(output_dir, logger=logger)
         except Exception as exc:

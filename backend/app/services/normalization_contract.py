@@ -4,6 +4,8 @@ from typing import Any, Dict, Iterable, Mapping, Optional
 
 
 SOURCE_DOCUMENT_TEXT = "document_text"
+SOURCE_DOCUMENT_TITLE = "document_title"
+SOURCE_DOCUMENT_METADATA = "document_metadata"
 SOURCE_TABLE = "table"
 SOURCE_PREVIEW = "preview"
 SOURCE_DERIVED = "derived"
@@ -20,6 +22,8 @@ QUALITY_LOW = "low"
 
 SOURCE_TYPES = {
     SOURCE_DOCUMENT_TEXT,
+    SOURCE_DOCUMENT_TITLE,
+    SOURCE_DOCUMENT_METADATA,
     SOURCE_TABLE,
     SOURCE_PREVIEW,
     SOURCE_DERIVED,

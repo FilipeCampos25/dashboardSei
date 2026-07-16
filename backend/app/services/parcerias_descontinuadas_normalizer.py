@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -28,7 +30,10 @@ NORMALIZED_COLUMNS = [
     "termo_encerramento_raw",
     "status_raw",
     "status_normalizado",
+    "status_calculado",
     "status_categoria",
+    "status_evidencia",
+    "status_data_referencia",
     "normalization_status",
     "missing_fields",
     "raw_anotacoes",
@@ -45,6 +50,7 @@ _LABEL_TO_FIELD = {
     "N TERMO ENCERRAMENTO": "numero_termo_encerramento",
     "NO TERMO ENCERRAMENTO": "numero_termo_encerramento",
     "PARCEIRO": "parceiro",
+    "PARCEIROS": "parceiro",
     "VIGENCIA": "vigencia",
     "OBJETO": "objeto",
     "GESTOR TITULAR": "gestor_titular",
@@ -53,12 +59,13 @@ _LABEL_TO_FIELD = {
     "PORTARIA": "portaria_designacao",
     "DATA DE ASSINATURA": "data_assinatura",
     "DATA DE VENCIMENTO": "data_vencimento",
+    "VENCIMENTO": "data_vencimento",
     "STATUS": "status_raw",
     "TERMO DE ENCERRAMENTO": "termo_encerramento_raw",
 }
 
 _LABEL_PREFIXES = sorted(_LABEL_TO_FIELD.keys(), key=len, reverse=True)
-_MULTILINE_FIELDS = {"objeto", "termo_encerramento_raw"}
+_MULTILINE_FIELDS = {"parceiro", "objeto", "termo_encerramento_raw"}
 _REQUIRED_STRUCTURED_FIELDS = ("tipo", "parceiro", "objeto", "status_raw")
 
 
@@ -175,31 +182,105 @@ def _extract_termo_number(termo_raw: str) -> str:
     return _clean_spaces(match.group(1)) if match else ""
 
 
-def _status_from_record(record: Dict[str, str]) -> tuple[str, str, str]:
-    raw = _clean_spaces(record.get("status_raw"))
-    termo_raw = _clean_spaces(record.get("termo_encerramento_raw"))
-    if not raw and termo_raw:
-        raw = "Encerrado"
+def _normalize_reference_date(value: date | datetime | pd.Timestamp | str | None) -> date:
+    if value is None:
+        return datetime.now(ZoneInfo("America/Sao_Paulo")).date()
+    if isinstance(value, datetime):
+        if value.tzinfo is not None:
+            value = value.astimezone(ZoneInfo("America/Sao_Paulo"))
+        return value.date()
+    if isinstance(value, date):
+        return value
+    parsed = pd.to_datetime(value, errors="coerce", dayfirst=True)
+    if pd.isna(parsed):
+        raise ValueError(f"Data de referencia invalida: {value!r}")
+    return parsed.date()
 
+
+def _has_identified_termination_term(record: Dict[str, str]) -> bool:
+    term = _clean_spaces(record.get("termo_encerramento_raw"))
+    if not term:
+        return False
+    return bool(
+        re.search(r"\b\d{5,}\b", term)
+        or re.search(r"\b\d+\s*/\s*\d{2,4}\b", term)
+        or re.search(r"\bpublicad[oa]\b", _normalize_status_key(term), flags=re.IGNORECASE)
+    )
+
+
+def _is_not_realized_status(key: str) -> bool:
+    return any(
+        marker in key
+        for marker in (
+            "NAO REALIZADO",
+            "NAO FORMALIZADO",
+            "NAO ASSINADO",
+            "NAO AUTORIZADO",
+            "NAO HOUVE CONTINUIDADE",
+        )
+    )
+
+
+def _normalized_raw_status(raw: str) -> str:
     key = _normalize_status_key(raw)
     if not key:
-        return ("", "", "sem_status")
+        return ""
     if key in {"ENCERRADO", "ENCERRADA"} or key.startswith("ENCERRADO PELA"):
-        return (raw, "Encerrado", "encerrado")
+        return "Encerrado"
     if key.startswith("VIGENTE"):
-        return (raw, "Vigente", "vigente_em_descontinuadas")
-    if (
-        "NAO REALIZADO" in key
-        or "NAO FORMALIZADO" in key
-        or "NAO ASSINADO" in key
-        or "NAO AUTORIZADO" in key
-        or "NAO HOUVE CONTINUIDADE" in key
-    ):
-        return (raw, "Nao Realizado", "nao_realizado")
-    return (raw, raw, "nao_realizado")
+        return "Vigente"
+    if _is_not_realized_status(key):
+        return "Nao Realizado"
+    return raw
 
 
-def build_normalized_record(row: Dict[str, Any]) -> Dict[str, str]:
+def _status_from_record(
+    record: Dict[str, str], reference_date: date
+) -> tuple[str, str, str, str, str]:
+    raw = _clean_spaces(record.get("status_raw"))
+    key = _normalize_status_key(raw)
+    normalized = _normalized_raw_status(raw)
+    evidence: List[str] = []
+
+    has_term = _has_identified_termination_term(record)
+    if has_term:
+        evidence.append("termo_encerramento_identificado")
+
+    parsed_end = pd.to_datetime(_clean_spaces(record.get("data_vencimento")), errors="coerce", dayfirst=True)
+    if not pd.isna(parsed_end):
+        if parsed_end.date() < reference_date:
+            evidence.append("data_final_anterior_referencia")
+        else:
+            evidence.append("data_final_igual_ou_posterior_referencia")
+
+    if key:
+        if key.startswith("VIGENTE"):
+            evidence.append("status_raw_vigente")
+        elif _is_not_realized_status(key):
+            evidence.append("status_raw_nao_realizado")
+        elif key in {"ENCERRADO", "ENCERRADA"} or key.startswith("ENCERRADO PELA"):
+            evidence.append("status_raw_encerrado")
+        else:
+            evidence.append("status_raw_nao_mapeado")
+
+    if has_term:
+        calculated, category = "Encerrado", "encerrado"
+    elif _is_not_realized_status(key):
+        calculated, category = "Nao Realizado", "nao_realizado"
+    elif not pd.isna(parsed_end) and parsed_end.date() < reference_date:
+        calculated, category = "Vencido", "vencido"
+    elif not pd.isna(parsed_end):
+        calculated, category = "Vigente", "vigente"
+    else:
+        calculated, category = "Indeterminado", "indeterminado"
+
+    return raw, normalized, calculated, category, ";".join(evidence)
+
+
+def build_normalized_record(
+    row: Dict[str, Any], *, reference_date: date | datetime | pd.Timestamp | str | None = None
+) -> Dict[str, str]:
+    resolved_reference = _normalize_reference_date(reference_date)
     raw_anotacoes = _clean_multiline(row.get("anotacoes", ""))
     record = _extract_fields_from_anotacoes(raw_anotacoes)
     record["processo"] = _clean_spaces(row.get("processo", ""))
@@ -208,14 +289,17 @@ def build_normalized_record(row: Dict[str, Any]) -> Dict[str, str]:
     if not record.get("numero_termo_encerramento") and record.get("termo_encerramento_raw"):
         record["numero_termo_encerramento"] = _extract_termo_number(record["termo_encerramento_raw"])
 
-    status_raw, status_normalizado, status_categoria = _status_from_record(record)
+    status_raw, status_normalizado, status_calculado, status_categoria, status_evidencia = _status_from_record(
+        record, resolved_reference
+    )
     record["status_raw"] = status_raw
     record["status_normalizado"] = status_normalizado
+    record["status_calculado"] = status_calculado
     record["status_categoria"] = status_categoria
+    record["status_evidencia"] = status_evidencia
+    record["status_data_referencia"] = resolved_reference.isoformat()
 
     missing = [field for field in _REQUIRED_STRUCTURED_FIELDS if not _clean_spaces(record.get(field))]
-    if status_categoria == "sem_status" and "status_raw" not in missing:
-        missing.append("status_raw")
     if len(missing) == 0:
         normalization_status = "completo"
     elif len(missing) >= len(_REQUIRED_STRUCTURED_FIELDS):
@@ -228,11 +312,20 @@ def build_normalized_record(row: Dict[str, Any]) -> Dict[str, str]:
     return {column: record.get(column, "") for column in NORMALIZED_COLUMNS}
 
 
-def normalize_rows(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, str]]:
-    return [build_normalized_record(row) for row in rows]
+def normalize_rows(
+    rows: Iterable[Dict[str, Any]], *, reference_date: date | datetime | pd.Timestamp | str | None = None
+) -> List[Dict[str, str]]:
+    resolved_reference = _normalize_reference_date(reference_date)
+    return [build_normalized_record(row, reference_date=resolved_reference) for row in rows]
 
 
-def export_normalized_csv(output_dir: Path | str, records: List[Dict[str, Any]] | None = None, logger: Any = None) -> Dict[str, Any]:
+def export_normalized_csv(
+    output_dir: Path | str,
+    records: List[Dict[str, Any]] | None = None,
+    logger: Any = None,
+    *,
+    reference_date: date | datetime | pd.Timestamp | str | None = None,
+) -> Dict[str, Any]:
     output_path = csv_writer.ensure_output_dir(output_dir)
     if records is None:
         source_path = output_path / SOURCE_FILENAME
@@ -244,7 +337,7 @@ def export_normalized_csv(output_dir: Path | str, records: List[Dict[str, Any]] 
     else:
         rows = records
 
-    normalized_rows = normalize_rows(rows)
+    normalized_rows = normalize_rows(rows, reference_date=reference_date)
     csv_path = output_path / OUTPUT_FILENAME
     csv_writer.write_csv(normalized_rows, csv_path, columns=NORMALIZED_COLUMNS)
 

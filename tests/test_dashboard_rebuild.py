@@ -176,6 +176,33 @@ class DashboardRebuildModelTests(unittest.TestCase):
         self.assertNotIn("Dias Restantes", history_display_table(hist_df).columns)
         self.assertEqual(history_metrics(hist_df)["inconsistentes"], 1)
 
+    def test_historical_records_use_calculated_status_and_expose_audit_fields(self) -> None:
+        hist_df = build_historical_partnerships(
+            _bundle(
+                history_normalized=pd.DataFrame(
+                    [
+                        {
+                            "processo": "60090.000263/2024-64",
+                            "tipo": "Protocolo de Intenções",
+                            "status_raw": "Vigente.",
+                            "status_normalizado": "Vigente",
+                            "status_calculado": "Encerrado",
+                            "status_categoria": "encerrado",
+                            "status_evidencia": "termo_encerramento_identificado;data_final_anterior_referencia;status_raw_vigente",
+                            "status_data_referencia": "2026-01-01",
+                        }
+                    ]
+                )
+            )
+        )
+
+        row = hist_df.iloc[0]
+        self.assertEqual(row["status_gerencial"], "Encerrado")
+        self.assertEqual(row["status_raw"], "Vigente.")
+        self.assertEqual(row["status_data_referencia"], "2026-01-01")
+        self.assertIn("status_raw_diverge_do_calculado", row["conflitos"])
+        self.assertEqual(history_metrics(hist_df)["encerradas"], 1)
+
     def test_missing_empty_and_invalid_sources_are_tolerated(self) -> None:
         root = Path.cwd() / "_tmp_dashboard_rebuild" / uuid.uuid4().hex
         try:

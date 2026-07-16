@@ -163,7 +163,7 @@ def build_quality_model(bundle: dict[str, Any], dashboard_model: dict[str, pd.Da
             [
                 is_chartable_dimension(active_df, "parceiro"),
                 is_chartable_dimension(ted_df, "unidade_descentralizadora"),
-                is_chartable_dimension(history_df, "status_normalizado"),
+                is_chartable_dimension(history_df, "status_calculado"),
             ]
         ),
         "review_summary": review_summary(review_df),

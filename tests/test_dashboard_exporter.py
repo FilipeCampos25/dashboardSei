@@ -25,6 +25,75 @@ def _write_json(path: Path, payload: dict[str, object]) -> None:
 
 
 class DashboardExporterTests(unittest.TestCase):
+    def test_best_numero_preserves_act_and_compares_leading_zero_semantically(self) -> None:
+        from app.services.dashboard_exporter import _best_numero
+
+        equivalent = _best_numero({"numero_act": "01/2023"}, {"numero_acordo": "1/2023"}, True)
+        self.assertEqual(equivalent["value"], "1/2023")
+        self.assertNotIn("warning", equivalent)
+
+        conflict = _best_numero({"numero_act": "02/2023"}, {"numero_acordo": "1/2023"}, True)
+        self.assertEqual(conflict["value"], "1/2023")
+        self.assertEqual(conflict["source"], "act_gold")
+        self.assertIn("numero_acordo_conflict", conflict["warning"])
+
+    def test_ted_universe_exports_normalized_numbers_without_using_act_fields(self) -> None:
+        output_dir = Path.cwd() / "tests" / "_tmp_dashboard_exporter_ted_numbers"
+        if output_dir.exists():
+            shutil.rmtree(output_dir, ignore_errors=True)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        expected = {
+            "60092.000169/2023-12": ("06", "2023"),
+            "60090.000840/2025-07": ("04", "2025"),
+            "60090.000165/2024-27": ("05", "2024"),
+            "60092.000353/2023-54": ("01", "2024"),
+            "60093.000180/2022-83": ("01", "2023"),
+            "60090.000777/2021-77": ("01", "2021"),
+        }
+        try:
+            _write_csv(
+                output_dir / "ted_normalizado_latest.csv",
+                ["processo", "numero_ted", "ano_ted", "validation_status", "publication_status", "quality_status", "json_path"],
+                [
+                    {
+                        "processo": processo,
+                        "numero_ted": numero,
+                        "ano_ted": ano,
+                        "validation_status": "valid_for_requested_type",
+                        "publication_status": "published_gold",
+                        "quality_status": "medium",
+                        "json_path": str(output_dir / f"ted_{index}.json"),
+                    }
+                    for index, (processo, (numero, ano)) in enumerate(expected.items(), start=1)
+                ],
+            )
+            for index in range(1, len(expected) + 1):
+                _write_json(output_dir / f"ted_{index}.json", {"snapshot": {}})
+
+            result = export_dashboard_ready_csv(output_dir)
+            self.assertEqual(result["records"], 6)
+
+            with (output_dir / "dashboard_ready_latest.csv").open("r", encoding="utf-8-sig", newline="") as file_obj:
+                rows = {row["processo"]: row for row in csv.DictReader(file_obj)}
+            with (output_dir / "divergence_matrix_latest.csv").open("r", encoding="utf-8-sig", newline="") as file_obj:
+                divergence = {row["processo"]: row for row in csv.DictReader(file_obj)}
+
+            for processo, (numero, ano) in expected.items():
+                row = rows[processo]
+                self.assertEqual(row["source_universe"], "ted_normalizado")
+                self.assertEqual(row["ted_numero"], numero)
+                self.assertEqual(row["ted_ano"], ano)
+                self.assertEqual(row["documento_principal_tipo"], "TED")
+                self.assertEqual(row["documento_principal_numero"], f"{numero}/{ano}")
+                self.assertEqual(row["act_numero"], "")
+                self.assertEqual(row["act_numero_acordo"], "")
+                self.assertEqual(row["best_numero_acordo"], "")
+                self.assertNotIn("numero_missing", row["normalization_issues"])
+                self.assertEqual(divergence[processo]["documento_principal_numero"], f"{numero}/{ano}")
+        finally:
+            shutil.rmtree(output_dir, ignore_errors=True)
+
     def test_ted_merge_normalizes_process_key_and_ignores_related_documents(self) -> None:
         output_dir = Path.cwd() / "tests" / "_tmp_dashboard_exporter_ted_keys"
         if output_dir.exists():
@@ -440,6 +509,10 @@ class DashboardExporterTests(unittest.TestCase):
             self.assertEqual(len(rows), 22)
 
             row_1 = next(row for row in rows if row["processo"] == "60090.000001/2026-01")
+            self.assertEqual(row_1["source_universe"], "parcerias_vigentes")
+            self.assertEqual(row_1["act_numero"], "1/2026")
+            self.assertEqual(row_1["documento_principal_tipo"], "ACT")
+            self.assertEqual(row_1["documento_principal_numero"], "1/2026")
             self.assertEqual(row_1["pt_gold"], "True")
             self.assertEqual(row_1["act_gold"], "True")
             self.assertEqual(row_1["act_numero_acordo"], "1/2026")
@@ -466,6 +539,9 @@ class DashboardExporterTests(unittest.TestCase):
             self.assertEqual(row_1["best_objeto_source"], "pt_gold")
 
             row_2 = next(row for row in rows if row["processo"] == "60090.000002/2026-02")
+            self.assertEqual(row_2["act_numero"], "")
+            self.assertEqual(row_2["documento_principal_tipo"], "ACT")
+            self.assertEqual(row_2["documento_principal_numero"], "2/2026")
             self.assertEqual(row_2["act_gold"], "False")
             self.assertEqual(row_2["act_numero_acordo"], "")
             self.assertEqual(row_2["act_quality"], "silver_only")
@@ -486,6 +562,8 @@ class DashboardExporterTests(unittest.TestCase):
             self.assertEqual(row_3["best_data_assinatura_source"], "memorando_gold")
 
             row_4 = next(row for row in rows if row["processo"] == "60090.000004/2026-04")
+            self.assertEqual(row_4["source_universe"], "parcerias_vigentes")
+            self.assertEqual(row_4["documento_principal_tipo"], "ACT")
             self.assertEqual(row_4["ted_gold"], "True")
             self.assertEqual(row_4["ted_json_path"], str(ted_json_path))
             self.assertEqual(row_4["ted_objeto"], "Execucao descentralizada de atividades")

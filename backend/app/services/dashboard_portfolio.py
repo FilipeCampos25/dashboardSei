@@ -24,6 +24,8 @@ SITUACAO_ATIVA = "ativa_em_acompanhamento"
 SITUACAO_HISTORICO_ENCERRADO = "historico_encerrado"
 SITUACAO_HISTORICO_DESCONTINUADO = "historico_descontinuado"
 SITUACAO_HISTORICO_NAO_REALIZADO = "historico_nao_realizado"
+SITUACAO_HISTORICO_VENCIDO = "historico_vencido"
+SITUACAO_HISTORICO_VIGENTE = "historico_vigente"
 SITUACAO_REVISAR = "inconsistente_ou_revisar"
 
 
@@ -123,6 +125,10 @@ def _status_from_history_category(category: Any) -> str:
         return SITUACAO_HISTORICO_ENCERRADO
     if normalized == "nao_realizado":
         return SITUACAO_HISTORICO_NAO_REALIZADO
+    if normalized == "vencido":
+        return SITUACAO_HISTORICO_VENCIDO
+    if normalized == "vigente":
+        return SITUACAO_HISTORICO_VIGENTE
     if normalized == "descontinuado":
         return SITUACAO_HISTORICO_DESCONTINUADO
     return SITUACAO_REVISAR
@@ -176,12 +182,22 @@ def build_canonical_portfolio(bundle: dict[str, Any], *, today: date | datetime 
             continue
         ted_row = ted_by_process.get(processo, {})
         divergence = divergence_by_process.get(processo, {})
-        source_universe = clean_spaces(divergence.get("source_universe", ""))
-        ted_principal = bool(source_universe == "ted_normalizado" or (ted_row and not clean_spaces(overview.get("best_numero_acordo", "")) and _boolish(overview.get("ted_gold", ""))))
-        document_type = "TED" if ted_principal else "ACT"
-        document_number = _document_number_ted(ted_row) if ted_principal else clean_spaces(overview.get("best_numero_acordo", ""))
-        if not document_number and not ted_principal:
-            document_type = "Parceria"
+        source_universe = clean_spaces(overview.get("source_universe", "")) or clean_spaces(divergence.get("source_universe", ""))
+        exported_type_raw = overview.get("documento_principal_tipo", "")
+        exported_number_raw = overview.get("documento_principal_numero", "")
+        exported_document_type = "" if pd.isna(exported_type_raw) else clean_spaces(exported_type_raw)
+        exported_document_number = "" if pd.isna(exported_number_raw) else clean_spaces(exported_number_raw)
+        if exported_document_type:
+            document_type = exported_document_type
+            document_number = exported_document_number
+            ted_principal = document_type == "TED"
+        else:
+            # Compatibilidade com dashboard_ready gerado antes do contrato de documento principal.
+            ted_principal = bool(source_universe == "ted_normalizado" or (ted_row and not clean_spaces(overview.get("best_numero_acordo", "")) and _boolish(overview.get("ted_gold", ""))))
+            document_type = "TED" if ted_principal else "ACT"
+            document_number = _document_number_ted(ted_row) if ted_principal else clean_spaces(overview.get("best_numero_acordo", ""))
+            if not document_number and not ted_principal:
+                document_type = "Parceria"
 
         parceiro = clean_spaces(overview.get("best_parceiro", ""))
         if not parceiro and ted_principal:
@@ -325,12 +341,17 @@ def build_history_dataframe(bundle: dict[str, Any]) -> pd.DataFrame:
     for record in hist_df.to_dict(orient="records"):
         processo = normalize_processo(record.get("processo", ""))
         status_category = clean_spaces(record.get("status_categoria", ""))
+        status_calculado = clean_spaces(record.get("status_calculado", "")) or clean_spaces(record.get("status_normalizado", ""))
         situacao = _status_from_history_category(status_category)
         conflicts = []
         if processo in active_processes:
             situacao = SITUACAO_REVISAR
             conflicts.append("processo_tambem_na_carteira_ativa")
-        if status_category in {"vigente_em_descontinuadas", "sem_status", ""}:
+        if clean_spaces(record.get("status_calculado", "")):
+            normalized_raw = clean_spaces(record.get("status_normalizado", ""))
+            if normalized_raw and normalized_raw.casefold() != status_calculado.casefold():
+                conflicts.append("status_raw_diverge_do_calculado")
+        elif status_category in {"vigente_em_descontinuadas", "sem_status", ""}:
             situacao = SITUACAO_REVISAR
             conflicts.append(f"status_historico={status_category or 'vazio'}")
         rows.append(
@@ -344,7 +365,11 @@ def build_history_dataframe(bundle: dict[str, Any]) -> pd.DataFrame:
                 "data_assinatura": format_date(record.get("data_assinatura", "")),
                 "data_vencimento": format_date(record.get("data_vencimento", "")),
                 "status_normalizado": clean_spaces(record.get("status_normalizado", "")),
+                "status_raw": clean_spaces(record.get("status_raw", "")),
+                "status_calculado": status_calculado,
                 "status_categoria": status_category,
+                "status_evidencia": clean_spaces(record.get("status_evidencia", "")),
+                "status_data_referencia": format_date(record.get("status_data_referencia", "")),
                 "situacao_carteira": situacao,
                 "conflitos": "; ".join(conflicts),
                 "missing_fields": clean_spaces(record.get("missing_fields", "")),

@@ -159,6 +159,14 @@ def _value_source(value: str, source: str) -> Dict[str, str]:
     return {"value": _clean_spaces(value), "source": source, "confidence": _confidence(source)}
 
 
+def _numero_comparison_key(value: str) -> str:
+    normalized = re.sub(r"\s+", "", _clean_spaces(value).lower())
+    match = re.fullmatch(r"0*(\d+)/(0*\d+)", normalized)
+    if match:
+        return f"{int(match.group(1))}/{int(match.group(2))}"
+    return normalized
+
+
 def _group_rows(rows: List[Dict[str, str]]) -> Dict[str, List[Dict[str, str]]]:
     grouped: Dict[str, List[Dict[str, str]]] = {}
     for row in rows:
@@ -332,11 +340,23 @@ def _period_label(row: Dict[str, str]) -> str:
 def _best_numero(preview: Dict[str, str], act_row: Dict[str, str], act_gold: bool) -> Dict[str, str]:
     act_numero = _clean_spaces(act_row.get("numero_acordo", "")) if act_gold else ""
     if _is_valid_numero_acordo(act_numero):
-        return _value_source(act_numero, "act_gold")
+        result = _value_source(act_numero, "act_gold")
+        preview_numero = _clean_spaces(preview.get("numero_act", ""))
+        if _is_valid_numero_acordo(preview_numero) and _numero_comparison_key(preview_numero) != _numero_comparison_key(act_numero):
+            result["warning"] = f"numero_acordo_conflict: act_gold={act_numero}; preview={preview_numero}"
+        return result
     preview_numero = _clean_spaces(preview.get("numero_act", ""))
     if _is_valid_numero_acordo(preview_numero):
         return _value_source(preview_numero, "preview_fallback")
     return _value_source("", "missing")
+
+
+def _ted_document_number(ted_row: Dict[str, str]) -> str:
+    numero = _clean_spaces(ted_row.get("numero_ted", ""))
+    ano = _clean_spaces(ted_row.get("ano_ted", ""))
+    if numero and ano:
+        return f"{numero}/{ano}"
+    return numero or ano
 
 
 def _best_partner(
@@ -517,6 +537,15 @@ def export_dashboard_ready_csv(output_dir: Path, logger: Any = None) -> Dict[str
             act_objeto = preview_objeto
 
         best_numero = _best_numero(preview, act_row, act_gold)
+        act_numero = _clean_spaces(act_row.get("numero_acordo", "")) if act_gold else ""
+        ted_numero = _clean_spaces(ted_row.get("numero_ted", "")) if ted_gold else ""
+        ted_ano = _clean_spaces(ted_row.get("ano_ted", "")) if ted_gold else ""
+        if source_universe == "ted_normalizado" and ted_gold:
+            documento_principal_tipo = "TED"
+            documento_principal_numero = _ted_document_number(ted_row)
+        else:
+            documento_principal_numero = best_numero["value"]
+            documento_principal_tipo = "ACT" if documento_principal_numero else "Parceria"
         best_parceiro = _best_partner(preview, pt_row, act_row, act_gold=act_gold, pt_gold=pt_gold)
         best_vigencia = _best_vigencia(preview, pt_row, act_row, act_gold=act_gold, pt_gold=pt_gold)
         best_data_assinatura = _best_data_assinatura(
@@ -531,6 +560,8 @@ def export_dashboard_ready_csv(output_dir: Path, logger: Any = None) -> Dict[str
 
         notes: List[str] = []
         issues: List[str] = []
+        if best_numero.get("warning"):
+            issues.append(best_numero["warning"])
         if act_quality != "gold_complete":
             notes.append(f"act={act_quality}")
         if pt_quality != "gold":
@@ -557,7 +588,7 @@ def export_dashboard_ready_csv(output_dir: Path, logger: Any = None) -> Dict[str
                     issues.append(warning)
         if act_gold and not _is_valid_numero_acordo(act_row.get("numero_acordo", "")) and act_row.get("numero_acordo", ""):
             issues.append("numero_placeholder")
-        if best_numero["source"] == "missing":
+        if best_numero["source"] == "missing" and not documento_principal_numero:
             issues.append("numero_missing")
         if best_vigencia["source"] == "preview_fallback" and not (best_vigencia["inicio"] and best_vigencia["fim"]):
             issues.append("vigencia_sem_data_base")
@@ -575,6 +606,12 @@ def export_dashboard_ready_csv(output_dir: Path, logger: Any = None) -> Dict[str
         dashboard_row = (
             {
                 "processo": processo,
+                "source_universe": source_universe,
+                "act_numero": act_numero,
+                "ted_numero": ted_numero,
+                "ted_ano": ted_ano,
+                "documento_principal_tipo": documento_principal_tipo,
+                "documento_principal_numero": documento_principal_numero,
                 "preview_parceiro": preview_partner,
                 "preview_numero_act": _clean_spaces(preview.get("numero_act", "")),
                 "preview_objeto": preview_objeto,
@@ -587,7 +624,7 @@ def export_dashboard_ready_csv(output_dir: Path, logger: Any = None) -> Dict[str
                 "pt_quality": pt_quality,
                 "act_gold": act_gold,
                 "act_json_path": act_row.get("json_path", "") if act_gold else "",
-                "act_numero_acordo": act_row.get("numero_acordo", "") if act_gold else "",
+                "act_numero_acordo": act_numero,
                 "act_data_assinatura": act_row.get("data_assinatura", "") if act_gold else "",
                 "act_data_inicio_vigencia": act_row.get("data_inicio_vigencia", "") if act_gold else "",
                 "act_data_fim_vigencia": act_row.get("data_fim_vigencia", "") if act_gold else "",
@@ -643,6 +680,11 @@ def export_dashboard_ready_csv(output_dir: Path, logger: Any = None) -> Dict[str
             {
                 "processo": processo,
                 "source_universe": source_universe,
+                "act_numero": dashboard_row["act_numero"],
+                "ted_numero": dashboard_row["ted_numero"],
+                "ted_ano": dashboard_row["ted_ano"],
+                "documento_principal_tipo": dashboard_row["documento_principal_tipo"],
+                "documento_principal_numero": dashboard_row["documento_principal_numero"],
                 "dashboard_join_key": processo,
                 "process_key_valid": _is_valid_processo(processo),
                 "quality_status": dashboard_row["quality_status"],
@@ -676,6 +718,12 @@ def export_dashboard_ready_csv(output_dir: Path, logger: Any = None) -> Dict[str
 
     columns = [
         "processo",
+        "source_universe",
+        "act_numero",
+        "ted_numero",
+        "ted_ano",
+        "documento_principal_tipo",
+        "documento_principal_numero",
         "preview_parceiro",
         "preview_numero_act",
         "preview_objeto",
@@ -737,6 +785,11 @@ def export_dashboard_ready_csv(output_dir: Path, logger: Any = None) -> Dict[str
     divergence_columns = [
         "processo",
         "source_universe",
+        "act_numero",
+        "ted_numero",
+        "ted_ano",
+        "documento_principal_tipo",
+        "documento_principal_numero",
         "dashboard_join_key",
         "process_key_valid",
         "quality_status",

@@ -11,6 +11,12 @@ from .dashboard_metrics import clean_spaces
 
 OVERVIEW_COLUMNS = [
     "processo",
+    "source_universe",
+    "act_numero",
+    "ted_numero",
+    "ted_ano",
+    "documento_principal_tipo",
+    "documento_principal_numero",
     "preview_parceiro",
     "preview_numero_act",
     "preview_objeto",
@@ -94,7 +100,10 @@ PARCERIAS_DESCONTINUADAS_COLUMNS = [
     "termo_encerramento_raw",
     "status_raw",
     "status_normalizado",
+    "status_calculado",
     "status_categoria",
+    "status_evidencia",
+    "status_data_referencia",
     "normalization_status",
     "missing_fields",
     "raw_anotacoes",

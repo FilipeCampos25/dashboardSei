@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+from datetime import datetime
 
 from app.config import get_settings
 from app.core.logging_config import setup_logging
@@ -30,6 +31,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    execution_started_at = datetime.now().astimezone()
     args = _build_parser().parse_args()
     settings = get_settings()
 
@@ -57,7 +59,7 @@ def main() -> None:
         settings.timeout_seconds,
     )
 
-    scraper = SEIScraper()
+    scraper = SEIScraper(execution_started_at=execution_started_at)
     try:
         scraper.run_full_flow(
             manual_login=manual_login,

@@ -271,8 +271,9 @@ def _wait_for_page_signature_change(
 class SEIScraper:
 
     # Setup / lifecycle
-    def __init__(self) -> None:
+    def __init__(self, *, execution_started_at: datetime | None = None) -> None:
         self.logger = setup_logger()
+        self.execution_started_at = execution_started_at or datetime.now().astimezone()
 
         cfg = get_settings()
         self.settings = cfg
@@ -2372,6 +2373,19 @@ class SEIScraper:
         if not candidates:
             return False
 
+        discovery_recorder = getattr(document_type.handler, "record_candidate_discovery", None)
+        if callable(discovery_recorder) and document_type.key == "act":
+            for candidate in candidates:
+                candidate_text = str(candidate.get("text", "") or "")
+                discovery_recorder(
+                    processo=processo,
+                    title=candidate_text,
+                    source="tree",
+                    tree_score=int(candidate.get("score", 0) or 0),
+                    matched_terms=list(candidate.get("matched_terms", []) or []),
+                    disposition="preopen_skipped" if should_skip_candidate(candidate_text) else "eligible_for_opening",
+                )
+
         base_process_url = (process_url or self.driver.current_url or "").strip()
         collect_competing_candidates = self._should_collect_competing_candidates(document_type)
         collected_valid_candidates = 0
@@ -2685,6 +2699,22 @@ class SEIScraper:
                     len(hits),
                     termo,
                 )
+
+                discovery_recorder = getattr(document_type.handler, "record_candidate_discovery", None)
+                if callable(discovery_recorder) and document_type.key == "act":
+                    for hit in hits:
+                        candidate_text = " ".join(
+                            part
+                            for part in (str(hit.protocolo or ""), str(getattr(hit, "row_text", "") or ""))
+                            if part
+                        )
+                        discovery_recorder(
+                            processo=processo,
+                            title=candidate_text,
+                            source="filter",
+                            matched_terms=[termo],
+                            disposition="preopen_skipped" if should_skip_candidate(candidate_text) else "eligible_for_opening",
+                        )
 
                 hits_to_open = self._get_ordered_filter_hits_for_opening(
                     processo,
@@ -4496,7 +4526,12 @@ class SEIScraper:
         try:
             from app.services.parcerias_descontinuadas_normalizer import export_normalized_csv
 
-            export_normalized_csv(output_dir, records=sanitized_records, logger=self.logger)
+            export_normalized_csv(
+                output_dir,
+                records=sanitized_records,
+                logger=self.logger,
+                reference_date=getattr(self, "execution_started_at", datetime.now().astimezone()),
+            )
         except Exception as exc:
             self.logger.warning("Falha ao normalizar PARCERIAS DESCONTINUADAS (%s).", exc)
         return csv_path

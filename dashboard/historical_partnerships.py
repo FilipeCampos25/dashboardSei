@@ -31,7 +31,11 @@ HISTORY_MODEL_COLUMNS = [
     "objeto_resumo",
     "objeto_completo",
     "status_normalizado",
+    "status_raw",
+    "status_calculado",
     "status_categoria",
+    "status_evidencia",
+    "status_data_referencia",
     "status_gerencial",
     "categoria_gerencial",
     "data_assinatura",
@@ -46,9 +50,12 @@ HISTORY_MODEL_COLUMNS = [
 ]
 
 
-def _status_gerencial(status_categoria: Any, status_normalizado: Any) -> str:
+def _status_gerencial(status_categoria: Any, status_calculado: Any, status_normalizado: Any) -> str:
     category = clean_spaces(status_categoria)
+    calculated = clean_spaces(status_calculado)
     normalized = clean_spaces(status_normalizado)
+    if calculated:
+        return calculated
     if category == "encerrado":
         return "Encerrado"
     if category == "nao_realizado":
@@ -70,14 +77,14 @@ def _document_label(tipo: Any, numero_act: Any, termo: Any) -> str:
 
 def _missing_fields(record: dict[str, Any]) -> str:
     missing = []
-    for label, field in (("parceiro", "parceiro"), ("objeto", "objeto_completo"), ("status", "status_normalizado")):
+    for label, field in (("parceiro", "parceiro"), ("objeto", "objeto_completo"), ("status", "status_calculado")):
         if not clean_spaces(record.get(field, "")):
             missing.append(label)
     return ", ".join(missing)
 
 
 def _score(record: dict[str, Any]) -> int:
-    fields = ("documento_instrumento", "parceiro", "objeto_completo", "status_normalizado", "data_assinatura", "data_vencimento")
+    fields = ("documento_instrumento", "parceiro", "objeto_completo", "status_calculado", "data_assinatura", "data_vencimento")
     return sum(1 for field in fields if clean_spaces(record.get(field, "")))
 
 
@@ -104,9 +111,16 @@ def build_historical_partnerships(bundle: dict[str, Any]) -> pd.DataFrame:
         processo = normalize_processo(raw.get("processo", ""))
         if not processo:
             continue
-        status = _status_gerencial(raw.get("status_categoria", ""), raw.get("status_normalizado", ""))
+        status = _status_gerencial(
+            raw.get("status_categoria", ""), raw.get("status_calculado", ""), raw.get("status_normalizado", "")
+        )
         conflicts = []
-        if status == "Inconsistente / revisar":
+        raw_status = clean_spaces(raw.get("status_raw", ""))
+        normalized_raw = clean_spaces(raw.get("status_normalizado", ""))
+        calculated_status = clean_spaces(raw.get("status_calculado", ""))
+        if calculated_status and normalized_raw and normalize_key(calculated_status) != normalize_key(normalized_raw):
+            conflicts.append("status_raw_diverge_do_calculado")
+        elif status == "Inconsistente / revisar":
             conflicts.append(clean_spaces(raw.get("status_categoria", "")) or "sem_status")
         record = {
             "record_id": "|".join(
@@ -128,7 +142,11 @@ def build_historical_partnerships(bundle: dict[str, Any]) -> pd.DataFrame:
             "objeto_resumo": summarize_text(raw.get("objeto", ""), 150),
             "objeto_completo": clean_spaces(raw.get("objeto", "")),
             "status_normalizado": clean_spaces(raw.get("status_normalizado", "")),
+            "status_raw": raw_status,
+            "status_calculado": calculated_status or status,
             "status_categoria": clean_spaces(raw.get("status_categoria", "")),
+            "status_evidencia": clean_spaces(raw.get("status_evidencia", "")),
+            "status_data_referencia": format_date_iso(raw.get("status_data_referencia", "")),
             "status_gerencial": status,
             "categoria_gerencial": status,
             "data_assinatura": format_date_iso(raw.get("data_assinatura", "")),
@@ -151,8 +169,11 @@ def history_metrics(df: pd.DataFrame) -> dict[str, int]:
     return {
         "total": int(len(df)),
         "encerradas": int(counts.get("Encerrado", 0)),
-        "nao_realizadas": int(counts.get("Não realizado", 0)),
-        "inconsistentes": int(counts.get("Inconsistente / revisar", 0)),
+        "nao_realizadas": int(sum(value for key, value in counts.items() if "realizado" in key.casefold())),
+        "vencidas": int(counts.get("Vencido", 0)),
+        "vigentes": int(counts.get("Vigente", 0)),
+        "indeterminadas": int(counts.get("Indeterminado", 0)),
+        "inconsistentes": int(counts.get("Inconsistente / revisar", 0) + counts.get("Indeterminado", 0)),
     }
 
 
@@ -246,4 +267,3 @@ def detail_label(df: pd.DataFrame, record_id: str) -> str:
         return record_id
     record = row.iloc[0]
     return f"{record['processo']} - {record['status_gerencial']}"
-

@@ -391,7 +391,7 @@ def render_pt(pt_df: pd.DataFrame) -> None:
     sem_estrutura = int((~pt_df["possui_metas"] | ~pt_df["possui_acoes"] | ~pt_df["possui_prazo"]).sum())
     prazo_counts = _metric_value_counts(pt_df, "indicador_prazo_pt")
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("Processos com PT", processes)
     c2.metric("Metas identificadas", metas)
     c3.metric("Acoes identificadas", acoes)
@@ -524,25 +524,27 @@ def render_history(history_df: pd.DataFrame) -> None:
     c1.metric("Encerrados", int(counts.get("historico_encerrado", 0)))
     c2.metric("Nao realizados", int(counts.get("historico_nao_realizado", 0)))
     c3.metric("Descontinuados", int(counts.get("historico_descontinuado", 0)))
-    c4.metric("Inconsistentes", int(counts.get("inconsistente_ou_revisar", 0)))
+    c4.metric("Vencidos", int(counts.get("historico_vencido", 0)))
+    c5.metric("Vigentes", int(counts.get("historico_vigente", 0)))
+    c6.metric("Indeterminados / revisar", int(counts.get("inconsistente_ou_revisar", 0)))
 
-    status_check = is_chartable_dimension(history_df, "status_normalizado")
+    status_check = is_chartable_dimension(history_df, "status_calculado")
     if status_check["allowed"]:
-        status_df = history_df.groupby("status_normalizado", as_index=False).size().rename(columns={"size": "total"})
-        _plot(px.bar(status_df, x="status_normalizado", y="total", text="total", title="Historico por status"), "history_status")
+        status_df = history_df.groupby("status_calculado", as_index=False).size().rename(columns={"size": "total"})
+        _plot(px.bar(status_df, x="status_calculado", y="total", text="total", title="Historico por status"), "history_status")
     else:
         st.info(f"Distribuicao historica por status nao renderizada: {status_check['reason']}.")
 
     _dataframe(
         history_df,
-        ["processo", "tipo", "parceiro", "objeto_resumo", "data_vencimento", "status_normalizado", "situacao_carteira", "conflitos"],
+        ["processo", "tipo", "parceiro", "objeto_resumo", "data_vencimento", "status_calculado", "situacao_carteira", "conflitos"],
         {
             "processo": "Processo",
             "tipo": "Tipo",
             "parceiro": "Parceiro",
             "objeto_resumo": "Objeto",
             "data_vencimento": "Data Vencimento",
-            "status_normalizado": "Status",
+            "status_calculado": "Status",
             "situacao_carteira": "Classificacao",
             "conflitos": "Conflitos",
         },

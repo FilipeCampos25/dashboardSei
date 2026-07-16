@@ -38,6 +38,10 @@ def build_act_document_type() -> DocumentTypeSpec:
             "act_status_execucao_latest.csv",
             "act_normalizado_latest.csv",
             "act_classificacao_latest.csv",
+            "act_candidate_discoveries_latest.csv",
+            "act_candidate_inventory_latest.csv",
+            "act_shadow_comparison_latest.csv",
+            "act_shadow_comparison_latest.json",
         ),
         handler=CooperationDocumentHandler(
             status_filename="act_status_execucao_latest.csv",

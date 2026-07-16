@@ -246,6 +246,13 @@ Saidas principais:
 - `act_classificacao_latest.csv`
 - `act_field_diagnostics_latest.csv`
 - `act_normalizado_latest.csv`
+- `act_candidate_discoveries_latest.csv`: inventario dos candidatos vistos antes da abertura
+- `act_candidate_inventory_latest.csv`: candidatos descobertos e extraidos, com scores e gates
+- `act_shadow_comparison_latest.csv`: comparacao resumida entre o vencedor atual e o proposto
+- `act_shadow_comparison_latest.json`: decomposicao completa, metricas e hashes de imutabilidade
+
+O scoring sombra e somente diagnostico: ele nao altera o alias
+`acordo_cooperacao_tecnica_<processo>.json` nem `act_normalizado_latest.csv`.
 
 ### Memorando / documento administrativo
 
@@ -335,7 +342,7 @@ Abas principais:
 
 - `Parcerias Vigentes`: consulta de processo, instrumento, parceiro, objeto e vigencia, com regra centralizada de situacao por prazo.
 - `Termo de Execucao Descentralizada`: consulta independente de TEDs, valor global, vigencia, objeto e unidades quando houver cobertura.
-- `Parcerias Descontinuadas / Nao Realizadas`: consulta historica por status normalizado, sem alertas de vigencia.
+- `Parcerias Descontinuadas / Nao Realizadas`: consulta histórica pelo status operacional calculado, sem alertas de vigência. O status coletado permanece em `status_raw`; evidências e data de referência do cálculo ficam disponíveis para auditoria.
 
 Filtros por aba:
 

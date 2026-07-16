@@ -316,6 +316,12 @@ Modelo canonico em memoria:
 - `indicador_vigencia`
 - campos de PT, TED, memorando, qualidade, origem e conflitos
 
+No `dashboard_ready_latest.csv`, os numeros documentais permanecem separados por familia:
+`act_numero`/`act_numero_acordo` representam apenas ACT e `ted_numero` + `ted_ano`
+representam apenas TED. `documento_principal_numero` e uma projecao visual definida a partir
+de `source_universe`; ela nao autoriza copiar numeros entre as familias ACT e TED. A previa
+de Parcerias Vigentes continua sendo fallback apenas para o documento principal desse universo.
+
 ## Dashboard
 
 O dashboard:
@@ -325,6 +331,8 @@ O dashboard:
 3. monta modelos independentes para `Parcerias Vigentes`, `Termo de Execucao Descentralizada` e `Parcerias Descontinuadas / Nao Realizadas`;
 4. calcula vigencia com a regra centralizada apenas onde ha acompanhamento operacional de prazo;
 5. renderiza exatamente as tres categorias principais, sem total geral ou metricas misturadas.
+
+No universo de parcerias descontinuadas, o normalizador preserva `status_raw` e produz separadamente `status_calculado`, `status_categoria`, `status_evidencia` e `status_data_referencia`. Termo de encerramento identificado tem precedência sobre situação por data; uma data final anterior à referência gera `Vencido`, uma data igual ou posterior gera `Vigente` e a ausência de evidência suficiente gera `Indeterminado`. A data de referência vem do início da execução e é persistida no CSV normalizado.
 
 Se uma fonte nao existir ou estiver vazia, a dashboard mostra estado vazio e cobertura, sem dados de exemplo.
 

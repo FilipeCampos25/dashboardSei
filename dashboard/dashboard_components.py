@@ -284,7 +284,10 @@ def render_history_detail(row: pd.Series) -> None:
         st.markdown(f"**Processo:** `{row.get('processo', '')}`")
         st.markdown(f"**Documento / instrumento:** {display_text(row.get('documento_instrumento', ''))}")
         st.markdown(f"**Parceiro:** {display_text(row.get('parceiro', ''))}")
-        st.markdown(f"**Status normalizado:** {display_text(row.get('status_gerencial', ''))}")
+        st.markdown(f"**Status calculado:** {display_text(row.get('status_gerencial', ''))}")
+        st.markdown(f"**Status bruto:** {display_text(row.get('status_raw', ''))}")
+        st.markdown(f"**Evidências:** {display_text(row.get('status_evidencia', ''))}")
+        st.markdown(f"**Data de referência:** {display_text(row.get('status_data_referencia', ''))}")
         st.markdown(f"**Categoria:** {display_text(row.get('categoria_gerencial', ''))}")
     with right:
         st.markdown(f"**Data de assinatura:** {row.get('data_assinatura_display', '')}")
