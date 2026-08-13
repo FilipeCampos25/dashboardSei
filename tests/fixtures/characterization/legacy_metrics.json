@@ -1,0 +1,72 @@
+{
+  "schema_version": "1.0",
+  "expectation_policy": {
+    "update_mode": "explicit_review_only",
+    "normative_categories": ["correct_invariant"],
+    "non_normative_categories": ["known_legacy_bug", "legacy_characterization"]
+  },
+  "fixtures": {
+    "family_counts": {
+      "act": 2,
+      "administrative": 1,
+      "pt": 2,
+      "ted": 2
+    },
+    "technical_state_counts": {
+      "EMPTY_CONTENT": 1,
+      "EXTRACTED": 4,
+      "IFRAME_UNAVAILABLE": 1,
+      "RELATED": 1
+    },
+    "correct_invariants": {
+      "all_origins_are_synthetic": true,
+      "all_manifest_paths_are_relative": true,
+      "families_represented": ["act", "administrative", "pt", "ted"]
+    }
+  },
+  "round": {
+    "universe": {
+      "dashboard_processes": 33,
+      "pt_candidates": 36,
+      "pt_candidate_processes": 15,
+      "pt_final_rows": 4,
+      "act_candidates": 18,
+      "act_candidate_processes": 11,
+      "act_final_rows": 5,
+      "ted_final_rows": 10,
+      "administrative_final_rows": 22
+    },
+    "publication": {
+      "pt_gold_rows": 5,
+      "pt_silver_rows": 31,
+      "pt_gold_processes": 4,
+      "act_gold_rows": 5,
+      "act_silver_rows": 13,
+      "ted_gold_rows": 10,
+      "administrative_gold_rows": 22
+    },
+    "known_legacy_bugs": {
+      "ted_empty_published_gold": 9,
+      "administrative_empty_published_gold": 12,
+      "pt_processes_with_multiple_gold_markings": 1
+    },
+    "legacy_characterization": {
+      "act_multi_candidate_processes": 5,
+      "act_candidates_discarded_by_relative_score": 2,
+      "pt_rows_with_preview_number": 22,
+      "dashboard_rows_with_preview_number": 13,
+      "dashboard_quality_counts": {
+        "high": 2,
+        "low": 15,
+        "medium": 16
+      }
+    }
+  },
+  "excluded_unstable_values": [
+    "absolute_paths",
+    "captured_at",
+    "file_mtime",
+    "raw_document_content",
+    "temporary_directory_names"
+  ]
+}
