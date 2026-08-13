@@ -5,6 +5,8 @@ from typing import Any
 
 import requests
 
+from app.config import ensure_online_operation_allowed
+
 
 LOGGER = logging.getLogger(__name__)
 
@@ -29,6 +31,7 @@ def consultar_ted(
     numero_instrumento: str,
     ano: int,
 ) -> list[Any] | None:
+    ensure_online_operation_allowed("consultar_ted")
     params = {
         "numeroProcesso": numero_processo,
         "numeroInstrumento": numero_instrumento,

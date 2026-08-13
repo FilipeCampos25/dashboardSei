@@ -1,0 +1,4 @@
+{
+  "metadata": {"id": "pt_html_extracted", "description": "Canonical PT with structured goals and native HTML text.", "family": "pt", "document_role": "work_plan", "extraction_method": "html_dom", "technical_state": "EXTRACTED", "origin": "synthetic"},
+  "payload": {"processo": "PROCESSO-EXEMPLO-001", "snapshot": {"title": "Plano de Trabalho", "text": "PLANO DE TRABALHO. OBJETO: cooperacao entre ORGAO_A e PARCEIRO_B. META 1. ACAO 1. PERIODO: 12 meses.", "tables": [{"rows": [["Meta", "Acao", "Responsavel", "Periodo"], ["1", "Executar atividade exemplo", "ORGAO_A", "12 meses"]]}], "extraction_mode": "html_dom"}, "analysis": {"validation_status": "valid_for_requested_type"}}
+}

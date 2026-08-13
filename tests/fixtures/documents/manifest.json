@@ -1,0 +1,13 @@
+{
+  "schema_version": "1.0",
+  "description": "Small synthetic fixture set for offline document-pipeline regression tests.",
+  "fixtures": [
+    {"id": "pt_html_extracted", "path": "pt_html_extracted.json"},
+    {"id": "act_pdf_extracted", "path": "act_pdf_extracted.json"},
+    {"id": "ted_ocr_extracted", "path": "ted_ocr_extracted.json"},
+    {"id": "administrative_docx_extracted", "path": "administrative_docx_extracted.json"},
+    {"id": "ted_empty", "path": "ted_empty.json"},
+    {"id": "pt_iframe_unavailable", "path": "pt_iframe_unavailable.json"},
+    {"id": "act_related", "path": "act_related.json"}
+  ]
+}

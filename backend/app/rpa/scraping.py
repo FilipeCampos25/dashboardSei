@@ -21,7 +21,7 @@ from selenium.common.exceptions import (
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 
-from app.config import get_settings
+from app.config import ensure_online_operation_allowed, get_settings
 from app.core.driver_factory import create_chrome_driver
 from app.core.logging_config import setup_logger
 from app.documents import resolve_document_types
@@ -277,6 +277,7 @@ class SEIScraper:
 
         cfg = get_settings()
         self.settings = cfg
+        ensure_online_operation_allowed("SEIScraper.__init__", current_settings=cfg)
         self.logger.info("DEBUG CFG document_types raw: %s", cfg.document_types)
         self.logger.info("DEBUG ENV DOCUMENT_TYPES: %s", os.getenv("DOCUMENT_TYPES"))
         self.base_url = (
@@ -374,6 +375,9 @@ class SEIScraper:
         max_processos_por_interno: Optional[int] = None,
         stop_at_filter: bool = True,
     ) -> List[str]:
+        ensure_online_operation_allowed(
+            "SEIScraper.run_full_flow", current_settings=getattr(self, "settings", None)
+        )
         self.performance_profiler = PerformanceProfiler()
         self.driver._performance_profiler = self.performance_profiler
         set_active_profiler(self.performance_profiler)
@@ -573,6 +577,10 @@ class SEIScraper:
 
     # Login / tela inicial
     def _wait_for_manual_login(self) -> None:
+        ensure_online_operation_allowed(
+            "SEIScraper._wait_for_manual_login",
+            current_settings=getattr(self, "settings", None),
+        )
         cfg = self.settings
         self.logger.info("Aguardando conclusao do login/autenticacao no SEI (modo manual).")
 
@@ -752,6 +760,10 @@ class SEIScraper:
 
 
     def _login_if_possible(self) -> None:
+        ensure_online_operation_allowed(
+            "SEIScraper._login_if_possible",
+            current_settings=getattr(self, "settings", None),
+        )
         if not self.username or not self.password:
             self.logger.info("Sem credenciais no env; pulando login automatizado.")
             return
@@ -886,6 +898,10 @@ class SEIScraper:
         process_url: Optional[str] = None,
         reason: str = "",
     ) -> None:
+        ensure_online_operation_allowed(
+            "SEIScraper._restore_process_base_context",
+            current_settings=getattr(self, "settings", None),
+        )
         target_url = (process_url or self.driver.current_url or "").strip()
         if not target_url:
             self.logger.warning(
@@ -1444,6 +1460,10 @@ class SEIScraper:
         processo: str,
         document_type: DocumentTypeSpec,
     ) -> Dict[str, Any] | None:
+        ensure_online_operation_allowed(
+            "SEIScraper._process_ted_via_api",
+            current_settings=getattr(self, "settings", None),
+        )
         self.logger.info("Processo %s: TED via API iniciado", processo)
         try:
             numero_processo, ano = normalize_processo_sei(processo)
@@ -3521,6 +3541,10 @@ class SEIScraper:
         selected_target: str,
         list_url: str,
     ) -> bool:
+        ensure_online_operation_allowed(
+            "SEIScraper._click_selected_interno",
+            current_settings=getattr(self, "settings", None),
+        )
         try:
             self.driver.get(list_url)
             self._wait_for_document_ready(self.timeout_seconds, "reload_lista_internos")

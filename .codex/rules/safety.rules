@@ -1,0 +1,550 @@
+# safety.rules
+#
+# Camada de politica de execucao para Codex.
+#
+# IMPORTANTE:
+# - Estas regras controlam comandos quando o Codex pede para executa-los fora
+#   do sandbox. Elas NAO substituem AGENTS.md, sandbox ou approval_policy.
+# - Regras de projeto em <repo>/.codex/rules/ so carregam quando o projeto
+#   estiver marcado como confiavel.
+# - Reinicie o Codex depois de alterar este arquivo.
+#
+# Filosofia:
+# - FORBIDDEN: operacoes destrutivas que nao devem ser autonomas.
+# - PROMPT: operacoes legitimas, mas com efeito persistente, externo ou sensivel.
+# - Sem regra: leitura, testes, lint, build e investigacao local rotineira.
+
+# =============================================================================
+# 1. GIT — HISTORICO E DESTRUICAO LOCAL
+# =============================================================================
+
+prefix_rule(
+    pattern = ["git", "reset", "--hard"],
+    decision = "forbidden",
+    justification = "Nao use git reset --hard. Preserve o worktree e prefira revert, restore seletivo ou uma branch de recuperacao.",
+    match = [
+        "git reset --hard",
+        "git reset --hard HEAD~1",
+        "git reset --hard abc1234",
+    ],
+)
+
+prefix_rule(
+    pattern = ["git", "clean"],
+    decision = "forbidden",
+    justification = "git clean pode apagar arquivos nao rastreados de forma irreversivel. Inspecione com git clean -n manualmente e remova somente alvos explicitamente autorizados.",
+    match = [
+        "git clean -fd",
+        "git clean -fdx",
+        "git clean -xdf",
+    ],
+)
+
+prefix_rule(
+    pattern = ["git", "checkout", "--"],
+    decision = "prompt",
+    justification = "Checkout de paths pode descartar alteracoes locais. Confirme explicitamente o alvo antes de executar.",
+    match = [
+        "git checkout -- file.py",
+        "git checkout -- .",
+    ],
+)
+
+prefix_rule(
+    pattern = ["git", "restore"],
+    decision = "prompt",
+    justification = "git restore pode descartar alteracoes locais. Confirme o escopo antes de executar.",
+    match = [
+        "git restore file.py",
+        "git restore .",
+        "git restore --staged file.py",
+    ],
+)
+
+prefix_rule(
+    pattern = ["git", "branch", ["-d", "-D", "--delete"]],
+    decision = "prompt",
+    justification = "Excluir branch e uma operacao persistente. Confirme a branch e se o trabalho ja esta preservado.",
+    match = [
+        "git branch -d feature/x",
+        "git branch -D feature/x",
+        "git branch --delete feature/x",
+    ],
+)
+
+prefix_rule(
+    pattern = ["git", "tag", "-d"],
+    decision = "prompt",
+    justification = "Excluir tag altera checkpoints locais. Confirme a tag antes de executar.",
+    match = [
+        "git tag -d checkpoint/fase-01",
+    ],
+)
+
+# =============================================================================
+# 2. GIT — COMMIT E PUBLICACAO REMOTA
+# =============================================================================
+
+prefix_rule(
+    pattern = ["git", "commit"],
+    decision = "prompt",
+    justification = "Commit deve ser uma decisao explicita: confirme escopo, diff e testes antes de registrar historico.",
+    match = [
+        "git commit -m \"fix: corrigir validacao\"",
+        "git commit --amend",
+    ],
+)
+
+# Bloqueia formas comuns de force-push quando a flag aparece logo apos `push`.
+# O `git push` generico abaixo continua exigindo confirmacao, cobrindo outras
+# ordens de argumentos que nao coincidam com estes prefixos.
+prefix_rule(
+    pattern = ["git", "push", ["--force", "-f", "--force-with-lease"]],
+    decision = "forbidden",
+    justification = "Force-push nao deve ser autonomo. Preserve o historico remoto; se for realmente necessario, execute manualmente apos revisar o impacto.",
+    match = [
+        "git push --force",
+        "git push -f origin main",
+        "git push --force-with-lease origin feature/x",
+    ],
+)
+
+prefix_rule(
+    pattern = ["git", "push"],
+    decision = "prompt",
+    justification = "Push publica alteracoes no remoto. Confirme branch, commits e testes antes de enviar.",
+    match = [
+        "git push",
+        "git push origin main",
+        "git push origin feature/x",
+    ],
+)
+
+# =============================================================================
+# 3. GITHUB CLI — ACOES COM EFEITO REMOTO
+# =============================================================================
+
+# Leitura remota segura: reduz atrito quando o Codex so esta investigando.
+prefix_rule(
+    pattern = ["gh", "pr", ["view", "list", "status", "checks"]],
+    decision = "allow",
+    justification = "Leitura de pull requests e permitida para investigacao e revisao.",
+    match = [
+        "gh pr view 42",
+        "gh pr list",
+        "gh pr status",
+        "gh pr checks 42",
+    ],
+)
+
+prefix_rule(
+    pattern = ["gh", "issue", ["view", "list", "status"]],
+    decision = "allow",
+    justification = "Leitura de issues e permitida para investigacao.",
+    match = [
+        "gh issue view 10",
+        "gh issue list",
+    ],
+)
+
+prefix_rule(
+    pattern = ["gh", "repo", "view"],
+    decision = "allow",
+    justification = "Leitura de metadados do repositorio e permitida.",
+    match = [
+        "gh repo view",
+        "gh repo view owner/repo",
+    ],
+)
+
+prefix_rule(
+    pattern = ["gh", "pr", ["create", "merge", "close", "reopen", "edit", "review"]],
+    decision = "prompt",
+    justification = "Esta acao altera estado remoto de pull requests. Exige confirmacao explicita.",
+    match = [
+        "gh pr create --title \"Minha PR\"",
+        "gh pr merge 42",
+        "gh pr close 42",
+        "gh pr review 42 --approve",
+    ],
+)
+
+prefix_rule(
+    pattern = ["gh", "issue", ["create", "close", "reopen", "edit", "comment"]],
+    decision = "prompt",
+    justification = "Esta acao altera estado remoto de issues. Exige confirmacao explicita.",
+    match = [
+        "gh issue create --title \"Bug\"",
+        "gh issue close 10",
+        "gh issue comment 10 --body \"Atualizacao\"",
+    ],
+)
+
+prefix_rule(
+    pattern = ["gh", "release", ["create", "delete", "edit", "upload"]],
+    decision = "prompt",
+    justification = "Releases sao artefatos publicados. Confirme versao, arquivos e impacto antes de alterar.",
+    match = [
+        "gh release create v1.0.0",
+        "gh release delete v1.0.0",
+    ],
+)
+
+prefix_rule(
+    pattern = ["gh", "repo", ["delete", "rename", "archive"]],
+    decision = "forbidden",
+    justification = "Alteracoes destrutivas no repositorio remoto nao devem ser executadas autonomamente. Faca manualmente apos revisao.",
+    match = [
+        "gh repo delete owner/repo",
+        "gh repo rename novo-nome",
+        "gh repo archive owner/repo",
+    ],
+)
+
+# `gh api` pode realizar GET ou mutacoes dependendo dos argumentos.
+# Mantemos sempre sob confirmacao.
+prefix_rule(
+    pattern = ["gh", "api"],
+    decision = "prompt",
+    justification = "gh api pode executar chamadas arbitrarias na API do GitHub. Confirme endpoint, metodo e payload.",
+    match = [
+        "gh api repos/owner/repo",
+        "gh api --method POST repos/owner/repo/issues",
+    ],
+)
+
+# =============================================================================
+# 4. DEPENDENCIAS — INSTALACAO, REMOCAO E UPDATE
+# =============================================================================
+
+prefix_rule(
+    pattern = [["pip", "pip3"], ["install", "uninstall"]],
+    decision = "prompt",
+    justification = "Alterar dependencias do ambiente deve ser intencional e compatibilidade deve ser verificada.",
+    match = [
+        "pip install requests",
+        "pip3 uninstall requests",
+    ],
+)
+
+prefix_rule(
+    pattern = [["python", "python3", "py"], "-m", "pip", ["install", "uninstall"]],
+    decision = "prompt",
+    justification = "Alterar dependencias Python deve ser intencional e compatibilidade deve ser verificada.",
+    match = [
+        "python -m pip install requests",
+        "py -m pip uninstall requests",
+    ],
+)
+
+prefix_rule(
+    pattern = ["npm", ["install", "uninstall", "update"]],
+    decision = "prompt",
+    justification = "Alterar dependencias Node ou lockfiles exige confirmacao e revisao do diff.",
+    match = [
+        "npm install express",
+        "npm uninstall express",
+        "npm update",
+    ],
+)
+
+prefix_rule(
+    pattern = ["pnpm", ["add", "install", "remove", "update"]],
+    decision = "prompt",
+    justification = "Alterar dependencias Node ou lockfiles exige confirmacao e revisao do diff.",
+    match = [
+        "pnpm add zod",
+        "pnpm install",
+        "pnpm remove zod",
+    ],
+)
+
+prefix_rule(
+    pattern = ["yarn", ["add", "install", "remove", "upgrade"]],
+    decision = "prompt",
+    justification = "Alterar dependencias Node ou lockfiles exige confirmacao e revisao do diff.",
+    match = [
+        "yarn add axios",
+        "yarn install",
+        "yarn remove axios",
+    ],
+)
+
+prefix_rule(
+    pattern = ["poetry", ["add", "remove", "update", "install"]],
+    decision = "prompt",
+    justification = "Alterar dependencias ou ambiente Poetry exige confirmacao.",
+    match = [
+        "poetry add fastapi",
+        "poetry update",
+    ],
+)
+
+prefix_rule(
+    pattern = ["uv", ["add", "remove", "sync"]],
+    decision = "prompt",
+    justification = "Alterar dependencias ou ambiente uv exige confirmacao.",
+    match = [
+        "uv add fastapi",
+        "uv sync",
+    ],
+)
+
+# =============================================================================
+# 5. BANCO DE DADOS E MIGRATIONS
+# =============================================================================
+
+prefix_rule(
+    pattern = ["alembic", ["upgrade", "downgrade", "revision"]],
+    decision = "prompt",
+    justification = "Migrations alteram schema ou historico de banco. Confirme alvo, ambiente e reversibilidade.",
+    match = [
+        "alembic upgrade head",
+        "alembic downgrade -1",
+        "alembic revision --autogenerate -m \"nova coluna\"",
+    ],
+)
+
+prefix_rule(
+    pattern = ["flask", "db", ["upgrade", "downgrade", "migrate", "stamp"]],
+    decision = "prompt",
+    justification = "Flask-Migrate pode alterar schema ou historico de migrations. Confirme o banco e o diff.",
+    match = [
+        "flask db upgrade",
+        "flask db migrate -m \"nova coluna\"",
+    ],
+)
+
+prefix_rule(
+    pattern = ["npx", "prisma", ["migrate", "db"]],
+    decision = "prompt",
+    justification = "Prisma pode alterar schema, migrations ou dados. Confirme o comando e o ambiente.",
+    match = [
+        "npx prisma migrate deploy",
+        "npx prisma db push",
+    ],
+)
+
+prefix_rule(
+    pattern = [["psql", "mysql", "mysqlsh"]],
+    decision = "prompt",
+    justification = "Acesso direto a banco pode ler ou modificar dados reais. Confirme ambiente, alvo e comando antes de executar.",
+    match = [
+        "psql postgresql://localhost/app",
+        "mysql -u root app",
+        "mysqlsh --sql",
+    ],
+)
+
+# =============================================================================
+# 6. DOCKER E LIMPEZA DE RECURSOS
+# =============================================================================
+
+prefix_rule(
+    pattern = ["docker", "system", "prune"],
+    decision = "forbidden",
+    justification = "docker system prune pode remover recursos de outros projetos. Execute manualmente apos inspecionar o que sera apagado.",
+    match = [
+        "docker system prune",
+        "docker system prune -a",
+    ],
+)
+
+prefix_rule(
+    pattern = ["docker", ["volume", "image", "container", "builder"], "prune"],
+    decision = "forbidden",
+    justification = "Prune pode apagar recursos compartilhados ou dados. Execute manualmente apos inspecao.",
+    match = [
+        "docker volume prune",
+        "docker image prune",
+        "docker container prune",
+        "docker builder prune",
+    ],
+)
+
+prefix_rule(
+    pattern = ["docker", ["rm", "rmi", "push"]],
+    decision = "prompt",
+    justification = "Remocao ou publicacao de recursos Docker exige confirmacao explicita.",
+    match = [
+        "docker rm app",
+        "docker rmi minha-imagem",
+        "docker push owner/app:latest",
+    ],
+)
+
+prefix_rule(
+    pattern = ["docker", "compose", "down"],
+    decision = "prompt",
+    justification = "docker compose down altera o ambiente em execucao e pode remover recursos. Confirme antes de executar.",
+    match = [
+        "docker compose down",
+        "docker compose down -v",
+    ],
+)
+
+# =============================================================================
+# 7. DEPLOY, INFRA E CLOUD
+# =============================================================================
+
+prefix_rule(
+    pattern = ["terraform", "destroy"],
+    decision = "forbidden",
+    justification = "terraform destroy pode remover infraestrutura real. Nao execute autonomamente; revise o plano e execute manualmente.",
+    match = [
+        "terraform destroy",
+        "terraform destroy -auto-approve",
+    ],
+)
+
+prefix_rule(
+    pattern = ["terraform", ["apply", "import"]],
+    decision = "prompt",
+    justification = "Terraform pode alterar infraestrutura ou estado. Revise o plan e confirme ambiente antes de aplicar.",
+    match = [
+        "terraform apply",
+        "terraform apply plan.tfplan",
+        "terraform import aws_s3_bucket.example bucket-name",
+    ],
+)
+
+prefix_rule(
+    pattern = ["kubectl", ["apply", "delete", "patch", "replace", "scale", "rollout", "set"]],
+    decision = "prompt",
+    justification = "kubectl pode alterar recursos de cluster. Confirme contexto, namespace e alteracao.",
+    match = [
+        "kubectl apply -f deployment.yaml",
+        "kubectl delete pod app-123",
+        "kubectl scale deployment app --replicas=3",
+    ],
+)
+
+prefix_rule(
+    pattern = [["aws", "gcloud", "az"]],
+    decision = "prompt",
+    justification = "CLI de cloud pode acessar ou modificar recursos reais. Confirme conta, projeto, regiao e operacao.",
+    match = [
+        "aws s3 ls",
+        "gcloud projects list",
+        "az account show",
+    ],
+)
+
+prefix_rule(
+    pattern = ["vercel", ["deploy", "--prod"]],
+    decision = "prompt",
+    justification = "Deploy publica uma versao externa. Confirme projeto, ambiente e diff antes de executar.",
+    match = [
+        "vercel deploy",
+        "vercel --prod",
+    ],
+)
+
+prefix_rule(
+    pattern = ["netlify", "deploy"],
+    decision = "prompt",
+    justification = "Deploy publica uma versao externa. Confirme projeto e ambiente antes de executar.",
+    match = [
+        "netlify deploy",
+        "netlify deploy --prod",
+    ],
+)
+
+prefix_rule(
+    pattern = ["fly", "deploy"],
+    decision = "prompt",
+    justification = "Deploy publica uma versao externa. Confirme app e ambiente antes de executar.",
+    match = [
+        "fly deploy",
+    ],
+)
+
+# =============================================================================
+# 8. FILESYSTEM E PRIVILEGIOS
+# =============================================================================
+
+prefix_rule(
+    pattern = ["rm", ["-rf", "-fr"]],
+    decision = "forbidden",
+    justification = "Remocao recursiva forcada nao deve ser autonoma. Liste os alvos e remova somente caminhos explicitamente autorizados.",
+    match = [
+        "rm -rf build",
+        "rm -fr tmp",
+    ],
+)
+
+prefix_rule(
+    pattern = ["rm"],
+    decision = "prompt",
+    justification = "Remocao de arquivos exige confirmacao do alvo quando houver escalacao para fora do sandbox.",
+    match = [
+        "rm arquivo.txt",
+        "rm -r pasta",
+    ],
+)
+
+prefix_rule(
+    pattern = ["sudo"],
+    decision = "prompt",
+    justification = "Comandos privilegiados alteram o sistema fora do escopo normal do repositorio. Confirme explicitamente.",
+    match = [
+        "sudo apt update",
+        "sudo systemctl restart nginx",
+    ],
+)
+
+prefix_rule(
+    pattern = [["chmod", "chown"]],
+    decision = "prompt",
+    justification = "Alterar permissoes ou propriedade pode afetar seguranca e execucao. Confirme o alvo.",
+    match = [
+        "chmod +x script.sh",
+        "chown user:user arquivo",
+    ],
+)
+
+# =============================================================================
+# 9. WINDOWS — COMANDOS DIRETOS DE ALTO IMPACTO
+# =============================================================================
+#
+# Observacao: regras por prefixo so funcionam sobre o argv que o Codex avalia.
+# Comandos escondidos dentro de wrappers PowerShell complexos podem nao casar
+# com estes prefixos; por isso sandbox + approval_policy continuam obrigatorios.
+
+prefix_rule(
+    pattern = [["del", "erase"]],
+    decision = "prompt",
+    justification = "Exclusao via Windows deve confirmar explicitamente os alvos.",
+    match = [
+        "del arquivo.txt",
+        "erase arquivo.txt",
+    ],
+)
+
+prefix_rule(
+    pattern = ["rmdir"],
+    decision = "prompt",
+    justification = "Remocao de diretorios via Windows deve confirmar explicitamente os alvos.",
+    match = [
+        "rmdir pasta",
+        "rmdir /s /q pasta",
+    ],
+)
+
+prefix_rule(
+    pattern = ["taskkill", "/F"],
+    decision = "prompt",
+    justification = "Finalizacao forcada de processos pode afetar outras tarefas. Confirme o processo.",
+    match = [
+        "taskkill /F /IM python.exe",
+    ],
+)
+
+# =============================================================================
+# 10. PRINCIPIO FINAL
+# =============================================================================
+#
+# Nao crie regras `allow` amplas para shells inteiros (`bash`, `sh`, `zsh`,
+# `pwsh`, `powershell`, `cmd`) nem para ferramentas genericas capazes de
+# executar comandos arbitrarios. Prefira liberar apenas prefixos read-only
+# pequenos e conhecidos.

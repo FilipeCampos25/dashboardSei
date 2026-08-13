@@ -5,7 +5,7 @@ import logging
 import sys
 from datetime import datetime
 
-from app.config import get_settings
+from app.config import ensure_online_operation_allowed, get_settings
 from app.core.logging_config import setup_logging
 from app.rpa.scraping import SEIScraper
 
@@ -38,6 +38,8 @@ def main() -> None:
     log_level = "DEBUG" if (settings.debug or args.debug) else settings.log_level
     setup_logging(log_level)
     logger = logging.getLogger(__name__)
+
+    ensure_online_operation_allowed("main", current_settings=settings)
 
     if args.manual_login and args.auto_login:
         raise ValueError("Use apenas uma opcao: --manual-login ou --auto-login")

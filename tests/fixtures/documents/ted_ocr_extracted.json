@@ -1,0 +1,4 @@
+{
+  "metadata": {"id": "ted_ocr_extracted", "description": "TED whose structured fields were recovered through OCR.", "family": "ted", "document_role": "instrument", "extraction_method": "ocr", "technical_state": "EXTRACTED", "origin": "synthetic"},
+  "payload": {"processo": "PROCESSO-EXEMPLO-003", "snapshot": {"title": "Termo de Execucao Descentralizada 01/2026", "text": "TERMO DE EXECUCAO DESCENTRALIZADA. OBJETO: atividade sintetica verificavel.", "tables": [{"rows": [["Unidade Descentralizadora", "ORGAO_A"], ["Unidade Descentralizada", "PARCEIRO_B"], ["Valor global", "R$ 100.000,00"]]}], "extraction_mode": "ocr"}, "analysis": {"validation_status": "valid_for_requested_type"}}
+}

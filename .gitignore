@@ -56,6 +56,8 @@ msedgedriver.exe
 /backend.zip
 /vba_codigo.txt
 /vba_codigo.zip
+/docs/CHECKLIST_CORRECAO_PIPELINE_CENSIPAM.md
+/CONTROLE_PROGRESSO_COMMITS_CENSIPAM.md
 
 # OS files
 .DS_Store

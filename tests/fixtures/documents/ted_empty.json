@@ -1,0 +1,4 @@
+{
+  "metadata": {"id": "ted_empty", "description": "Located TED candidate with no extractable content.", "family": "ted", "document_role": "instrument_candidate", "extraction_method": "none", "technical_state": "EMPTY_CONTENT", "origin": "synthetic"},
+  "payload": {"processo": "PROCESSO-EXEMPLO-005", "snapshot": {"title": "TED candidato", "text": "", "tables": [], "extraction_mode": "none"}, "technical": {"access_state": "ACCESSIBLE", "extraction_state": "EMPTY_CONTENT"}}
+}

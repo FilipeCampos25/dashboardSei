@@ -1,0 +1,4 @@
+{
+  "metadata": {"id": "pt_iframe_unavailable", "description": "PT candidate whose iframe could not be accessed.", "family": "pt", "document_role": "work_plan_candidate", "extraction_method": "none", "technical_state": "IFRAME_UNAVAILABLE", "origin": "synthetic"},
+  "payload": {"processo": "PROCESSO-EXEMPLO-006", "snapshot": {"title": "Plano de Trabalho indisponivel", "text": "", "tables": [], "extraction_mode": "none"}, "technical": {"access_state": "IFRAME_UNAVAILABLE", "extraction_state": "NOT_ATTEMPTED"}}
+}

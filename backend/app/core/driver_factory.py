@@ -20,6 +20,8 @@ from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 
+from app.config import ensure_online_operation_allowed
+
 
 def _prepare_managed_download_dir() -> Path:
     download_dir = Path(__file__).resolve().parents[2] / "output" / "browser_downloads"
@@ -67,6 +69,7 @@ def _finalize_driver_downloads(driver: webdriver.Chrome, download_dir: Path) -> 
 
 
 def create_chrome_driver(*, headless: bool = False) -> webdriver.Chrome:
+    ensure_online_operation_allowed("create_chrome_driver")
     options = Options()
 
     if headless:

@@ -26,6 +26,7 @@ Variaveis principais:
 - `SEI_URL`
 - `SEI_USERNAME`
 - `SEI_PASSWORD`
+- `OFFLINE_ONLY`
 - `HEADLESS`
 - `TIMEOUT_SECONDS`
 - `MANUAL_LOGIN`
@@ -41,6 +42,7 @@ Variaveis principais:
 
 Observacoes:
 
+- `OFFLINE_ONLY=true` e a barreira fail-closed para testes e reprocessamentos offline: bloqueia antes da criacao do Chrome Driver, login, navegacao ou consulta HTTP. A variavel de ambiente tem precedencia sobre `.env`; o valor legado `false` preserva o fluxo online existente.
 - `OUTPUT_DIR=output` significa `backend/output/`, porque o backend resolve caminhos relativos a partir da pasta `backend/`.
 - `DESCRICOES_BUSCA` define quais internos entram no fluxo guiado.
 - `DESCRICOES_MATCH_MODE` aceita `contains` e `equals`. O valor legado `exact` tambem e aceito e convertido para `equals`.
@@ -179,6 +181,31 @@ Para focar so no PT:
 ```bash
 python -m unittest tests.test_pt_normalizer
 ```
+
+## Congelamento offline de uma baseline
+
+Uma rodada completa combina `backend/output/` com
+`output/execution_log_latest.json`, ambos relativos a uma raiz privada comum. O
+manifesto registra somente metadados, tamanhos e hashes; ele nao incorpora o
+conteudo dos artefatos.
+
+Para inspecionar o manifesto sem escrever na baseline:
+
+```bash
+python scripts/freeze_baseline.py --source CAMINHO_DA_BASELINE --run-id output-3 --origin auditoria-2026-08-05 --execution-mode existing-output
+```
+
+Por padrao, o JSON e emitido em stdout. A gravacao exige destino explicito, que
+pode ficar ao lado da baseline privada ou em um diretorio privado de metadados:
+
+```bash
+python scripts/freeze_baseline.py --source CAMINHO_DA_BASELINE --run-id output-3 --origin auditoria-2026-08-05 --execution-mode existing-output --captured-at 2026-08-05 --contract-version legacy --output CAMINHO_PRIVADO/run_manifest.json
+```
+
+Os JSONs documentais, candidatos, CSVs `latest`, diagnosticos e o log sao
+evidencias da rodada. `browser_downloads/`, temporarios, segredos e o proprio
+`run_manifest.json` nao entram no inventario. O manifesto real e a baseline nao
+devem ser copiados automaticamente para o Git.
 
 Para validar as regras da dashboard gerencial:
 

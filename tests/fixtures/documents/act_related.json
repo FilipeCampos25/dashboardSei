@@ -1,0 +1,4 @@
+{
+  "metadata": {"id": "act_related", "description": "Non-canonical ACT-related closing report.", "family": "act", "document_role": "closing_report", "extraction_method": "html_dom", "technical_state": "RELATED", "origin": "synthetic"},
+  "payload": {"processo": "PROCESSO-EXEMPLO-007", "snapshot": {"title": "Relatorio de encerramento do ACT", "text": "RELATORIO DE ENCERRAMENTO. Este documento relata a execucao do acordo e nao constitui o instrumento final.", "tables": [], "extraction_mode": "html_dom"}, "analysis": {"classification": "related_document", "canonicality": "INELIGIBLE"}}
+}

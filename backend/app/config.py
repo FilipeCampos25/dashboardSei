@@ -62,6 +62,10 @@ class Settings(BaseSettings):
             "manual_login_wait_seconds",
         ),
     )
+    offline_only: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("OFFLINE_ONLY", "offline_only"),
+    )
     debug: bool = Field(
         default=False,
         validation_alias=AliasChoices("DEBUG", "debug"),
@@ -101,3 +105,19 @@ settings = Settings()
 
 def get_settings() -> Settings:
     return settings
+
+
+class OfflineModeError(RuntimeError):
+    """Raised before an online-only operation can cause an external effect."""
+
+
+def ensure_online_operation_allowed(
+    operation: str,
+    *,
+    current_settings: Settings | None = None,
+) -> None:
+    active_settings = current_settings or get_settings()
+    if active_settings.offline_only:
+        raise OfflineModeError(
+            f"OFFLINE_ONLY bloqueou a operacao online '{operation}' antes de qualquer efeito externo."
+        )

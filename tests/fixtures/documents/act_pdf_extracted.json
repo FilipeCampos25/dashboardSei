@@ -1,0 +1,4 @@
+{
+  "metadata": {"id": "act_pdf_extracted", "description": "Canonical ACT represented as text extracted from a native PDF.", "family": "act", "document_role": "final_instrument", "extraction_method": "pdf_native", "technical_state": "EXTRACTED", "origin": "synthetic"},
+  "payload": {"processo": "PROCESSO-EXEMPLO-002", "snapshot": {"title": "Acordo de Cooperacao Tecnica", "text": "ACORDO DE COOPERACAO TECNICA que entre si celebram ORGAO_A e PARCEIRO_B. CLAUSULA PRIMEIRA - DO OBJETO: executar atividade conjunta.", "tables": [], "extraction_mode": "pdf_native"}, "collection": {"found_in": "synthetic_index"}}
+}

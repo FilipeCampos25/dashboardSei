@@ -1,0 +1,4 @@
+{
+  "metadata": {"id": "administrative_docx_extracted", "description": "Administrative memorandum extracted from a DOCX-compatible archive.", "family": "administrative", "document_role": "memorandum", "extraction_method": "zip_docx", "technical_state": "EXTRACTED", "origin": "synthetic"},
+  "payload": {"processo": "PROCESSO-EXEMPLO-004", "snapshot": {"title": "Memorando DOCUMENTO-EXEMPLO-001", "text": "MEMORANDO. Ao ORGAO_A. Assunto: encaminhamento administrativo sintetico. Encaminha-se ao PARCEIRO_B para providencias.", "tables": [], "extraction_mode": "zip_docx"}, "analysis": {"classification": "memorando"}}
+}
