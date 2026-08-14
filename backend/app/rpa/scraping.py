@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 import time
 import unicodedata
 from dataclasses import dataclass
@@ -31,6 +32,7 @@ from app.documents.ted import build_ted_document_type
 from app.documents.types import DocumentTypeSpec
 from app.integrations.transferegov_client import consultar_ted, normalize_processo_sei
 from app.output import csv_writer
+from app.output.run_publication import RunPublication
 from app.rpa.performance_profiler import (
     PerformanceProfiler,
     count_target_event,
@@ -326,6 +328,7 @@ class SEIScraper:
         set_active_profiler(self.performance_profiler)
         self.total_candidatos_avaliados = 0
         self.candidatos_descartados_pre_abertura = 0
+        self._run_publication: RunPublication | None = None
         self.logger.info(
             "Tipos documentais ativos: %s",
             ", ".join(spec.key for spec in self.document_types),
@@ -342,7 +345,12 @@ class SEIScraper:
             self.descricao_match_mode = "contains"
 
     def _prepare_output_dir_for_run(self) -> None:
-        output_dir = self._resolve_preview_output_dir()
+        published_dir = self._resolve_published_output_dir()
+        self._run_publication = RunPublication(
+            published_dir,
+            started_at=self.execution_started_at,
+        )
+        output_dir = self._run_publication.begin()
         csv_writer.ensure_output_dir(output_dir)
 
         cleanup_patterns = {
@@ -535,6 +543,12 @@ class SEIScraper:
             print(result)
             return result
         finally:
+            publication = getattr(self, "_run_publication", None)
+            if publication is not None and publication.active:
+                active_error = sys.exc_info()[1]
+                publication.abort(
+                    active_error or RuntimeError("Run ended before publication completed")
+                )
             self.performance_profiler.end_span(total_span_name)
             try:
                 self._export_performance_analysis(time.time() - execution_started_at)
@@ -4050,13 +4064,19 @@ class SEIScraper:
 
         return all_records
 
-    def _resolve_preview_output_dir(self) -> Path:
+    def _resolve_published_output_dir(self) -> Path:
         configured = (self.settings.output_dir or "output").strip()
         backend_root = Path(__file__).resolve().parents[2]
         output_dir = Path(configured)
         if not output_dir.is_absolute():
             output_dir = backend_root / output_dir
-        return output_dir
+        return output_dir.resolve()
+
+    def _resolve_preview_output_dir(self) -> Path:
+        publication = getattr(self, "_run_publication", None)
+        if publication is not None and publication.active:
+            return publication.staging_dir
+        return self._resolve_published_output_dir()
 
     def _export_performance_analysis(self, total_execution_time: float) -> None:
         output_dir = self._resolve_preview_output_dir()
@@ -4073,13 +4093,21 @@ class SEIScraper:
 
     def _finalize_document_runs(self) -> None:
         output_dir = self._resolve_preview_output_dir()
-        for document_type in self._get_document_types_for_outputs():
-            document_type.handler.finalize_run(
-                spec=document_type,
-                output_dir=output_dir,
-                logger=self.logger,
-                settings=self.settings,
-            )
+        publication = getattr(self, "_run_publication", None)
+        try:
+            for document_type in self._get_document_types_for_outputs():
+                document_type.handler.finalize_run(
+                    spec=document_type,
+                    output_dir=output_dir,
+                    logger=self.logger,
+                    settings=self.settings,
+                )
+            if publication is not None and publication.active:
+                publication.publish()
+        except BaseException as exc:
+            if publication is not None:
+                publication.abort(exc)
+            raise
 
     def _reset_candidate_screening_stats(self) -> None:
         self.total_candidatos_avaliados = 0
