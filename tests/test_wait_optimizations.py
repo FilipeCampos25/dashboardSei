@@ -2801,6 +2801,10 @@ class WaitOptimizationTests(unittest.TestCase):
         scraper._buscar_e_abrir_documento_mais_recente.assert_not_called()
         scraper._record_document_search_outcome.assert_not_called()
 
+    @unittest.skipIf(
+        os.getenv("OFFLINE_ONLY", "").strip().lower() in {"1", "true", "yes", "on"},
+        "genuine online RPA integration is excluded in OFFLINE_ONLY mode",
+    )
     def test_process_ted_via_api_skips_when_no_instrument_number_is_linked(self) -> None:
         scraper = scraping.SEIScraper.__new__(scraping.SEIScraper)
         scraper.logger = Mock()

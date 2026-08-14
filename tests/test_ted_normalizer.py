@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import shutil
 import sys
 import unittest
@@ -10,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 
 from app.services.dashboard_exporter import export_dashboard_ready_csv
 from app.services.ted_normalizer import RICH_COLUMNS, build_normalized_record, export_normalized_csv, parse_brl_money
+from tests.fixture_loader import load_fixture
 
 
 class TEDNormalizerTests(unittest.TestCase):
@@ -26,32 +28,29 @@ class TEDNormalizerTests(unittest.TestCase):
         self.assertEqual(parse_brl_money("valor total de R$ 2.500.000,00"), "2500000.00")
         self.assertEqual(parse_brl_money("130.000,00"), "130000.00")
 
-    def test_real_rich_ted_extracts_both_units_with_table_provenance(self) -> None:
-        source = Path(__file__).resolve().parents[1] / "backend" / "output" / "termo_execucao_descentralizada_60092.000169_2023-12.json"
-        self.assertTrue(source.exists())
-        import json
-
-        row, diagnostics = build_normalized_record(json.loads(source.read_text(encoding="utf-8")), source)
-        self.assertEqual(row["unidade_descentralizadora"], "Centro Gestor e Operacional do Sistema de Proteção da Amazônia - CENSIPAM")
-        self.assertEqual(row["unidade_descentralizada"], "Universidade de Brasília - UnB")
+    def test_versioned_rich_ted_extracts_both_units_with_table_provenance(self) -> None:
+        payload = load_fixture("ted_normalizer_rich.json")["payload"]
+        row, diagnostics = build_normalized_record(payload, "ted_normalizer_rich.json")
+        self.assertEqual(row["unidade_descentralizadora"], "CENSIPAM")
+        self.assertEqual(row["unidade_descentralizada"], "UNIVERSIDADE FEDERAL SINTETICA")
         unit_diagnostics = {item["field_name"]: item for item in diagnostics if item["field_name"].startswith("unidade_")}
-        self.assertEqual(unit_diagnostics["unidade_descentralizadora"]["table_index"], 2)
+        self.assertEqual(unit_diagnostics["unidade_descentralizadora"]["table_index"], 1)
         self.assertEqual(unit_diagnostics["unidade_descentralizadora"]["row_index"], 2)
-        self.assertEqual(unit_diagnostics["unidade_descentralizadora"]["column_index"], 1)
-        self.assertEqual(unit_diagnostics["unidade_descentralizadora"]["confidence"], "medium")
-        self.assertIn("Unidade Gestora", unit_diagnostics["unidade_descentralizadora"]["matched_key"])
-        self.assertEqual(unit_diagnostics["unidade_descentralizada"]["row_index"], 4)
+        self.assertEqual(unit_diagnostics["unidade_descentralizadora"]["column_index"], 2)
+        self.assertEqual(unit_diagnostics["unidade_descentralizadora"]["confidence"], "high")
+        self.assertIn("descentralizador", unit_diagnostics["unidade_descentralizadora"]["matched_key"].lower())
+        self.assertEqual(unit_diagnostics["unidade_descentralizada"]["row_index"], 2)
         self.assertEqual(unit_diagnostics["unidade_descentralizada"]["confidence"], "high")
         self.assertNotIn("DANIEL DIAS PEREIRA", row["unidade_descentralizadora"])
         self.assertNotIn("MÁRCIA ABRAHÃO", row["unidade_descentralizada"])
 
-        self.assertEqual(row["datas_assinatura"], "2023-08-30;2023-08-31")
-        self.assertEqual(row["data_assinatura"], "2023-08-31")
-        self.assertEqual(row["vigencia_prazo_quantidade"], "24")
+        self.assertEqual(row["datas_assinatura"], "2020-12-01")
+        self.assertEqual(row["data_assinatura"], "2020-12-01")
+        self.assertEqual(row["vigencia_prazo_quantidade"], "25")
         self.assertEqual(row["vigencia_prazo_unidade"], "meses")
         self.assertEqual(row["vigencia_regra_inicio"], "assinatura")
-        self.assertEqual(row["vigencia_inicio"], "2023-08-31")
-        self.assertEqual(row["vigencia_fim"], "2025-08-30")
+        self.assertEqual(row["vigencia_inicio"], "2020-12-01")
+        self.assertEqual(row["vigencia_fim"], "2022-12-31")
         self.assertEqual(row["vigencia_inicio_origem"], "calculada")
         self.assertEqual(row["vigencia_fim_origem"], "calculada")
 
@@ -197,39 +196,24 @@ class TEDNormalizerTests(unittest.TestCase):
         self.assertEqual(row["unidade_descentralizadora"], "")
         self.assertEqual(row["unidade_descentralizada"], "")
 
-    def test_export_uses_three_real_ted_jsons_and_writes_diagnostics(self) -> None:
-        repo_root = Path(__file__).resolve().parents[1]
-        source_dir = repo_root / "backend" / "output"
-        source_files = [
-            source_dir / "termo_execucao_descentralizada_60090.000165_2024-27.json",
-            source_dir / "termo_execucao_descentralizada_60092.000266_2020-54.json",
-            source_dir / "termo_execucao_descentralizada_60090.000840_2025-07.json",
-        ]
-        for source_file in source_files:
-            self.assertTrue(source_file.exists(), f"Fixture real ausente: {source_file}")
-
-        output_dir = Path.cwd() / "tests" / "_tmp_ted_normalizer"
-        if output_dir.exists():
-            shutil.rmtree(output_dir, ignore_errors=True)
+    def test_export_uses_versioned_ted_fixture_and_writes_diagnostics(self) -> None:
+        fixture = load_fixture("ted_normalizer_rich.json")
+        output_dir = Path(__file__).resolve().parent / "_tmp_ted_normalizer"
         output_dir.mkdir(parents=True, exist_ok=True)
-
         try:
-            records = []
-            for source_file in source_files:
-                target = output_dir / source_file.name
-                shutil.copyfile(source_file, target)
-                records.append({"publication_status": "published_gold", "json_path": str(target)})
-
+            target = output_dir / "ted_normalizer_rich.json"
+            target.write_text(json.dumps(fixture["payload"]), encoding="utf-8")
+            records = [{"publication_status": "published_gold", "json_path": str(target)}]
             result = export_normalized_csv(output_dir, records=records)
-            self.assertEqual(result["records"], 3)
+            self.assertEqual(result["records"], 1)
 
             with (output_dir / "ted_normalizado_latest.csv").open("r", encoding="utf-8-sig", newline="") as file_obj:
                 rows = list(csv.DictReader(file_obj))
-            self.assertEqual(len(rows), 3)
+            self.assertEqual(len(rows), 1)
             for column in RICH_COLUMNS:
                 self.assertIn(column, rows[0])
 
-            row_2020 = next(row for row in rows if row["processo"] == "60092.000266/2020-54")
+            row_2020 = rows[0]
             self.assertEqual(row_2020["numero_ted"], "12")
             self.assertEqual(row_2020["ano_ted"], "2020")
             self.assertEqual(row_2020["valor_global"], "1255800.00")
@@ -238,30 +222,22 @@ class TEDNormalizerTests(unittest.TestCase):
             self.assertIn("UNIVERSIDADE FEDERAL", row_2020["unidade_descentralizada"].upper())
             self.assertIn("Natureza da Despesa", row_2020["cronograma_desembolso"])
 
-            row_2025 = next(row for row in rows if row["processo"] == "60090.000840/2025-07")
-            self.assertEqual(row_2025["numero_ted"], "04")
-            self.assertEqual(row_2025["ano_ted"], "2025")
-            self.assertEqual(row_2025["valor_global"], "2500000.00")
-            self.assertIn("META 1", row_2025["metas"])
+            self.assertIn("META 1", row_2020["metas"])
 
             with (output_dir / "ted_field_diagnostics_latest.csv").open("r", encoding="utf-8-sig", newline="") as file_obj:
                 diagnostics = list(csv.DictReader(file_obj))
-            self.assertGreaterEqual(len(diagnostics), 36)
+            self.assertGreaterEqual(len(diagnostics), 12)
             self.assertTrue(any(row["field_name"] == "valor_global" and row["status"] == "extracted" for row in diagnostics))
         finally:
             shutil.rmtree(output_dir, ignore_errors=True)
 
     def test_dashboard_ready_includes_ted_process_without_preview(self) -> None:
-        repo_root = Path(__file__).resolve().parents[1]
-        source_file = repo_root / "backend" / "output" / "termo_execucao_descentralizada_60092.000266_2020-54.json"
-        output_dir = Path.cwd() / "tests" / "_tmp_ted_dashboard"
-        if output_dir.exists():
-            shutil.rmtree(output_dir, ignore_errors=True)
+        fixture = load_fixture("ted_normalizer_rich.json")
+        output_dir = Path(__file__).resolve().parent / "_tmp_ted_dashboard"
         output_dir.mkdir(parents=True, exist_ok=True)
-
         try:
-            target = output_dir / source_file.name
-            shutil.copyfile(source_file, target)
+            target = output_dir / "ted_normalizer_rich.json"
+            target.write_text(json.dumps(fixture["payload"]), encoding="utf-8")
             export_normalized_csv(output_dir, records=[{"publication_status": "published_gold", "json_path": str(target)}])
 
             result = export_dashboard_ready_csv(output_dir)

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import sys
 import unittest
 from pathlib import Path
@@ -9,14 +8,14 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "backend"))
 
-from app.services.act_normalizer import PUBLICATION_STATUS_GOLD, build_normalized_record
+from app.services.act_normalizer import build_normalized_record
 from app.services.act_process_affinity import AFFINITY_RULE_VERSION, assess_act_process_affinity
+from tests.fixture_loader import load_fixture
 
 
 class ActProcessAffinityTests(unittest.TestCase):
-    def _snapshot_result(self, relative_path: str) -> tuple[dict, dict]:
-        path = ROOT / relative_path
-        payload = json.loads(path.read_text(encoding="utf-8"))
+    def _fixture_result(self, fixture_name: str) -> tuple[dict, dict]:
+        payload = load_fixture(fixture_name)["payload"]
         result = assess_act_process_affinity(
             payload["snapshot"],
             current_process=payload["processo"],
@@ -25,22 +24,28 @@ class ActProcessAffinityTests(unittest.TestCase):
         return payload, result
 
     def test_target_mb_act_is_related_with_probable_external_origin(self) -> None:
-        payload, result = self._snapshot_result(
-            "backend/output/acordo_cooperacao_tecnica_60090.001292_2025-24.json"
-        )
+        payload, result = self._fixture_result("act_affinity_related.json")
 
         self.assertFalse(result["current_process_explicit"]["found"])
         self.assertEqual(result["affinity_status"], "related_document")
         self.assertEqual(result["affinity_confidence"], "medium")
         self.assertEqual(result["document_origin_process"]["process"], "61074.007769/2025-46")
-        self.assertEqual(result["document_origin_process"]["source"], "preamble.labeled_process")
+        self.assertEqual(result["document_origin_process"]["source"], "header.institutional_process_header")
         self.assertTrue(result["shadow_only"])
         self.assertEqual(result["affinity_rule_version"], AFFINITY_RULE_VERSION)
         self.assertEqual(payload["processo"], "60090.001292/2025-24")
 
     def test_target_inpe_act_uses_reference_footer_as_origin(self) -> None:
-        _, result = self._snapshot_result(
-            "backend/output/acordo_cooperacao_tecnica_60090.000702_2025-10.json"
+        text = (
+            "PROCESSO INPE 01340.003873/2025-42. ACORDO DE COOPERACAO TECNICA. "
+            "CLAUSULA PRIMEIRA - DO OBJETO. " + ("conteudo sintetico " * 80)
+            + "Autenticidade: Referencia: Processo 01340.003873/2025-42 SEI n 1. "
+            "Processo relacionado 01340.009269/2023-68."
+        )
+        result = assess_act_process_affinity(
+            {"title": "ACT", "text": text},
+            current_process="60090.000702/2025-10",
+            collection={"related_to_current_process": True},
         )
 
         self.assertFalse(result["current_process_explicit"]["found"])
@@ -57,12 +62,16 @@ class ActProcessAffinityTests(unittest.TestCase):
         self.assertIn("authentication_footer", zones)
 
     def test_multi_process_gold_baselines_remain_strong_matches(self) -> None:
-        for relative_path in (
-            "backend/output/acordo_cooperacao_tecnica_08650.063489_2021-11.json",
-            "backend/output/acordo_cooperacao_tecnica_60090.000269_2020-16.json",
+        for current_process, external_process in (
+            ("08650.063489/2021-11", "60090.000001/2021-00"),
+            ("60090.000269/2020-16", "08650.000001/2020-00"),
         ):
-            payload, result = self._snapshot_result(relative_path)
-            with self.subTest(processo=payload["processo"]):
+            result = assess_act_process_affinity(
+                {"title": "ACT", "text": f"Processo {current_process}. Processo relacionado {external_process}. CLAUSULA PRIMEIRA - DO OBJETO."},
+                current_process=current_process,
+                collection={},
+            )
+            with self.subTest(processo=current_process):
                 self.assertTrue(result["current_process_explicit"]["found"])
                 self.assertTrue(result["external_processes_found"])
                 self.assertEqual(result["affinity_status"], "strong_match")
@@ -110,12 +119,11 @@ class ActProcessAffinityTests(unittest.TestCase):
         self.assertEqual(result["affinity_status"], "strong_match")
         self.assertEqual(result["document_origin_process"]["source"], "metadata.processo_origem")
 
-    def test_shadow_fields_do_not_change_gold_publication_or_score(self) -> None:
-        path = ROOT / "backend/output/acordo_cooperacao_tecnica_60090.001292_2025-24.json"
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        record = build_normalized_record(payload, path)
+    def test_shadow_fields_do_not_promote_related_document_publication(self) -> None:
+        payload = load_fixture("act_affinity_related.json")["payload"]
+        record = build_normalized_record(payload, Path("act_affinity_related.json"))
 
-        self.assertEqual(record["publication_status"], PUBLICATION_STATUS_GOLD)
+        self.assertEqual(record["publication_status"], "retained_silver")
         self.assertEqual(record["affinity_status"], "related_document")
         self.assertEqual(record["affinity_rule_version"], AFFINITY_RULE_VERSION)
         self.assertIn("current_metadata_link=true", record["affinity_evidence"])

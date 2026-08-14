@@ -176,6 +176,10 @@ class DummyProfiler:
         return
 
 
+@unittest.skipIf(
+    os.getenv("OFFLINE_ONLY", "").strip().lower() in {"1", "true", "yes", "on"},
+    "genuine online RPA main-loop integration is excluded in OFFLINE_ONLY mode",
+)
 class InternalBlockProfileMainLoopTests(unittest.TestCase):
     def _make_scraper(self) -> scraping.SEIScraper:
         scraper = scraping.SEIScraper.__new__(scraping.SEIScraper)
