@@ -14,6 +14,7 @@ from app.config import OfflineModeError, settings  # noqa: E402
 from app.core.driver_factory import create_chrome_driver  # noqa: E402
 from app.integrations.transferegov_client import consultar_ted  # noqa: E402
 from app.rpa.scraping import SEIScraper  # noqa: E402
+import main as backend_main  # noqa: E402
 
 
 class OfflineModeTests(unittest.TestCase):
@@ -33,6 +34,19 @@ class OfflineModeTests(unittest.TestCase):
                 SEIScraper()
 
         create_driver.assert_not_called()
+
+    def test_offline_main_fails_before_logging_or_scraper_instantiation(self) -> None:
+        offline_settings = SimpleNamespace(offline_only=True)
+        with patch.object(backend_main, "get_settings", return_value=offline_settings), patch.object(
+            backend_main, "setup_logging"
+        ) as setup_logging, patch.object(backend_main, "SEIScraper") as scraper_class, patch.object(
+            sys, "argv", ["main.py"]
+        ):
+            with self.assertRaisesRegex(OfflineModeError, "OFFLINE_ONLY.*main"):
+                backend_main.main()
+
+        setup_logging.assert_not_called()
+        scraper_class.assert_not_called()
 
     def test_direct_driver_creation_fails_before_selenium(self) -> None:
         with patch.object(settings, "offline_only", True), patch(

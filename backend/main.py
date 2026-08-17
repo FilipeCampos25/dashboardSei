@@ -35,11 +35,11 @@ def main() -> None:
     args = _build_parser().parse_args()
     settings = get_settings()
 
+    ensure_online_operation_allowed("main", current_settings=settings)
+
     log_level = "DEBUG" if (settings.debug or args.debug) else settings.log_level
     setup_logging(log_level)
     logger = logging.getLogger(__name__)
-
-    ensure_online_operation_allowed("main", current_settings=settings)
 
     if args.manual_login and args.auto_login:
         raise ValueError("Use apenas uma opcao: --manual-login ou --auto-login")
