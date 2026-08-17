@@ -22,9 +22,14 @@ Em Windows, configure `TESSERACT_CMD` e `POPPLER_PATH` no `.env` caso OCR ou con
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
+python -m pip install -r requirements.txt -c constraints.txt
 Copy-Item .env.example .env
 ```
+
+`requirements.txt` declara apenas as dependencias diretas e fixa as versoes
+validadas. `constraints.txt` fixa o fechamento transitivo conhecido para evitar
+resolucoes flutuantes. A referencia atual e CPython 3.12.10 em Windows x86-64;
+use sempre os dois arquivos no mesmo comando de instalacao.
 
 Depois edite o `.env` com a URL do SEI, credenciais e filtros da rodada.
 

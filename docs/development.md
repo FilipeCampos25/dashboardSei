@@ -14,8 +14,14 @@ Dependencias opcionais para fallback de anexos:
 ## Instalacao
 
 ```bash
-pip install -r requirements.txt
+python -m pip install -r requirements.txt -c constraints.txt
 ```
+
+O `requirements.txt` contem as dependencias diretas com pins absolutos. O
+`constraints.txt` registra o fechamento transitivo validado com CPython 3.12.10
+em Windows x86-64. Use sempre os dois arquivos; instalar apenas requirements
+nao aplica a politica reprodutivel do projeto. Em especial, o fechamento fixa
+Pydantic 2.x, necessario para `AliasChoices` usado pela configuracao.
 
 ## Configuracao
 
