@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import socket
 import unittest
@@ -28,6 +29,33 @@ class DocumentFixtureTests(unittest.TestCase):
             [fixture["metadata"]["id"] for fixture in fixtures],
             [entry["id"] for entry in manifest["fixtures"]],
         )
+
+    def test_manifest_rejects_duplicate_ids_and_paths(self) -> None:
+        invalid_manifest = {
+            "schema_version": "1.0",
+            "fixtures": [
+                {"id": "duplicate", "path": "first.json"},
+                {"id": "duplicate", "path": "first.json"},
+            ],
+        }
+        with patch.object(
+            Path,
+            "read_text",
+            return_value=json.dumps(invalid_manifest),
+        ), self.assertRaises(ValueError):
+            load_manifest()
+
+    def test_loader_rejects_manifest_id_mismatch(self) -> None:
+        fixture = load_fixture("pt_html_extracted.json")
+        fixture["metadata"]["id"] = "different_id"
+        with patch("tests.fixture_loader.load_fixture", return_value=fixture), self.assertRaises(
+            ValueError
+        ):
+            load_all_fixtures()
+
+    def test_loader_rejects_missing_file(self) -> None:
+        with self.assertRaises(FileNotFoundError):
+            load_fixture("missing_fixture.json")
 
     def test_loader_is_independent_of_working_directory(self) -> None:
         original = Path.cwd()

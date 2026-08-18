@@ -97,6 +97,26 @@ def load_manifest() -> dict[str, Any]:
     manifest = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
     if manifest.get("schema_version") != "1.0" or not isinstance(manifest.get("fixtures"), list):
         raise ValueError("invalid fixture manifest schema")
+    fixture_ids: set[str] = set()
+    fixture_paths: set[str] = set()
+    for index, entry in enumerate(manifest["fixtures"]):
+        if not isinstance(entry, dict) or set(entry) != {"id", "path"}:
+            raise ValueError(f"invalid fixture manifest entry at index {index}")
+        fixture_id = entry["id"]
+        relative_path = entry["path"]
+        if not isinstance(fixture_id, str) or not fixture_id.strip():
+            raise ValueError(f"invalid fixture id at index {index}")
+        if not isinstance(relative_path, str) or not relative_path.strip():
+            raise ValueError(f"invalid fixture path at index {index}")
+        path = Path(relative_path)
+        if path.is_absolute() or ".." in path.parts:
+            raise ValueError(f"unsafe fixture path at index {index}")
+        if fixture_id in fixture_ids:
+            raise ValueError(f"duplicate fixture id: {fixture_id}")
+        if relative_path in fixture_paths:
+            raise ValueError(f"duplicate fixture path: {relative_path}")
+        fixture_ids.add(fixture_id)
+        fixture_paths.add(relative_path)
     return manifest
 
 
@@ -113,4 +133,13 @@ def load_fixture(relative_path: str) -> dict[str, Any]:
 
 def load_all_fixtures() -> list[dict[str, Any]]:
     manifest = load_manifest()
-    return [load_fixture(entry["path"]) for entry in manifest["fixtures"]]
+    fixtures = []
+    for entry in manifest["fixtures"]:
+        fixture = load_fixture(entry["path"])
+        if fixture["metadata"]["id"] != entry["id"]:
+            raise ValueError(
+                f"fixture id mismatch for {entry['path']}: "
+                f"expected {entry['id']}, got {fixture['metadata']['id']}"
+            )
+        fixtures.append(fixture)
+    return fixtures
