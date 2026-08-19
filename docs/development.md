@@ -87,6 +87,25 @@ Depuracao manual mantendo o filtro aberto:
 python backend/main.py --manual-login --no-stop-at-filter
 ```
 
+## Gerar pacote de release
+
+O release e construido somente a partir de arquivos rastreados e de uma
+allowlist explicita. O comando recusa sobrescrever um ZIP existente:
+
+```bash
+python scripts/build_release_package.py dist/dashboard-sei.zip
+```
+
+Antes de publicar, o proprio gerador valida o ZIP e falha se encontrar arquivo
+fora da allowlist, `.env`, SQLite, temporario, cache, output gerado, caminho
+inseguro ou indicador de segredo de alta confianca. `backend/app/output/` e
+codigo-fonte permitido; `backend/output/` e dado gerado proibido. Para repetir
+a verificacao de higiene sobre um artefato existente:
+
+```bash
+python scripts/check_secret_hygiene.py dist/dashboard-sei.zip
+```
+
 ## O que o backend faz hoje
 
 - abre o SEI e valida o pos-login;
