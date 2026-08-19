@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Mapping, Optional
 
 
@@ -33,6 +34,43 @@ SOURCE_TYPES = {
 
 CONFIDENCE_LEVELS = {CONFIDENCE_HIGH, CONFIDENCE_MEDIUM, CONFIDENCE_LOW}
 QUALITY_STATUSES = {QUALITY_HIGH, QUALITY_MEDIUM, QUALITY_LOW}
+
+
+@dataclass(frozen=True)
+class DocumentIdentity:
+    """Additive V2 identity for a document candidate.
+
+    Identifiers are deliberately independent. In particular, ``process_id`` is
+    never reused to fill either of the document or candidate identifiers.
+    """
+
+    process_id: str
+    document_id: Optional[str] = None
+    candidate_id: Optional[str] = None
+    source_url: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "process_id", _clean_text(self.process_id))
+        for field_name in ("document_id", "candidate_id", "source_url"):
+            value = _clean_text(getattr(self, field_name))
+            object.__setattr__(self, field_name, value or None)
+
+    def to_dict(self) -> Dict[str, Optional[str]]:
+        return {
+            "process_id": self.process_id,
+            "document_id": self.document_id,
+            "candidate_id": self.candidate_id,
+            "source_url": self.source_url,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "DocumentIdentity":
+        return cls(
+            process_id=value.get("process_id", ""),
+            document_id=value.get("document_id"),
+            candidate_id=value.get("candidate_id"),
+            source_url=value.get("source_url"),
+        )
 
 
 def _clean_text(value: Any) -> str:

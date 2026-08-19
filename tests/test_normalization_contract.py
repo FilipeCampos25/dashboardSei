@@ -12,6 +12,7 @@ from app.documents.cooperation_common import CooperationDocumentHandler
 from app.documents.types import DocumentTypeSpec
 from app.services.act_normalizer import build_normalized_record as build_act_record
 from app.services.normalization_contract import (
+    DocumentIdentity,
     SOURCE_DOCUMENT_TEXT,
     SOURCE_FALLBACK,
     SOURCE_MISSING,
@@ -24,6 +25,83 @@ from app.services.pt_normalizer import build_normalized_record as build_pt_recor
 
 
 class NormalizationContractTests(unittest.TestCase):
+    def test_document_identity_keeps_process_document_and_candidate_distinct(self) -> None:
+        identity = DocumentIdentity(
+            process_id="60090.000001/2026-01",
+            document_id="8707829",
+            candidate_id="tree-rank-001",
+            source_url="https://sei.example/document?id_documento=8707829",
+        )
+
+        self.assertEqual(identity.process_id, "60090.000001/2026-01")
+        self.assertEqual(identity.document_id, "8707829")
+        self.assertEqual(identity.candidate_id, "tree-rank-001")
+
+    def test_document_identity_preserves_id_documento_source_url(self) -> None:
+        source_url = "https://sei.example/controlador.php?acao=documento&id_documento=8707829"
+        identity = DocumentIdentity(
+            process_id="60090.000001/2026-01",
+            document_id="8707829",
+            source_url=source_url,
+        )
+
+        self.assertEqual(identity.document_id, "8707829")
+        self.assertEqual(identity.source_url, source_url)
+
+    def test_document_identity_preserves_id_anexo_source_url(self) -> None:
+        source_url = "https://sei.example/controlador.php?acao=anexo&id_anexo=1139528"
+        identity = DocumentIdentity(
+            process_id="60090.000001/2026-01",
+            candidate_id="tree-rank-003",
+            source_url=source_url,
+        )
+
+        self.assertIsNone(identity.document_id)
+        self.assertEqual(identity.candidate_id, "tree-rank-003")
+        self.assertEqual(identity.source_url, source_url)
+
+    def test_document_identity_represents_unknown_values_explicitly(self) -> None:
+        identity = DocumentIdentity(process_id="60090.000001/2026-01")
+
+        self.assertIsNone(identity.document_id)
+        self.assertIsNone(identity.candidate_id)
+        self.assertIsNone(identity.source_url)
+
+    def test_document_identity_normalizes_blank_optional_values_to_none(self) -> None:
+        identity = DocumentIdentity(
+            process_id=" 60090.000001/2026-01 ",
+            document_id="  ",
+            candidate_id="\n",
+            source_url="",
+        )
+
+        self.assertEqual(identity.process_id, "60090.000001/2026-01")
+        self.assertIsNone(identity.document_id)
+        self.assertIsNone(identity.candidate_id)
+        self.assertIsNone(identity.source_url)
+
+    def test_legacy_document_equal_to_process_is_not_inferred_as_document_id(self) -> None:
+        processo = "60090.000001/2026-01"
+        legacy_payload = {"processo": processo, "documento": processo}
+
+        identity = DocumentIdentity(process_id=legacy_payload["processo"])
+
+        self.assertEqual(identity.process_id, processo)
+        self.assertIsNone(identity.document_id)
+
+    def test_document_identity_round_trip_is_deterministic(self) -> None:
+        expected = {
+            "process_id": "60090.000001/2026-01",
+            "document_id": "8707829",
+            "candidate_id": None,
+            "source_url": "https://sei.example/document?id_documento=8707829",
+        }
+
+        identity = DocumentIdentity.from_dict(expected)
+
+        self.assertEqual(identity.to_dict(), expected)
+        self.assertEqual(DocumentIdentity.from_dict(identity.to_dict()), identity)
+
     def test_contract_preserves_field_source_metadata(self) -> None:
         contract = build_document_contract(
             processo="60090.000001/2026-01",
