@@ -6,7 +6,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 
-from app.services.gold_contracts import DocumentGoldDecision, FieldEvidence, RecordGold
+from app.services.gold_contracts import DocumentGoldDecision, FieldEvidence, RecordGold, SourceKind
 from app.services.normalization_contract import DocumentIdentity
 from app.services.semantic_states import (
     AffinityState,
@@ -45,7 +45,8 @@ class GoldContractsTests(unittest.TestCase):
 
         self.assertEqual(evidence.source_document, source)
         self.assertNotIsInstance(evidence.source_document, DocumentGoldDecision)
-        self.assertEqual(set(evidence.to_dict()), {"field_name", "source_document"})
+        self.assertIs(evidence.source_kind, SourceKind.DOCUMENT)
+        self.assertEqual(evidence.to_dict()["source_document"], source.to_dict())
 
     def test_field_evidence_round_trip_does_not_fabricate_rich_provenance(self) -> None:
         evidence = FieldEvidence(
@@ -55,8 +56,11 @@ class GoldContractsTests(unittest.TestCase):
 
         serialized = evidence.to_dict()
         self.assertEqual(FieldEvidence.from_dict(serialized), evidence)
-        for deferred_field in ("page", "excerpt", "xpath", "table", "confidence", "warning", "relation"):
-            self.assertNotIn(deferred_field, serialized)
+        self.assertIsNone(serialized["location"])
+        self.assertIsNone(serialized["relation"])
+        self.assertIsNone(serialized["raw_evidence"])
+        self.assertNotIn("confidence", serialized)
+        self.assertNotIn("warning", serialized)
 
     def test_record_gold_combines_primary_document_and_multiple_evidence(self) -> None:
         primary = self._document_gold()
