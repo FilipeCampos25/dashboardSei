@@ -26,7 +26,7 @@ from app.config import ensure_online_operation_allowed, get_settings
 from app.core.driver_factory import create_chrome_driver
 from app.core.logging_config import setup_logger
 from app.documents import resolve_document_types
-from app.documents.common import sanitize_snapshot
+from app.documents.common import identity_from_source_url, sanitize_snapshot
 from app.documents.document_utils import should_skip_candidate
 from app.documents.ted import build_ted_document_type
 from app.documents.types import DocumentTypeSpec
@@ -2287,7 +2287,7 @@ class SEIScraper:
                 )
                 return []
 
-            candidates_by_text: Dict[str, Dict[str, Any]] = {}
+            candidates_by_identity: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
             for xpath in xpaths:
                 try:
                     elems = self.driver.find_elements(By.XPATH, xpath)
@@ -2308,10 +2308,20 @@ class SEIScraper:
                         "score": score,
                         "matched_terms": matched_terms,
                     }
-                    current = candidates_by_text.get(normalized)
+                    try:
+                        source_url = str(elem.get_attribute("href") or "").strip()
+                    except WebDriverException:
+                        source_url = ""
+                    detail.update(identity_from_source_url(source_url))
+                    identity_key = (
+                        normalized,
+                        str(detail.get("document_id") or detail.get("candidate_id") or ""),
+                        source_url,
+                    )
+                    current = candidates_by_identity.get(identity_key)
                     if current is None or int(current.get("score", 0)) < score:
-                        candidates_by_text[normalized] = detail
-                if candidates_by_text:
+                        candidates_by_identity[identity_key] = detail
+                if candidates_by_identity:
                     break
 
             try:
@@ -2320,7 +2330,7 @@ class SEIScraper:
                 pass
 
             candidates = sorted(
-                candidates_by_text.values(),
+                candidates_by_identity.values(),
                 key=lambda item: (-int(item.get("score", 0)), str(item.get("text", ""))),
             )
             if not candidates:
@@ -2346,7 +2356,10 @@ class SEIScraper:
         candidates = self._find_document_candidates_in_tree(document_type)
         if not candidates:
             return None
-        link = self._locate_tree_link_by_text(candidates[0]["text"])
+        link = self._locate_tree_link_by_text(
+            candidates[0]["text"],
+            source_url=str(candidates[0].get("source_url") or ""),
+        )
         if link is None:
             return None
         context = self._build_collection_context(
@@ -2362,7 +2375,7 @@ class SEIScraper:
         )
         return (link, context)
 
-    def _locate_tree_link_by_text(self, target_text: str) -> Optional[Any]:
+    def _locate_tree_link_by_text(self, target_text: str, *, source_url: str = "") -> Optional[Any]:
         target_normalized = self._normalize_text(target_text)
         if not target_normalized:
             return None
@@ -2385,8 +2398,15 @@ class SEIScraper:
                     raw_text = (elem.text or "").strip()
                 except WebDriverException:
                     continue
-                if self._normalize_text(raw_text) == target_normalized:
-                    return elem
+                if self._normalize_text(raw_text) != target_normalized:
+                    continue
+                if source_url:
+                    try:
+                        if str(elem.get_attribute("href") or "").strip() != source_url:
+                            continue
+                    except WebDriverException:
+                        continue
+                return elem
 
         try:
             self.driver.switch_to.default_content()
@@ -2459,7 +2479,10 @@ class SEIScraper:
                         return True
                     return False
 
-            link = self._locate_tree_link_by_text(str(candidate.get("text", "")))
+            link = self._locate_tree_link_by_text(
+                str(candidate.get("text", "")),
+                source_url=str(candidate.get("source_url") or ""),
+            )
             if link is None:
                 self.logger.warning(
                     "Processo %s: candidato #%d da arvore para %s nao foi reencontrado (texto='%s').",
@@ -2516,6 +2539,8 @@ class SEIScraper:
                     f"termos={'|'.join(candidate.get('matched_terms', []))}"
                 ),
             )
+            for field_name in ("document_id", "candidate_id", "source_url"):
+                collection_context[field_name] = candidate.get(field_name)
             snapshot_saved = self._extract_and_process_document_snapshot(
                 processo=processo,
                 protocolo_documento=processo,
@@ -4409,6 +4434,12 @@ class SEIScraper:
                         logger=self.logger,
                     )
                 )
+                observed_identity = identity_from_source_url(snapshot.get("url"))
+                if collection_context is None:
+                    collection_context = {}
+                for field_name in ("document_id", "candidate_id", "source_url"):
+                    if not collection_context.get(field_name) and observed_identity.get(field_name):
+                        collection_context[field_name] = observed_identity[field_name]
                 is_valid, validation_reason, analysis = self._validate_snapshot_for_document_type(
                     processo,
                     document_type,

@@ -5,8 +5,48 @@ import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
+from urllib.parse import parse_qs, urlparse
 
 from app.documents.types import DocumentTypeSpec
+
+
+def identity_from_source_url(source_url: Any) -> dict[str, Optional[str]]:
+    """Extract only supported SEI identity parameters from an observed URL."""
+    url = str(source_url or "").strip()
+    identity: dict[str, Optional[str]] = {
+        "document_id": None,
+        "candidate_id": None,
+        "source_url": url or None,
+    }
+    if not url:
+        return identity
+    try:
+        query = parse_qs(urlparse(url).query, keep_blank_values=False)
+    except ValueError:
+        return identity
+    document_values = query.get("id_documento", [])
+    candidate_values = query.get("id_anexo", [])
+    if len(document_values) == 1 and document_values[0].strip().isdigit():
+        identity["document_id"] = document_values[0].strip()
+    if len(candidate_values) == 1 and candidate_values[0].strip().isdigit():
+        identity["candidate_id"] = candidate_values[0].strip()
+    return identity
+
+
+def build_document_identity(
+    processo: Any,
+    collection_context: Optional[dict[str, Any]] = None,
+    snapshot: Optional[dict[str, Any]] = None,
+) -> dict[str, Optional[str]]:
+    context = collection_context or {}
+    source_url = context.get("source_url") or (snapshot or {}).get("url")
+    observed = identity_from_source_url(source_url)
+    return {
+        "process_id": str(processo or "").strip(),
+        "document_id": str(context.get("document_id") or observed["document_id"] or "").strip() or None,
+        "candidate_id": str(context.get("candidate_id") or observed["candidate_id"] or "").strip() or None,
+        "source_url": str(source_url or "").strip() or None,
+    }
 
 
 MOJIBAKE_MARKERS = ("Ã", "Â", "â", "\ufffd")
@@ -99,11 +139,22 @@ def save_snapshot_json(
     filename = f"{snapshot_prefix}_{processo_id}{'_' + suffix if suffix else ''}.json"
     filepath = output_dir / filename
     sanitized_snapshot = sanitize_snapshot(snapshot)
+    collection = extra_payload.get("collection") if isinstance(extra_payload, dict) else None
+    identity = build_document_identity(
+        processo,
+        collection if isinstance(collection, dict) else None,
+        sanitized_snapshot,
+    )
     payload: Dict[str, Any] = {
         "captured_at": datetime.now().isoformat(timespec="seconds"),
         "document_type": spec.key,
         "processo": processo,
         "documento": protocolo_documento,
+        "process_id": identity["process_id"],
+        "document_id": identity["document_id"],
+        "candidate_id": identity["candidate_id"],
+        "source_url": identity["source_url"],
+        "identity": identity,
         "snapshot": sanitized_snapshot,
     }
     if extra_payload:
@@ -135,11 +186,13 @@ def build_basic_tracking_record(
     collection_context: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     sanitized_snapshot = sanitize_snapshot(snapshot)
+    identity = build_document_identity(processo, collection_context, sanitized_snapshot)
     record = {
         "captured_at": datetime.now().isoformat(timespec="seconds"),
         "document_type": spec.key,
         "processo": processo,
         "documento": protocolo_documento,
+        **identity,
         "snapshot_mode": (sanitized_snapshot.get("extraction_mode", "") or ""),
         "text_chars": len(sanitized_snapshot.get("text", "") or ""),
         "tables_count": len(sanitized_snapshot.get("tables", []) or []),
