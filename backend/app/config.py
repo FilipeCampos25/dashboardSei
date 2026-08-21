@@ -98,6 +98,10 @@ class Settings(BaseSettings):
         default=True,
         validation_alias=AliasChoices("EXPORT_RAW_FIELDS_CSV", "export_raw_fields_csv"),
     )
+    v2_dual_write: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("V2_DUAL_WRITE", "v2_dual_write"),
+    )
 
 
 settings = Settings()
