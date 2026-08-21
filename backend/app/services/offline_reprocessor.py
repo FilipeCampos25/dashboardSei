@@ -9,6 +9,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 from app.config import get_settings
 from app.services.contract_adapters import V2_SCHEMA_VERSION, adapt_legacy_record, write_v2_sidecar
+from app.services.portable_paths import PortableArtifactRef
 
 
 SUPPORTED_FAMILIES = ("act", "pt", "ted", "administrative")
@@ -177,7 +178,12 @@ def reprocess_snapshot(
             reason=f"{type(exc).__name__}: {exc}",
         )
     try:
-        record_v2 = adapt_legacy_record(legacy_record, field_names=_FAMILY_FIELDS[resolved_family])
+        source_root = source_path.parent if _relative_to is None else _relative_to
+        record_v2 = adapt_legacy_record(
+            legacy_record,
+            field_names=_FAMILY_FIELDS[resolved_family],
+            artifact_root=source_root,
+        )
     except Exception as exc:
         return ReprocessResult(
             source_path, "failed", family=resolved_family, stage="adaptation",
@@ -187,7 +193,10 @@ def reprocess_snapshot(
     envelope = {
         "schema_version": V2_SCHEMA_VERSION,
         "family": resolved_family,
+        # Kept for readers of NORM-P1-003 sidecars; the structured reference is
+        # the portable V2 location interpreted against the explicit source root.
         "source_artifact": source_path.name if _relative_to is None else source_path.relative_to(_relative_to).as_posix(),
+        "source_artifact_ref": PortableArtifactRef.from_path(source_path, root=source_root).to_dict(),
         "record": record_v2,
     }
     try:

@@ -49,6 +49,43 @@ class ContractAdapterTests(unittest.TestCase):
             self.assertEqual(first.name, "sample.v2.json")  # type: ignore[union-attr]
             self.assertEqual(first.parent.name, "v2")  # type: ignore[union-attr]
 
+    def test_flag_on_adds_portable_ref_without_changing_legacy_path(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+            root = Path(directory)
+            snapshot = root / "candidates" / "record.json"
+            snapshot.parent.mkdir()
+            snapshot.write_text("{}", encoding="utf-8")
+            legacy = root / "sample_latest.csv"
+            records = [{"processo": "123", "json_path": str(snapshot)}]
+            sidecar = write_csv_with_v2(
+                records,
+                legacy,
+                columns=("processo", "json_path"),
+                enabled=True,
+                artifact_root=root,
+            )
+            legacy_text = legacy.read_text(encoding="utf-8-sig")
+            payload = json.loads(sidecar.read_text(encoding="utf-8"))  # type: ignore[union-attr]
+            self.assertIn(str(snapshot), legacy_text)
+            self.assertEqual(payload["records"][0]["artifact_ref"], {
+                "root_kind": "artifact_root", "relative_path": "candidates/record.json",
+            })
+            self.assertNotIn(str(root), sidecar.read_text(encoding="utf-8"))  # type: ignore[union-attr]
+
+    def test_external_legacy_path_is_diagnostic_not_fabricated(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+            root = Path(directory)
+            adapted = adapt_legacy_record(
+                {"processo": "123", "json_path": str(root.parent / "external.json")},
+                artifact_root=root,
+            )
+            self.assertNotIn("artifact_ref", adapted)
+            self.assertIn("json_path_not_portable", adapted["diagnostics"])
+
+    def test_previous_v2_payload_without_portable_ref_remains_supported(self) -> None:
+        adapted = adapt_legacy_record({"processo": "123", "json_path": "legacy.json"})
+        self.assertNotIn("artifact_ref", adapted)
+
     def test_ambiguous_identity_empty_field_and_partial_found_are_honest(self) -> None:
         adapted = adapt_legacy_record(
             {"processo": "123", "documento": "123", "found": True, "campo": ""},

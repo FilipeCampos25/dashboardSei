@@ -12,6 +12,7 @@ from app.output import csv_writer
 from app.services.field_states import FieldResult, FieldState
 from app.services.gold_contracts import FieldEvidence, SourceKind
 from app.services.normalization_contract import DocumentIdentity
+from app.services.portable_paths import PortableArtifactRef, PortablePathError
 from app.services.pipeline_states import (
     AccessState,
     AcquisitionState,
@@ -54,6 +55,8 @@ def adapt_legacy_record(
     payload: Mapping[str, Any],
     *,
     field_names: Sequence[str] = (),
+    artifact_root: str | Path | None = None,
+    artifact_path_fields: Sequence[str] = ("candidate_json_path", "json_path"),
 ) -> dict[str, Any]:
     """Translate only facts that the generic legacy shape proves.
 
@@ -98,13 +101,28 @@ def adapt_legacy_record(
     if payload.get("publication_status") not in (None, ""):
         diagnostics.append("legacy_publication_status_not_expanded")
 
-    return {
+    artifact_ref = None
+    if artifact_root is not None:
+        for field_name in artifact_path_fields:
+            raw_path = _optional_text(payload.get(field_name))
+            if raw_path is None:
+                continue
+            try:
+                artifact_ref = PortableArtifactRef.from_path(raw_path, root=artifact_root).to_dict()
+            except PortablePathError:
+                diagnostics.append(f"{field_name}_not_portable")
+            break
+
+    adapted = {
         "identity": identity.to_dict(),
         "acquisition_state": acquisition.to_dict(),
         "semantic_state": semantic.to_dict(),
         "fields": [field.to_dict() for field in fields],
         "diagnostics": diagnostics,
     }
+    if artifact_ref is not None:
+        adapted["artifact_ref"] = artifact_ref
+    return adapted
 
 
 def _adapt_field(name: str, legacy_value: Any, identity: DocumentIdentity) -> FieldResult:
@@ -171,6 +189,7 @@ def write_csv_with_v2(
     columns: Sequence[str] | None = None,
     field_names: Sequence[str] = (),
     enabled: bool | None = None,
+    artifact_root: str | Path | None = None,
 ) -> Path | None:
     """Write the unchanged legacy CSV and an optional, separate V2 sidecar.
 
@@ -186,6 +205,13 @@ def write_csv_with_v2(
     envelope = {
         "schema_version": V2_SCHEMA_VERSION,
         "legacy_artifact": Path(filepath).name,
-        "records": [adapt_legacy_record(record, field_names=field_names) for record in records],
+        "records": [
+            adapt_legacy_record(
+                record,
+                field_names=field_names,
+                artifact_root=Path(filepath).parent if artifact_root is None else artifact_root,
+            )
+            for record in records
+        ],
     }
     return write_v2_sidecar(v2_sidecar_path(filepath), envelope)

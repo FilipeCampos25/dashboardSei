@@ -51,6 +51,11 @@ class OfflineReprocessorTests(unittest.TestCase):
             payload = json.loads(result.output.read_text(encoding="utf-8"))
             self.assertEqual(payload["family"], "act")
             self.assertEqual(payload["record"]["identity"]["process_id"], "PROCESSO-EXEMPLO-002")
+            self.assertEqual(payload["source_artifact_ref"], {
+                "root_kind": "artifact_root", "relative_path": "act_pdf_extracted.json",
+            })
+            self.assertEqual(payload["record"]["artifact_ref"], payload["source_artifact_ref"])
+            self.assertNotIn(str(FIXTURES), result.output.read_text(encoding="utf-8"))
         self.assertEqual((source.stat().st_size, _digest(source)), before)
 
     def test_all_supported_families_dispatch_to_offline_builders(self) -> None:
