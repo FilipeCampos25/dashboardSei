@@ -10,6 +10,13 @@ from typing import Any, Callable, Mapping, Sequence
 from app.config import get_settings
 from app.services.contract_adapters import V2_SCHEMA_VERSION, adapt_legacy_record, write_v2_sidecar
 from app.services.portable_paths import PortableArtifactRef
+from app.services.pipeline_states import (
+    AccessState,
+    AcquisitionState,
+    DiscoveryState,
+    ExtractionState,
+    OpeningState,
+)
 
 
 SUPPORTED_FAMILIES = ("act", "pt", "ted", "administrative")
@@ -64,6 +71,7 @@ class ReprocessResult:
     output: Path | None = None
     stage: str | None = None
     reason: str | None = None
+    backfill: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -82,6 +90,43 @@ class ReprocessReport:
     def unresolved(self) -> int:
         return sum(item.status == "unresolved" for item in self.results)
 
+    @property
+    def backfill_summary(self) -> dict[str, Any]:
+        summary: dict[str, Any] = {
+            "records": self.processed,
+            "identity_recovered": {"process_id": 0, "document_id": 0, "candidate_id": 0},
+            "identity_missing": 0,
+            "states": {name: {} for name in ("discovery", "opening", "access", "extraction")},
+            "not_inferable": 0,
+            "conflicts": 0,
+        }
+        for result in self.results:
+            metadata = result.backfill
+            if result.status != "processed" or not isinstance(metadata, Mapping):
+                continue
+            fields = metadata.get("fields", {})
+            for name in summary["identity_recovered"]:
+                if fields.get(f"identity.{name}", {}).get("classification") in {"observed", "derived"}:
+                    summary["identity_recovered"][name] += 1
+            if not any(summary_field.get("value_present") for summary_field in (
+                fields.get("identity.document_id", {}), fields.get("identity.candidate_id", {})
+            )):
+                summary["identity_missing"] += 1
+            for dimension in summary["states"]:
+                detail = fields.get(f"acquisition_state.{dimension}", {})
+                value = str(detail.get("value", ""))
+                if value:
+                    summary["states"][dimension][value] = summary["states"][dimension].get(value, 0) + 1
+            summary["not_inferable"] += sum(
+                detail.get("classification") == "not_inferable" for detail in fields.values()
+            )
+            summary["conflicts"] += len(metadata.get("conflicts", ()))
+        for values in summary["states"].values():
+            ordered = dict(sorted(values.items()))
+            values.clear()
+            values.update(ordered)
+        return summary
+
 
 def _clean_signal(value: Any) -> str | None:
     if value is None:
@@ -92,6 +137,123 @@ def _clean_signal(value: Any) -> str | None:
 def _fixture_payload(document: Mapping[str, Any]) -> Mapping[str, Any]:
     payload = document.get("payload")
     return payload if isinstance(payload, Mapping) else document
+
+
+def _historical_backfill(document: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Recover only V2 facts supported by persisted historical evidence."""
+
+    from app.documents.common import identity_from_source_url
+
+    payload = _fixture_payload(document)
+    snapshot = payload.get("snapshot") if isinstance(payload.get("snapshot"), Mapping) else {}
+    collection = payload.get("collection") if isinstance(payload.get("collection"), Mapping) else {}
+    explicit_identity = payload.get("identity") if isinstance(payload.get("identity"), Mapping) else {}
+    containers = (explicit_identity, payload, collection)
+    fields: dict[str, dict[str, Any]] = {}
+    conflicts: list[str] = []
+
+    def candidates(name: str) -> set[str]:
+        return {
+            str(container.get(name)).strip()
+            for container in containers
+            if container.get(name) not in (None, "")
+        }
+
+    process_values = candidates("process_id") | candidates("processo")
+    process_id = next(iter(process_values)) if len(process_values) == 1 else ""
+    if len(process_values) > 1:
+        conflicts.append("identity.process_id")
+    fields["identity.process_id"] = {
+        "classification": "observed" if process_id else "conflict" if process_values else "not_inferable",
+        "reason": "explicit_legacy_process" if process_id else "conflicting_sources" if process_values else "not_observable_in_legacy",
+        "value_present": bool(process_id),
+    }
+
+    source_values = candidates("source_url")
+    persisted_url = str(snapshot.get("url") or "").strip()
+    if persisted_url:
+        source_values.add(persisted_url)
+    source_url = next(iter(source_values)) if len(source_values) == 1 else None
+    if len(source_values) > 1:
+        conflicts.append("identity.source_url")
+    fields["identity.source_url"] = {
+        "classification": "observed" if source_url else "conflict" if source_values else "not_inferable",
+        "reason": "persisted_source_url" if source_url else "conflicting_sources" if source_values else "not_observable_in_legacy",
+        "value_present": bool(source_url),
+    }
+    url_identity = identity_from_source_url(source_url) if source_url else {}
+
+    identity: dict[str, Any] = {"process_id": process_id, "source_url": source_url}
+    for name in ("document_id", "candidate_id"):
+        explicit = candidates(name)
+        structured = str(url_identity.get(name) or "").strip()
+        all_values = explicit | ({structured} if structured else set())
+        value = next(iter(all_values)) if len(all_values) == 1 else None
+        if len(all_values) > 1:
+            conflicts.append(f"identity.{name}")
+        classification = (
+            "observed" if value and value in explicit else "derived" if value else
+            "conflict" if all_values else "not_inferable"
+        )
+        reason = (
+            "explicit_identifier" if classification == "observed" else
+            "structured_source_url" if classification == "derived" else
+            "conflicting_sources" if classification == "conflict" else "not_observable_in_legacy"
+        )
+        identity[name] = value
+        fields[f"identity.{name}"] = {
+            "classification": classification, "reason": reason, "value_present": bool(value)
+        }
+
+    explicit_state = payload.get("acquisition_state")
+    if isinstance(explicit_state, Mapping):
+        acquisition = AcquisitionState.from_dict(explicit_state)
+        for dimension, value in acquisition.to_dict().items():
+            fields[f"acquisition_state.{dimension}"] = {
+                "classification": "observed", "reason": "explicit_acquisition_state", "value": value
+            }
+    else:
+        found_values = {container.get("found") for container in (payload, collection) if isinstance(container.get("found"), bool)}
+        if found_values == {True}:
+            discovery = DiscoveryState.FOUND
+            discovery_classification, discovery_reason = "derived", "legacy_found_true"
+        elif found_values == {False}:
+            discovery = DiscoveryState.NOT_FOUND
+            discovery_classification, discovery_reason = "derived", "legacy_found_false"
+        elif len(found_values) > 1:
+            discovery = DiscoveryState.NOT_SEARCHED
+            discovery_classification, discovery_reason = "conflict", "conflicting_found_sources"
+            conflicts.append("acquisition_state.discovery")
+        else:
+            discovery = DiscoveryState.NOT_SEARCHED
+            discovery_classification, discovery_reason = "not_inferable", "not_observable_in_legacy"
+
+        extraction_error = str(snapshot.get("extraction_error") or collection.get("extraction_error") or "").strip()
+        if discovery is DiscoveryState.FOUND and extraction_error:
+            acquisition = AcquisitionState(
+                discovery, OpeningState.OPENED, AccessState.ACCESSIBLE, ExtractionState.EXTRACTION_FAILED
+            )
+            later = {
+                "opening": ("derived", "explicit_extractor_failure"),
+                "access": ("derived", "explicit_extractor_failure"),
+                "extraction": ("observed", "explicit_extraction_error"),
+            }
+        else:
+            acquisition = AcquisitionState(
+                discovery, OpeningState.NOT_ATTEMPTED, AccessState.UNKNOWN, ExtractionState.NOT_ATTEMPTED
+            )
+            later = {name: ("not_inferable", "not_observable_in_legacy") for name in ("opening", "access", "extraction")}
+        fields["acquisition_state.discovery"] = {
+            "classification": discovery_classification, "reason": discovery_reason, "value": acquisition.discovery.value
+        }
+        state_dict = acquisition.to_dict()
+        for dimension, (classification, reason) in later.items():
+            fields[f"acquisition_state.{dimension}"] = {
+                "classification": classification, "reason": reason, "value": state_dict[dimension]
+            }
+
+    metadata = {"fields": fields, "conflicts": sorted(conflicts)}
+    return {"identity": identity, "acquisition_state": acquisition.to_dict()}, metadata
 
 
 def determine_family(document: Mapping[str, Any], *, explicit: str | None = None) -> str:
@@ -184,6 +346,10 @@ def reprocess_snapshot(
             field_names=_FAMILY_FIELDS[resolved_family],
             artifact_root=source_root,
         )
+        recovered, backfill_metadata = _historical_backfill(document)
+        record_v2["identity"] = recovered["identity"]
+        record_v2["acquisition_state"] = recovered["acquisition_state"]
+        record_v2["backfill_metadata"] = backfill_metadata
     except Exception as exc:
         return ReprocessResult(
             source_path, "failed", family=resolved_family, stage="adaptation",
@@ -206,7 +372,9 @@ def reprocess_snapshot(
             source_path, "failed", family=resolved_family, stage="writing",
             reason=f"{type(exc).__name__}: {exc}",
         )
-    return ReprocessResult(source_path, "processed", family=resolved_family, output=target)
+    return ReprocessResult(
+        source_path, "processed", family=resolved_family, output=target, backfill=backfill_metadata
+    )
 
 
 def reprocess_directory(
