@@ -986,6 +986,9 @@ def extract_document_snapshot(driver: Any, logger: Any = None) -> Dict[str, Any]
             "extraction_complete": False,
             "extraction_partial": False,
             "extraction_error": "",
+            "access_state": "",
+            "diagnostic_code": "",
+            "diagnostic_stage": "",
         },
     }
     try:
@@ -999,6 +1002,13 @@ def extract_document_snapshot(driver: Any, logger: Any = None) -> Dict[str, Any]
         )
         visualizacao_log_state: Dict[str, Any] = {}
         if not _switch_to_visualizacao_iframe(driver, logger=logger, log_state=visualizacao_log_state):
+            snapshot["acquisition_observation"].update(
+                {
+                    "access_state": "IFRAME_UNAVAILABLE",
+                    "diagnostic_code": "IFRAME_UNAVAILABLE",
+                    "diagnostic_stage": "access",
+                }
+            )
             _log(logger, "warning", "Snapshot PT: extracao abortada; iframe de visualizacao indisponivel.")
             return snapshot
 
@@ -1136,6 +1146,8 @@ def extract_document_snapshot(driver: Any, logger: Any = None) -> Dict[str, Any]
         )
     except WebDriverException as exc:
         snapshot["acquisition_observation"]["extraction_error"] = str(exc)
+        snapshot["acquisition_observation"]["diagnostic_code"] = "EXTRACTION_FAILED"
+        snapshot["acquisition_observation"]["diagnostic_stage"] = "extraction"
         _log(logger, "warning", "Visualizacao: falha ao montar snapshot (%s).", exc)
     finally:
         try:

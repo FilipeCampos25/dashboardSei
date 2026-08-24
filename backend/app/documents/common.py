@@ -136,11 +136,16 @@ def build_acquisition_state(
         return state
 
     opening = state.opening
-    if observation.get("opening_attempted") is True:
+    if observation.get("opening_timeout") is True:
+        opening = OpeningState.TIMEOUT
+    elif observation.get("opening_attempted") is True:
         opening = OpeningState.OPENED if observation.get("opened") is True else OpeningState.OPEN_FAILED
 
     access = state.access
-    if observation.get("access_observed") is True:
+    observed_access_state = observation.get("access_state")
+    if observed_access_state in {AccessState.ACCESS_RESTRICTED.value, AccessState.IFRAME_UNAVAILABLE.value}:
+        access = AccessState(observed_access_state)
+    elif observation.get("access_observed") is True:
         access = AccessState.ACCESSIBLE
 
     extraction = state.extraction
@@ -156,6 +161,28 @@ def build_acquisition_state(
             extraction = ExtractionState.EXTRACTED if has_content else ExtractionState.EMPTY_CONTENT
 
     return AcquisitionState(state.discovery, opening, access, extraction)
+
+
+def acquisition_diagnostic_payload(
+    collection_context: Optional[dict[str, Any]] = None,
+    snapshot: Optional[dict[str, Any]] = None,
+) -> dict[str, str]:
+    """Return the additive controlled technical cause, without inferring one."""
+    context = collection_context or {}
+    observation = (snapshot or {}).get("acquisition_observation")
+    observed = observation if isinstance(observation, dict) else {}
+    code = str(observed.get("diagnostic_code") or context.get("acquisition_diagnostic_code") or "").strip()
+    stage = str(observed.get("diagnostic_stage") or context.get("acquisition_diagnostic_stage") or "").strip()
+    allowed = {
+        "IFRAME_UNAVAILABLE": "access",
+        "ACCESS_RESTRICTED": "access",
+        "TIMEOUT": "opening",
+        "EMPTY_CONTENT": "extraction",
+        "EXTRACTION_FAILED": "extraction",
+    }
+    if code not in allowed or stage != allowed[code]:
+        return {"code": "", "stage": ""}
+    return {"code": code, "stage": stage}
 
 
 def acquisition_state_payload(
@@ -212,6 +239,7 @@ def save_snapshot_json(
         sanitized_snapshot,
     )
     acquisition_state = acquisition_state_payload(collection, sanitized_snapshot)
+    acquisition_diagnostic = acquisition_diagnostic_payload(collection, sanitized_snapshot)
     payload: Dict[str, Any] = {
         "captured_at": datetime.now().isoformat(timespec="seconds"),
         "document_type": spec.key,
@@ -223,6 +251,7 @@ def save_snapshot_json(
         "source_url": identity["source_url"],
         "identity": identity,
         "acquisition_state": acquisition_state,
+        "acquisition_diagnostic": acquisition_diagnostic,
         "snapshot": sanitized_snapshot,
     }
     if extra_payload:
@@ -256,6 +285,7 @@ def build_basic_tracking_record(
     sanitized_snapshot = sanitize_snapshot(snapshot)
     identity = build_document_identity(processo, collection_context, sanitized_snapshot)
     acquisition_state = acquisition_state_payload(collection_context, sanitized_snapshot)
+    acquisition_diagnostic = acquisition_diagnostic_payload(collection_context, sanitized_snapshot)
     record = {
         "captured_at": datetime.now().isoformat(timespec="seconds"),
         "document_type": spec.key,
@@ -264,6 +294,8 @@ def build_basic_tracking_record(
         **identity,
         "acquisition_state": acquisition_state,
         "acquisition_state_v2": json.dumps(acquisition_state, ensure_ascii=False, sort_keys=True),
+        "acquisition_diagnostic_code": acquisition_diagnostic["code"],
+        "acquisition_diagnostic_stage": acquisition_diagnostic["stage"],
         "snapshot_mode": (sanitized_snapshot.get("extraction_mode", "") or ""),
         "text_chars": len(sanitized_snapshot.get("text", "") or ""),
         "tables_count": len(sanitized_snapshot.get("tables", []) or []),

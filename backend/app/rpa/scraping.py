@@ -26,7 +26,12 @@ from app.config import ensure_online_operation_allowed, get_settings
 from app.core.driver_factory import create_chrome_driver
 from app.core.logging_config import setup_logger
 from app.documents import resolve_document_types
-from app.documents.common import acquisition_state_payload, identity_from_source_url, sanitize_snapshot
+from app.documents.common import (
+    acquisition_diagnostic_payload,
+    acquisition_state_payload,
+    identity_from_source_url,
+    sanitize_snapshot,
+)
 from app.documents.document_utils import should_skip_candidate
 from app.documents.ted import build_ted_document_type
 from app.documents.types import DocumentTypeSpec
@@ -2898,6 +2903,7 @@ class SEIScraper:
                             attempt_context,
                             {"acquisition_observation": {"opening_attempted": True, "opened": False}},
                         )
+                        collection_context = attempt_context
                         self.abrir_documento_no_filtro(
                             position=hit.selected_position,
                             timeout_seconds=self.timeout_seconds,
@@ -3015,6 +3021,7 @@ class SEIScraper:
             )
             return False
         except (TimeoutException, NoSuchElementException) as exc:
+            previous_context = dict(collection_context)
             if self._is_search_context_stagnation_timeout(exc):
                 self._set_process_filter_degraded_state(processo, True)
                 self._invalidate_process_filter_session(processo, clear_hint=True)
@@ -3037,6 +3044,23 @@ class SEIScraper:
                 selection_detail=collection_context.get("selection_detail", ""),
                 extraction_error=str(exc),
             )
+            previous_state = previous_context.get("acquisition_state")
+            opening_timed_out = (
+                isinstance(exc, TimeoutException)
+                and isinstance(previous_state, dict)
+                and previous_state.get("discovery") == "FOUND"
+                and previous_state.get("opening") == "OPEN_FAILED"
+            )
+            if opening_timed_out:
+                collection_context["acquisition_state"] = acquisition_state_payload(
+                    collection_context,
+                    {"acquisition_observation": {"opening_timeout": True}},
+                )
+                collection_context["acquisition_diagnostic_code"] = "TIMEOUT"
+                collection_context["acquisition_diagnostic_stage"] = "opening"
+                for field_name in ("process_id", "document_id", "candidate_id", "source_url"):
+                    if previous_context.get(field_name):
+                        collection_context[field_name] = previous_context[field_name]
             self._record_document_search_outcome(processo, document_type, collection_context)
             self.logger.warning(
                 "Processo %s: falha resiliente ao buscar/abrir '%s' (%s); seguindo.",
@@ -4455,10 +4479,30 @@ class SEIScraper:
                     collection_context,
                     snapshot,
                 )
+                acquisition_diagnostic = acquisition_diagnostic_payload(collection_context, snapshot)
+                collection_context["acquisition_diagnostic_code"] = acquisition_diagnostic["code"]
+                collection_context["acquisition_diagnostic_stage"] = acquisition_diagnostic["stage"]
                 observed_identity = identity_from_source_url(snapshot.get("url"))
                 for field_name in ("document_id", "candidate_id", "source_url"):
                     if not collection_context.get(field_name) and observed_identity.get(field_name):
                         collection_context[field_name] = observed_identity[field_name]
+                extraction_state = collection_context["acquisition_state"]["extraction"]
+                technical_code = collection_context["acquisition_diagnostic_code"]
+                must_stop_without_classification = (
+                    extraction_state in {"EMPTY_CONTENT", "EXTRACTION_FAILED"}
+                    or technical_code in {"IFRAME_UNAVAILABLE", "ACCESS_RESTRICTED"}
+                )
+                if must_stop_without_classification:
+                    if extraction_state == "EMPTY_CONTENT":
+                        collection_context["acquisition_diagnostic_code"] = "EMPTY_CONTENT"
+                        collection_context["acquisition_diagnostic_stage"] = "extraction"
+                    self._record_document_extraction_failure(
+                        processo=processo,
+                        protocolo_documento=protocolo_documento,
+                        document_type=document_type,
+                        collection_context=collection_context,
+                    )
+                    return False
                 is_valid, validation_reason, analysis = self._validate_snapshot_for_document_type(
                     processo,
                     document_type,
@@ -4554,12 +4598,16 @@ class SEIScraper:
                 failure_context = dict(collection_context or {})
                 failure_context["captured_at"] = datetime.now().isoformat(timespec="seconds")
                 failure_context["extraction_error"] = str(exc)
+                failure_context["acquisition_diagnostic_code"] = "EXTRACTION_FAILED"
+                failure_context["acquisition_diagnostic_stage"] = "extraction"
                 failure_context["acquisition_state"] = acquisition_state_payload(
                     failure_context,
                     {
                         "acquisition_observation": {
                             "extraction_attempted": True,
                             "extraction_error": str(exc),
+                            "diagnostic_code": "EXTRACTION_FAILED",
+                            "diagnostic_stage": "extraction",
                         }
                     },
                 )

@@ -131,6 +131,8 @@ class PTDocumentHandler:
             "candidate_id",
             "source_url",
             "acquisition_state_v2",
+            "acquisition_diagnostic_code",
+            "acquisition_diagnostic_stage",
             "found",
             "found_in",
             "search_term",
@@ -323,6 +325,10 @@ class PTDocumentHandler:
                 "captured_at": context.get("captured_at", ""),
                 "processo": processo,
                 "documento": context.get("chosen_documento", ""),
+                "process_id": context.get("process_id", processo),
+                "document_id": context.get("document_id"),
+                "candidate_id": context.get("candidate_id"),
+                "source_url": context.get("source_url"),
                 "found": bool(context.get("found")),
                 "found_in": context.get("found_in", ""),
                 "search_term": context.get("search_term", ""),
@@ -349,6 +355,8 @@ class PTDocumentHandler:
                 "json_path": "",
                 "acquisition_state": acquisition_state,
                 "acquisition_state_v2": json.dumps(acquisition_state, sort_keys=True),
+                "acquisition_diagnostic_code": context.get("acquisition_diagnostic_code", ""),
+                "acquisition_diagnostic_stage": context.get("acquisition_diagnostic_stage", ""),
             }
         )
 
@@ -368,6 +376,10 @@ class PTDocumentHandler:
                 "captured_at": context.get("captured_at", ""),
                 "processo": processo,
                 "documento": protocolo_documento,
+                "process_id": context.get("process_id", processo),
+                "document_id": context.get("document_id"),
+                "candidate_id": context.get("candidate_id"),
+                "source_url": context.get("source_url"),
                 "found": bool(context.get("found")),
                 "found_in": context.get("found_in", ""),
                 "search_term": context.get("search_term", ""),
@@ -394,6 +406,8 @@ class PTDocumentHandler:
                 "json_path": "",
                 "acquisition_state": acquisition_state,
                 "acquisition_state_v2": json.dumps(acquisition_state, sort_keys=True),
+                "acquisition_diagnostic_code": context.get("acquisition_diagnostic_code", ""),
+                "acquisition_diagnostic_stage": context.get("acquisition_diagnostic_stage", ""),
             }
         )
 

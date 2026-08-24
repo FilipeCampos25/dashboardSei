@@ -51,6 +51,21 @@ def _optional_text(value: Any) -> str | None:
     return text or None
 
 
+def _adapt_acquisition_diagnostic(payload: Mapping[str, Any]) -> dict[str, str]:
+    code = _optional_text(payload.get("acquisition_diagnostic_code")) or ""
+    stage = _optional_text(payload.get("acquisition_diagnostic_stage")) or ""
+    allowed = {
+        "IFRAME_UNAVAILABLE": "access",
+        "ACCESS_RESTRICTED": "access",
+        "TIMEOUT": "opening",
+        "EMPTY_CONTENT": "extraction",
+        "EXTRACTION_FAILED": "extraction",
+    }
+    if code not in allowed or stage != allowed[code]:
+        return {"code": "", "stage": ""}
+    return {"code": code, "stage": stage}
+
+
 def adapt_legacy_record(
     payload: Mapping[str, Any],
     *,
@@ -121,6 +136,7 @@ def adapt_legacy_record(
     adapted = {
         "identity": identity.to_dict(),
         "acquisition_state": acquisition.to_dict(),
+        "acquisition_diagnostic": _adapt_acquisition_diagnostic(payload),
         "semantic_state": semantic.to_dict(),
         "fields": [field.to_dict() for field in fields],
         "diagnostics": diagnostics,
