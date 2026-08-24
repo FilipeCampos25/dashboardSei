@@ -26,7 +26,7 @@ from app.config import ensure_online_operation_allowed, get_settings
 from app.core.driver_factory import create_chrome_driver
 from app.core.logging_config import setup_logger
 from app.documents import resolve_document_types
-from app.documents.common import identity_from_source_url, sanitize_snapshot
+from app.documents.common import acquisition_state_payload, identity_from_source_url, sanitize_snapshot
 from app.documents.document_utils import should_skip_candidate
 from app.documents.ted import build_ted_document_type
 from app.documents.types import DocumentTypeSpec
@@ -1824,7 +1824,7 @@ class SEIScraper:
         selection_detail: str = "",
         extraction_error: str = "",
     ) -> Dict[str, Any]:
-        return {
+        context = {
             "captured_at": datetime.now().isoformat(timespec="seconds"),
             "found": found,
             "found_in": found_in,
@@ -1835,6 +1835,8 @@ class SEIScraper:
             "selection_detail": selection_detail,
             "extraction_error": extraction_error,
         }
+        context["acquisition_state"] = acquisition_state_payload(context)
+        return context
 
     def _collect_pesquisa_diagnostics(self) -> Dict[str, Any]:
         try:
@@ -2541,6 +2543,10 @@ class SEIScraper:
             )
             for field_name in ("document_id", "candidate_id", "source_url"):
                 collection_context[field_name] = candidate.get(field_name)
+            collection_context["acquisition_state"] = acquisition_state_payload(
+                collection_context,
+                {"acquisition_observation": {"opening_attempted": True, "opened": True}},
+            )
             snapshot_saved = self._extract_and_process_document_snapshot(
                 processo=processo,
                 protocolo_documento=processo,
@@ -2811,6 +2817,7 @@ class SEIScraper:
                     )
                     if getattr(hit, "row_text", ""):
                         attempt_context["candidate_row_text"] = str(getattr(hit, "row_text", "") or "")
+                    collection_context = attempt_context
                     try:
                         if hit.selected_position > 1:
                             reused_results = self._try_restore_filter_results_session(
@@ -2887,9 +2894,17 @@ class SEIScraper:
                             hit.protocolo,
                         )
                         handles_before_click = set(self.driver.window_handles)
+                        attempt_context["acquisition_state"] = acquisition_state_payload(
+                            attempt_context,
+                            {"acquisition_observation": {"opening_attempted": True, "opened": False}},
+                        )
                         self.abrir_documento_no_filtro(
                             position=hit.selected_position,
                             timeout_seconds=self.timeout_seconds,
+                        )
+                        attempt_context["acquisition_state"] = acquisition_state_payload(
+                            attempt_context,
+                            {"acquisition_observation": {"opening_attempted": True, "opened": True}},
                         )
                         handles_after_click = set(self.driver.window_handles)
                         attempt_opened_doc_handles = handles_after_click - handles_before_click
@@ -4417,6 +4432,8 @@ class SEIScraper:
             self.performance_profiler.start_span(snapshot_span_name)
         try:
             try:
+                if collection_context is None:
+                    collection_context = {}
                 iframe_info = get_iframes_info(self.driver)
                 self.logger.info(
                     "Processo %s: iniciando snapshot %s. contexto_pre_snapshot url=%s title=%s iframes=%d",
@@ -4434,9 +4451,11 @@ class SEIScraper:
                         logger=self.logger,
                     )
                 )
+                collection_context["acquisition_state"] = acquisition_state_payload(
+                    collection_context,
+                    snapshot,
+                )
                 observed_identity = identity_from_source_url(snapshot.get("url"))
-                if collection_context is None:
-                    collection_context = {}
                 for field_name in ("document_id", "candidate_id", "source_url"):
                     if not collection_context.get(field_name) and observed_identity.get(field_name):
                         collection_context[field_name] = observed_identity[field_name]
@@ -4535,6 +4554,15 @@ class SEIScraper:
                 failure_context = dict(collection_context or {})
                 failure_context["captured_at"] = datetime.now().isoformat(timespec="seconds")
                 failure_context["extraction_error"] = str(exc)
+                failure_context["acquisition_state"] = acquisition_state_payload(
+                    failure_context,
+                    {
+                        "acquisition_observation": {
+                            "extraction_attempted": True,
+                            "extraction_error": str(exc),
+                        }
+                    },
+                )
                 self._record_document_extraction_failure(
                     processo=processo,
                     protocolo_documento=protocolo_documento,

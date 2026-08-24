@@ -980,6 +980,13 @@ def extract_document_snapshot(driver: Any, logger: Any = None) -> Dict[str, Any]
         "url": "",
         "title": "",
         "extraction_mode": "html_dom",
+        "acquisition_observation": {
+            "access_observed": False,
+            "extraction_attempted": False,
+            "extraction_complete": False,
+            "extraction_partial": False,
+            "extraction_error": "",
+        },
     }
     try:
         snapshot_started_at = time.time()
@@ -994,6 +1001,9 @@ def extract_document_snapshot(driver: Any, logger: Any = None) -> Dict[str, Any]
         if not _switch_to_visualizacao_iframe(driver, logger=logger, log_state=visualizacao_log_state):
             _log(logger, "warning", "Snapshot PT: extracao abortada; iframe de visualizacao indisponivel.")
             return snapshot
+
+        snapshot["acquisition_observation"]["access_observed"] = True
+        snapshot["acquisition_observation"]["extraction_attempted"] = True
 
         snapshot.update(_read_visualizacao_state(driver))
         should_force_file_fallback = False
@@ -1101,6 +1111,7 @@ def extract_document_snapshot(driver: Any, logger: Any = None) -> Dict[str, Any]
                 snapshot["extraction_mode"] = str(fallback.get("mode") or "pdf_fallback")
                 if fallback.get("source_url"):
                     snapshot["url"] = str(fallback.get("source_url"))
+                snapshot["acquisition_observation"]["extraction_complete"] = True
                 _log(
                     logger,
                     "info",
@@ -1111,6 +1122,7 @@ def extract_document_snapshot(driver: Any, logger: Any = None) -> Dict[str, Any]
                 return snapshot
 
         snapshot["tables"] = _extract_tables_in_current_context(driver)
+        snapshot["acquisition_observation"]["extraction_complete"] = True
         _log(
             logger,
             "info",
@@ -1123,6 +1135,7 @@ def extract_document_snapshot(driver: Any, logger: Any = None) -> Dict[str, Any]
             _truncate(snapshot["text"], 280),
         )
     except WebDriverException as exc:
+        snapshot["acquisition_observation"]["extraction_error"] = str(exc)
         _log(logger, "warning", "Visualizacao: falha ao montar snapshot (%s).", exc)
     finally:
         try:

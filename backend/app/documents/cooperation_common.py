@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from app.documents.common import (
+    acquisition_state_payload,
     build_basic_tracking_record,
     derive_search_outcome_status,
     sanitize_snapshot,
@@ -203,6 +204,7 @@ class CooperationDocumentHandler:
         sanitized_context = sanitize_text_payload(collection_context)
         context = sanitized_context if isinstance(sanitized_context, dict) else collection_context
         outcome_status = derive_search_outcome_status(context)
+        acquisition_state = acquisition_state_payload(context)
         self._tracking_records.append(
             {
                 "captured_at": context.get("captured_at", ""),
@@ -231,6 +233,8 @@ class CooperationDocumentHandler:
                 "normalization_status": outcome_status["normalization_status"],
                 "discard_reason": outcome_status["discard_reason"],
                 "classification_reason": "",
+                "acquisition_state": acquisition_state,
+                "acquisition_state_v2": json.dumps(acquisition_state, sort_keys=True),
             }
         )
 
@@ -244,6 +248,7 @@ class CooperationDocumentHandler:
     ) -> None:
         sanitized_context = sanitize_text_payload(collection_context)
         context = sanitized_context if isinstance(sanitized_context, dict) else collection_context
+        acquisition_state = acquisition_state_payload(context)
         self._tracking_records.append(
             {
                 "captured_at": context.get("captured_at", ""),
@@ -272,6 +277,8 @@ class CooperationDocumentHandler:
                 "normalization_status": "extraction_failure",
                 "discard_reason": "extraction_failure",
                 "classification_reason": "",
+                "acquisition_state": acquisition_state,
+                "acquisition_state_v2": json.dumps(acquisition_state, sort_keys=True),
             }
         )
 
@@ -298,6 +305,7 @@ class CooperationDocumentHandler:
             "document_id",
             "candidate_id",
             "source_url",
+            "acquisition_state_v2",
             "found",
             "found_in",
             "search_term",

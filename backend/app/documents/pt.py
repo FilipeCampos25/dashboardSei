@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import json
 import re
 from datetime import datetime
 from pathlib import Path
@@ -9,6 +10,7 @@ from typing import Any, Dict, List, Optional
 
 from app.core.raw_date_field_collector import collect_raw_fields, export_raw_fields_csv
 from app.documents.common import (
+    acquisition_state_payload,
     build_basic_tracking_record,
     derive_search_outcome_status,
     sanitize_snapshot,
@@ -128,6 +130,7 @@ class PTDocumentHandler:
             "document_id",
             "candidate_id",
             "source_url",
+            "acquisition_state_v2",
             "found",
             "found_in",
             "search_term",
@@ -314,6 +317,7 @@ class PTDocumentHandler:
         sanitized_context = sanitize_text_payload(collection_context)
         context = sanitized_context if isinstance(sanitized_context, dict) else collection_context
         outcome_status = derive_search_outcome_status(context)
+        acquisition_state = acquisition_state_payload(context)
         self._tracking_records.append(
             {
                 "captured_at": context.get("captured_at", ""),
@@ -343,6 +347,8 @@ class PTDocumentHandler:
                 "publication_status": PUBLICATION_STATUS_SILVER,
                 "normalization_status": outcome_status["normalization_status"],
                 "json_path": "",
+                "acquisition_state": acquisition_state,
+                "acquisition_state_v2": json.dumps(acquisition_state, sort_keys=True),
             }
         )
 
@@ -356,6 +362,7 @@ class PTDocumentHandler:
     ) -> None:
         sanitized_context = sanitize_text_payload(collection_context)
         context = sanitized_context if isinstance(sanitized_context, dict) else collection_context
+        acquisition_state = acquisition_state_payload(context)
         self._tracking_records.append(
             {
                 "captured_at": context.get("captured_at", ""),
@@ -385,6 +392,8 @@ class PTDocumentHandler:
                 "publication_status": PUBLICATION_STATUS_SILVER,
                 "normalization_status": "extraction_failure",
                 "json_path": "",
+                "acquisition_state": acquisition_state,
+                "acquisition_state_v2": json.dumps(acquisition_state, sort_keys=True),
             }
         )
 

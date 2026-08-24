@@ -80,11 +80,16 @@ def adapt_legacy_record(
         if found is False
         else DiscoveryState.NOT_SEARCHED
     )
-    acquisition = AcquisitionState(
-        discovery=discovery,
-        opening=OpeningState.NOT_ATTEMPTED,
-        access=AccessState.UNKNOWN,
-        extraction=ExtractionState.NOT_ATTEMPTED,
+    explicit_acquisition = payload.get("acquisition_state")
+    acquisition = (
+        AcquisitionState.from_dict(explicit_acquisition)
+        if isinstance(explicit_acquisition, Mapping)
+        else AcquisitionState(
+            discovery=discovery,
+            opening=OpeningState.NOT_ATTEMPTED,
+            access=AccessState.UNKNOWN,
+            extraction=ExtractionState.NOT_ATTEMPTED,
+        )
     )
     semantic = SemanticState(
         classification=ClassificationState.NOT_CLASSIFIED,

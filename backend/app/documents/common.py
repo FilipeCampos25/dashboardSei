@@ -8,6 +8,13 @@ from typing import Any, Dict, Optional
 from urllib.parse import parse_qs, urlparse
 
 from app.documents.types import DocumentTypeSpec
+from app.services.pipeline_states import (
+    AccessState,
+    AcquisitionState,
+    DiscoveryState,
+    ExtractionState,
+    OpeningState,
+)
 
 
 def identity_from_source_url(source_url: Any) -> dict[str, Optional[str]]:
@@ -99,6 +106,65 @@ def sanitize_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
     return sanitized if isinstance(sanitized, dict) else {}
 
 
+def build_acquisition_state(
+    collection_context: Optional[dict[str, Any]] = None,
+    snapshot: Optional[dict[str, Any]] = None,
+) -> AcquisitionState:
+    """Build V2 acquisition state only from explicit technical observations."""
+    context = collection_context or {}
+    explicit = context.get("acquisition_state")
+    if isinstance(explicit, dict):
+        state = AcquisitionState.from_dict(explicit)
+    else:
+        found = context.get("found")
+        discovery = (
+            DiscoveryState.FOUND
+            if found is True
+            else DiscoveryState.NOT_FOUND
+            if found is False
+            else DiscoveryState.NOT_SEARCHED
+        )
+        state = AcquisitionState(
+            discovery=discovery,
+            opening=OpeningState.NOT_ATTEMPTED,
+            access=AccessState.UNKNOWN,
+            extraction=ExtractionState.NOT_ATTEMPTED,
+        )
+
+    observation = (snapshot or {}).get("acquisition_observation")
+    if not isinstance(observation, dict):
+        return state
+
+    opening = state.opening
+    if observation.get("opening_attempted") is True:
+        opening = OpeningState.OPENED if observation.get("opened") is True else OpeningState.OPEN_FAILED
+
+    access = state.access
+    if observation.get("access_observed") is True:
+        access = AccessState.ACCESSIBLE
+
+    extraction = state.extraction
+    if observation.get("extraction_attempted") is True:
+        if observation.get("extraction_error"):
+            extraction = ExtractionState.EXTRACTION_FAILED
+        elif observation.get("extraction_partial") is True:
+            extraction = ExtractionState.CONTENT_PARTIAL
+        elif observation.get("extraction_complete") is True:
+            has_content = bool(str((snapshot or {}).get("text", "") or "").strip()) or bool(
+                (snapshot or {}).get("tables", []) or []
+            )
+            extraction = ExtractionState.EXTRACTED if has_content else ExtractionState.EMPTY_CONTENT
+
+    return AcquisitionState(state.discovery, opening, access, extraction)
+
+
+def acquisition_state_payload(
+    collection_context: Optional[dict[str, Any]] = None,
+    snapshot: Optional[dict[str, Any]] = None,
+) -> dict[str, str]:
+    return build_acquisition_state(collection_context, snapshot).to_dict()
+
+
 def derive_search_outcome_status(collection_context: Optional[dict[str, Any]] = None) -> dict[str, str]:
     context = collection_context or {}
     explicit_status = str(context.get("validation_status", "") or "").strip()
@@ -145,6 +211,7 @@ def save_snapshot_json(
         collection if isinstance(collection, dict) else None,
         sanitized_snapshot,
     )
+    acquisition_state = acquisition_state_payload(collection, sanitized_snapshot)
     payload: Dict[str, Any] = {
         "captured_at": datetime.now().isoformat(timespec="seconds"),
         "document_type": spec.key,
@@ -155,6 +222,7 @@ def save_snapshot_json(
         "candidate_id": identity["candidate_id"],
         "source_url": identity["source_url"],
         "identity": identity,
+        "acquisition_state": acquisition_state,
         "snapshot": sanitized_snapshot,
     }
     if extra_payload:
@@ -187,12 +255,15 @@ def build_basic_tracking_record(
 ) -> dict[str, Any]:
     sanitized_snapshot = sanitize_snapshot(snapshot)
     identity = build_document_identity(processo, collection_context, sanitized_snapshot)
+    acquisition_state = acquisition_state_payload(collection_context, sanitized_snapshot)
     record = {
         "captured_at": datetime.now().isoformat(timespec="seconds"),
         "document_type": spec.key,
         "processo": processo,
         "documento": protocolo_documento,
         **identity,
+        "acquisition_state": acquisition_state,
+        "acquisition_state_v2": json.dumps(acquisition_state, ensure_ascii=False, sort_keys=True),
         "snapshot_mode": (sanitized_snapshot.get("extraction_mode", "") or ""),
         "text_chars": len(sanitized_snapshot.get("text", "") or ""),
         "tables_count": len(sanitized_snapshot.get("tables", []) or []),
