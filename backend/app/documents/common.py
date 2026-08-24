@@ -192,6 +192,35 @@ def acquisition_state_payload(
     return build_acquisition_state(collection_context, snapshot).to_dict()
 
 
+def acquisition_recovery_payload(
+    acquisition_state: dict[str, Any],
+    acquisition_diagnostic: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """Classify operational recoverability without making semantic decisions."""
+    diagnostic = acquisition_diagnostic or {}
+    diagnostic_code = str(diagnostic.get("code") or "").strip()
+    discovery = str(acquisition_state.get("discovery") or "").strip()
+    opening = str(acquisition_state.get("opening") or "").strip()
+    access = str(acquisition_state.get("access") or "").strip()
+    extraction = str(acquisition_state.get("extraction") or "").strip()
+
+    if discovery == DiscoveryState.NOT_FOUND.value:
+        return {"issue_code": "document_not_found", "root_cause": "documentary_absence", "recoverable": False}
+    if access == AccessState.IFRAME_UNAVAILABLE.value or diagnostic_code == "IFRAME_UNAVAILABLE":
+        return {"issue_code": "technical_access", "root_cause": "IFRAME_UNAVAILABLE", "recoverable": True}
+    if opening == OpeningState.TIMEOUT.value or diagnostic_code == "TIMEOUT":
+        return {"issue_code": "technical_timeout", "root_cause": "TIMEOUT", "recoverable": True}
+    if extraction == ExtractionState.EXTRACTION_FAILED.value or diagnostic_code == "EXTRACTION_FAILED":
+        return {"issue_code": "technical_extraction", "root_cause": "EXTRACTION_FAILED", "recoverable": True}
+    if access == AccessState.ACCESS_RESTRICTED.value or diagnostic_code == "ACCESS_RESTRICTED":
+        return {"issue_code": "technical_access_restricted", "root_cause": "ACCESS_RESTRICTED", "recoverable": None}
+    if extraction == ExtractionState.EMPTY_CONTENT.value or diagnostic_code == "EMPTY_CONTENT":
+        return {"issue_code": "empty_content", "root_cause": "EMPTY_CONTENT", "recoverable": False}
+    if extraction in {ExtractionState.EXTRACTED.value, ExtractionState.CONTENT_PARTIAL.value}:
+        return {"issue_code": "", "root_cause": "", "recoverable": None}
+    return {"issue_code": "technical_state_unknown", "root_cause": "UNKNOWN", "recoverable": None}
+
+
 def derive_search_outcome_status(collection_context: Optional[dict[str, Any]] = None) -> dict[str, str]:
     context = collection_context or {}
     explicit_status = str(context.get("validation_status", "") or "").strip()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Sequence
@@ -7,6 +8,7 @@ from typing import Any, Dict, Iterable, List, Sequence
 import pandas as pd
 
 from app.output import csv_writer
+from app.documents.common import acquisition_recovery_payload
 
 
 QUEUE_FILENAME = "normalization_review_queue_latest.csv"
@@ -64,6 +66,8 @@ COLUMNS = [
     "is_gold_missing",
     "is_recoverable",
     "is_not_found",
+    "acquisition_root_cause",
+    "acquisition_diagnostic_code",
 ]
 
 
@@ -137,8 +141,10 @@ def _issue(
     document_type: str,
     row: Dict[str, str],
     is_gold_missing: bool = False,
-    is_recoverable: bool = True,
+    is_recoverable: bool | None = True,
     is_not_found: bool = False,
+    acquisition_root_cause: str = "",
+    acquisition_diagnostic_code: str = "",
 ) -> Dict[str, Any]:
     return {
         "code": code,
@@ -158,8 +164,10 @@ def _issue(
         "normalization_status": row.get("normalization_status", ""),
         "json_path": row.get("json_path", "") or row.get("candidate_json_path", ""),
         "is_gold_missing": bool(is_gold_missing),
-        "is_recoverable": bool(is_recoverable),
+        "is_recoverable": is_recoverable,
         "is_not_found": bool(is_not_found),
+        "acquisition_root_cause": acquisition_root_cause,
+        "acquisition_diagnostic_code": acquisition_diagnostic_code,
     }
 
 
@@ -210,24 +218,63 @@ def _preview_or_fallback_issues(document_type: str, row: Dict[str, str], source_
     return issues
 
 
+def _acquisition_state_from_row(row: Dict[str, str]) -> Dict[str, Any] | None:
+    raw = row.get("acquisition_state_v2", "")
+    if not raw:
+        return None
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
 def _not_found_issue(document_type: str, row: Dict[str, str], *, administrative: bool = False) -> Dict[str, Any] | None:
     status = row.get("validation_status", "") or row.get("normalization_status", "")
-    if status not in NOT_FOUND_STATUSES:
+    state = _acquisition_state_from_row(row)
+    if state is None:
+        if status not in NOT_FOUND_STATUSES:
+            return None
+        recovery = {"issue_code": "document_not_found", "root_cause": "legacy_status", "recoverable": False}
+        diagnostic_code = ""
+    else:
+        diagnostic_code = row.get("acquisition_diagnostic_code", "")
+        recovery = acquisition_recovery_payload(state, {"code": diagnostic_code})
+        if not recovery["issue_code"]:
+            return None
+        if recovery["issue_code"] == "technical_state_unknown" and status not in NOT_FOUND_STATUSES:
+            return None
+
+    issue_code = str(recovery["issue_code"])
+    is_documentary_absence = issue_code == "document_not_found"
+    if administrative and is_documentary_absence:
+        issue_code = "administrative_document_not_found"
+    messages = {
+        "technical_access": "Acesso tecnico ao documento indisponivel (iframe).",
+        "technical_timeout": "Abertura do documento excedeu o tempo limite.",
+        "technical_extraction": "Extracao tecnica do documento falhou.",
+        "technical_access_restricted": "Acesso ao documento foi explicitamente identificado como restrito.",
+        "empty_content": "Documento acessivel foi extraido sem conteudo.",
+        "technical_state_unknown": "Estado tecnico insuficientemente observado para adjudicar recuperabilidade.",
+    }
+    if is_documentary_absence:
+        message = "Documento administrativo nao encontrado." if administrative else f"Documento {document_type} nao encontrado."
+    else:
+        message = messages[issue_code]
+    if not issue_code:
         return None
     return _issue(
-        code="administrative_document_not_found" if administrative else "document_not_found",
+        code=issue_code,
         severity="high" if administrative else "medium",
         field="documento",
-        message=(
-            "Documento administrativo nao encontrado."
-            if administrative
-            else f"Documento {document_type} nao encontrado ou nao extraido."
-        ),
+        message=message,
         suggested_action="Reexecutar a busca com termos alternativos ou revisar manualmente a arvore do processo.",
         document_type=document_type,
         row=row,
-        is_recoverable=False,
-        is_not_found=True,
+        is_recoverable=recovery["recoverable"],
+        is_not_found=is_documentary_absence,
+        acquisition_root_cause=str(recovery["root_cause"]),
+        acquisition_diagnostic_code=diagnostic_code,
     )
 
 

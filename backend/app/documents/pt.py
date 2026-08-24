@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional
 
 from app.core.raw_date_field_collector import collect_raw_fields, export_raw_fields_csv
 from app.documents.common import (
+    acquisition_recovery_payload,
     acquisition_state_payload,
     build_basic_tracking_record,
     derive_search_outcome_status,
@@ -133,6 +134,9 @@ class PTDocumentHandler:
             "acquisition_state_v2",
             "acquisition_diagnostic_code",
             "acquisition_diagnostic_stage",
+            "acquisition_issue_code",
+            "acquisition_root_cause",
+            "acquisition_recoverable",
             "found",
             "found_in",
             "search_term",
@@ -320,6 +324,10 @@ class PTDocumentHandler:
         context = sanitized_context if isinstance(sanitized_context, dict) else collection_context
         outcome_status = derive_search_outcome_status(context)
         acquisition_state = acquisition_state_payload(context)
+        recovery = acquisition_recovery_payload(acquisition_state, {
+            "code": context.get("acquisition_diagnostic_code", ""),
+            "stage": context.get("acquisition_diagnostic_stage", ""),
+        })
         self._tracking_records.append(
             {
                 "captured_at": context.get("captured_at", ""),
@@ -357,6 +365,9 @@ class PTDocumentHandler:
                 "acquisition_state_v2": json.dumps(acquisition_state, sort_keys=True),
                 "acquisition_diagnostic_code": context.get("acquisition_diagnostic_code", ""),
                 "acquisition_diagnostic_stage": context.get("acquisition_diagnostic_stage", ""),
+                "acquisition_issue_code": recovery["issue_code"],
+                "acquisition_root_cause": recovery["root_cause"],
+                "acquisition_recoverable": recovery["recoverable"],
             }
         )
 
@@ -371,6 +382,10 @@ class PTDocumentHandler:
         sanitized_context = sanitize_text_payload(collection_context)
         context = sanitized_context if isinstance(sanitized_context, dict) else collection_context
         acquisition_state = acquisition_state_payload(context)
+        recovery = acquisition_recovery_payload(acquisition_state, {
+            "code": context.get("acquisition_diagnostic_code", ""),
+            "stage": context.get("acquisition_diagnostic_stage", ""),
+        })
         self._tracking_records.append(
             {
                 "captured_at": context.get("captured_at", ""),
@@ -408,6 +423,9 @@ class PTDocumentHandler:
                 "acquisition_state_v2": json.dumps(acquisition_state, sort_keys=True),
                 "acquisition_diagnostic_code": context.get("acquisition_diagnostic_code", ""),
                 "acquisition_diagnostic_stage": context.get("acquisition_diagnostic_stage", ""),
+                "acquisition_issue_code": recovery["issue_code"],
+                "acquisition_root_cause": recovery["root_cause"],
+                "acquisition_recoverable": recovery["recoverable"],
             }
         )
 
