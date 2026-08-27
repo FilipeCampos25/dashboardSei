@@ -7,8 +7,18 @@ import unicodedata
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+from urllib.parse import parse_qs, urlparse
 
+from app.config import get_settings
 from app.output import csv_writer
+from app.services.contract_adapters import (
+    V2_SCHEMA_VERSION,
+    adapt_legacy_record,
+    v2_sidecar_path,
+    write_v2_sidecar,
+)
+from app.services.field_states import FieldResult, FieldState
+from app.services.gold_contracts import EvidenceLocation, FieldEvidence, SourceKind
 from app.services.normalization_contract import (
     CONFIDENCE_HIGH,
     CONFIDENCE_LOW,
@@ -18,6 +28,7 @@ from app.services.normalization_contract import (
     SOURCE_DOCUMENT_TEXT,
     SOURCE_DOCUMENT_TITLE,
     SOURCE_MISSING,
+    DocumentIdentity,
     build_document_contract,
     make_field,
     make_missing_field,
@@ -2047,6 +2058,122 @@ def _build_contract_fields(record: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     }
 
 
+def _act_source_kind(source_type: str) -> SourceKind | None:
+    if source_type == SOURCE_DERIVED:
+        return SourceKind.DERIVED
+    if source_type in {SOURCE_DOCUMENT_TEXT, SOURCE_DOCUMENT_TITLE, SOURCE_DOCUMENT_METADATA}:
+        return SourceKind.DOCUMENT
+    return None
+
+
+def _act_document_identity(record: Dict[str, Any], payload: Dict[str, Any]) -> DocumentIdentity:
+    collection = payload.get("collection", {}) or {}
+    snapshot = payload.get("snapshot", {}) or {}
+    source_url = _clean_spaces(str(collection.get("source_url") or snapshot.get("url") or "")) or None
+    query = parse_qs(urlparse(source_url).query) if source_url else {}
+    document_values = query.get("id_documento", ())
+    candidate_values = query.get("id_anexo", ())
+    document_id = _clean_spaces(str(collection.get("document_id", "") or "")) or None
+    candidate_id = _clean_spaces(str(collection.get("candidate_id", "") or "")) or None
+    if document_id is None and len(document_values) == 1 and document_values[0].strip().isdigit():
+        document_id = document_values[0].strip()
+    if candidate_id is None and len(candidate_values) == 1 and candidate_values[0].strip().isdigit():
+        candidate_id = candidate_values[0].strip()
+    if document_id == _clean_spaces(str(record.get("processo", "") or "")):
+        document_id = None
+    return DocumentIdentity(
+        process_id=record.get("processo", ""),
+        document_id=document_id,
+        candidate_id=candidate_id,
+        source_url=source_url,
+    )
+
+
+def _act_field_evidences(
+    field_name: str,
+    field: Dict[str, Any],
+    *,
+    identity: DocumentIdentity,
+    source_path: str | None,
+    legacy_evidences: Iterable[Dict[str, Any]] = (),
+) -> Tuple[FieldEvidence, ...]:
+    location = EvidenceLocation(source_path=source_path) if source_path else None
+    source_items = list(legacy_evidences)
+    if not source_items:
+        source_items = [field]
+
+    evidences: List[FieldEvidence] = []
+    for item in source_items:
+        source_kind = _act_source_kind(str(item.get("source_type", "") or ""))
+        if source_kind is None:
+            continue
+        rule_id = _clean_spaces(str(item.get("rule_id", "") or "")) or None
+        raw_evidence = _clean_spaces(
+            str(item.get("evidence", "") or item.get("raw_value", "") or "")
+        ) or None
+        evidence = FieldEvidence(
+            field_name=field_name,
+            source_kind=source_kind,
+            source_document=identity,
+            rule_id=rule_id,
+            location=location,
+            raw_evidence=raw_evidence,
+        )
+        if evidence not in evidences:
+            evidences.append(evidence)
+    return tuple(evidences)
+
+
+def build_act_v2_record(
+    record: Dict[str, Any],
+    payload: Dict[str, Any],
+    *,
+    source_path: str | Path | None = None,
+) -> Dict[str, Any]:
+    """Build additive ACT V2 fields without changing legacy decisions or values."""
+
+    identity = _act_document_identity(record, payload)
+    contract = record.get("normalization_contract", {})
+    legacy_fields = contract.get("fields", {}) if isinstance(contract, dict) else {}
+    resolved_source_path = str(source_path) if source_path else None
+    field_results: List[FieldResult] = []
+    for field_name, field in legacy_fields.items():
+        if not isinstance(field, dict):
+            continue
+        value = field.get("value")
+        present = value is not None and (not isinstance(value, str) or bool(value.strip()))
+        evidences = ()
+        if present:
+            legacy_evidences = record.get("numero_acordo_evidences", []) if field_name == "numero_acordo" else ()
+            evidences = _act_field_evidences(
+                field_name,
+                field,
+                identity=identity,
+                source_path=resolved_source_path,
+                legacy_evidences=legacy_evidences,
+            )
+        field_results.append(
+            FieldResult(
+                field_name=field_name,
+                state=FieldState.PRESENT if present else FieldState.NOT_EVALUATED,
+                value=value if present else None,
+                evidences=evidences,
+            )
+        )
+
+    adapted = adapt_legacy_record(
+        {
+            **record,
+            "process_id": identity.process_id,
+            "document_id": identity.document_id,
+            "candidate_id": identity.candidate_id,
+            "source_url": identity.source_url,
+        }
+    )
+    adapted["fields"] = [field.to_dict() for field in field_results]
+    return adapted
+
+
 def _refresh_contract(record: Dict[str, Any]) -> None:
     existing = record.get("normalization_contract")
     fields = existing.get("fields", {}) if isinstance(existing, dict) else _build_contract_fields(record)
@@ -2311,10 +2438,12 @@ def export_normalized_csv(output_dir: Path, logger: Any = None) -> Dict[str, Any
 
     audit_records: List[Dict[str, Any]] = []
     grouped: Dict[str, List[Dict[str, Any]]] = {}
+    payloads_by_record: Dict[int, Dict[str, Any]] = {}
     for json_path in json_paths:
         try:
             payload = _read_json(json_path)
             record = build_normalized_record(payload, json_path)
+            payloads_by_record[id(record)] = payload
             grouped.setdefault(record["processo"], []).append(record)
             audit_records.append(record)
         except Exception as exc:
@@ -2516,6 +2645,21 @@ def export_normalized_csv(output_dir: Path, logger: Any = None) -> Dict[str, Any
     csv_path = output_dir / "act_normalizado_latest.csv"
     public_rows = [{column: row.get(column, "") for column in normalized_columns} for row in canonical_records]
     csv_writer.write_csv(public_rows, csv_path, columns=normalized_columns)
+    v2_path = None
+    if get_settings().v2_dual_write:
+        envelope = {
+            "schema_version": V2_SCHEMA_VERSION,
+            "legacy_artifact": csv_path.name,
+            "records": [
+                build_act_v2_record(
+                    record,
+                    payloads_by_record[id(record)],
+                    source_path=Path(str(record.get("candidate_json_path", ""))).relative_to(output_dir).as_posix(),
+                )
+                for record in canonical_records
+            ],
+        }
+        v2_path = write_v2_sidecar(v2_sidecar_path(csv_path), envelope)
     diagnostic_columns = [
         "processo", "campo", "valor", "raw_value", "source_type", "confidence",
         "rule_id", "evidence", "evidences", "warning",
@@ -2536,4 +2680,5 @@ def export_normalized_csv(output_dir: Path, logger: Any = None) -> Dict[str, Any
         "audit_path": audit_path,
         "affinity_path": affinity_path,
         "diagnostics_path": diagnostics_path,
+        "v2_path": v2_path,
     }
