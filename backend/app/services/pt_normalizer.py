@@ -8,10 +8,20 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+from urllib.parse import parse_qs, urlparse
 
 import pandas as pd
 
+from app.config import get_settings
 from app.output import csv_writer
+from app.services.contract_adapters import (
+    V2_SCHEMA_VERSION,
+    adapt_legacy_record,
+    v2_sidecar_path,
+    write_v2_sidecar,
+)
+from app.services.field_states import FieldResult, FieldState
+from app.services.gold_contracts import EvidenceLocation, FieldEvidence, SourceKind
 from app.services.normalization_contract import (
     CONFIDENCE_HIGH,
     CONFIDENCE_MEDIUM,
@@ -20,6 +30,7 @@ from app.services.normalization_contract import (
     SOURCE_MISSING,
     SOURCE_PREVIEW,
     SOURCE_TABLE,
+    DocumentIdentity,
     build_document_contract,
     make_field,
     make_missing_field,
@@ -1161,6 +1172,7 @@ def _build_contract_fields(
 ) -> Dict[str, Dict[str, Any]]:
     preview_partner = _clean_spaces(str(preview.get("parceiro", "") or ""))
     preview_objeto = _clean_spaces(str(preview.get("objeto", "") or ""))
+    preview_vigencia = _clean_spaces(str(preview.get("vigencia", "") or ""))
     tables = snapshot.get("tables", []) or []
     metas_source = SOURCE_TABLE if tables and _clean_spaces(record.get("metas_raw", "")) else SOURCE_DOCUMENT_TEXT
     acoes_source = SOURCE_TABLE if tables and _clean_spaces(record.get("acoes_raw", "")) else SOURCE_DOCUMENT_TEXT
@@ -1194,6 +1206,21 @@ def _build_contract_fields(
             rule_id=f"pt.vigencia.{period_source or PERIOD_SOURCE_MISSING}",
             warning=record.get("period_warning", ""),
         ),
+        "vigencia_raw": _field_or_missing(
+            value=record.get("vigencia_raw", ""),
+            source_type=(
+                SOURCE_PREVIEW
+                if preview_vigencia and record.get("vigencia_raw", "") == preview_vigencia
+                else SOURCE_DOCUMENT_TEXT
+            ),
+            confidence=CONFIDENCE_MEDIUM,
+            rule_id="pt.vigencia_raw.preview_or_document_text",
+            warning=(
+                "preview_fallback"
+                if preview_vigencia and record.get("vigencia_raw", "") == preview_vigencia
+                else ""
+            ),
+        ),
         "data_assinatura": _field_or_missing(
             value=data_assinatura,
             raw_value=record.get("datas_assinatura", "") or data_assinatura,
@@ -1221,7 +1248,103 @@ def _build_contract_fields(
             confidence=CONFIDENCE_MEDIUM,
             rule_id="pt.execucao.acoes",
         ),
+        ATTRIBUICOES_COLUMN: _field_or_missing(
+            value=record.get(ATTRIBUICOES_COLUMN, ""),
+            source_type=SOURCE_DOCUMENT_TEXT,
+            confidence=CONFIDENCE_MEDIUM,
+            rule_id="pt.atribuicoes.document_text",
+        ),
     }
+
+
+def _pt_source_kind(source_type: str) -> SourceKind | None:
+    if source_type == SOURCE_PREVIEW:
+        return SourceKind.PREVIEW
+    if source_type == SOURCE_DERIVED:
+        return SourceKind.DERIVED
+    if source_type in {SOURCE_DOCUMENT_TEXT, SOURCE_TABLE}:
+        return SourceKind.DOCUMENT
+    return None
+
+
+def _pt_document_identity(record: Dict[str, Any], payload: Dict[str, Any]) -> DocumentIdentity:
+    collection = payload.get("collection", {}) or {}
+    snapshot = payload.get("snapshot", {}) or {}
+    source_url = _clean_spaces(str(collection.get("source_url") or snapshot.get("url") or "")) or None
+    query = parse_qs(urlparse(source_url).query) if source_url else {}
+    document_values = query.get("id_documento", ())
+    candidate_values = query.get("id_anexo", ())
+    document_id = _clean_spaces(str(collection.get("document_id", "") or "")) or None
+    candidate_id = _clean_spaces(str(collection.get("candidate_id", "") or "")) or None
+    if document_id is None and len(document_values) == 1 and document_values[0].strip().isdigit():
+        document_id = document_values[0].strip()
+    if candidate_id is None and len(candidate_values) == 1 and candidate_values[0].strip().isdigit():
+        candidate_id = candidate_values[0].strip()
+    if document_id == _clean_spaces(str(record.get("processo", "") or "")):
+        document_id = None
+    return DocumentIdentity(
+        process_id=record.get("processo", ""),
+        document_id=document_id,
+        candidate_id=candidate_id,
+        source_url=source_url,
+    )
+
+
+def build_pt_v2_record(
+    record: Dict[str, Any],
+    payload: Dict[str, Any],
+    preview: Dict[str, str],
+    *,
+    source_path: str | Path | None = None,
+) -> Dict[str, Any]:
+    """Build additive PT V2 provenance without changing legacy resolution."""
+
+    identity = _pt_document_identity(record, payload)
+    contract = record.get("normalization_contract", {})
+    legacy_fields = contract.get("fields", {}) if isinstance(contract, dict) else {}
+    location = EvidenceLocation(source_path=str(source_path)) if source_path else None
+    field_results: List[FieldResult] = []
+    for field_name, field in legacy_fields.items():
+        if not isinstance(field, dict):
+            continue
+        value = field.get("value")
+        present = value is not None and (not isinstance(value, str) or bool(value.strip()))
+        evidences: Tuple[FieldEvidence, ...] = ()
+        if present:
+            source_kind = _pt_source_kind(str(field.get("source_type", "") or ""))
+            if source_kind is not None:
+                evidences = (
+                    FieldEvidence(
+                        field_name=field_name,
+                        source_kind=source_kind,
+                        source_document=identity if source_kind is not SourceKind.PREVIEW else None,
+                        rule_id=_clean_spaces(str(field.get("rule_id", "") or "")) or None,
+                        location=location if source_kind is not SourceKind.PREVIEW else None,
+                        raw_evidence=_clean_spaces(
+                            str(field.get("evidence", "") or field.get("raw_value", "") or "")
+                        ) or None,
+                    ),
+                )
+        field_results.append(
+            FieldResult(
+                field_name=field_name,
+                state=FieldState.PRESENT if present else FieldState.NOT_EVALUATED,
+                value=value if present else None,
+                evidences=evidences,
+            )
+        )
+
+    adapted = adapt_legacy_record(
+        {
+            **record,
+            "process_id": identity.process_id,
+            "document_id": identity.document_id,
+            "candidate_id": identity.candidate_id,
+            "source_url": identity.source_url,
+        }
+    )
+    adapted["fields"] = [field.to_dict() for field in field_results]
+    return adapted
 
 
 def build_normalized_record(payload: Dict[str, Any], preview: Dict[str, str], json_path: Path) -> Dict[str, str]:
@@ -1314,11 +1437,17 @@ def export_normalized_csv(output_dir: Path, logger: Any = None) -> Dict[str, Any
         return {"records": 0, "csv_path": None, "latest_path": None}
 
     records: List[Dict[str, str]] = []
+    payloads_by_record: Dict[int, Dict[str, Any]] = {}
+    previews_by_record: Dict[int, Dict[str, str]] = {}
     for json_path in json_paths:
         try:
             payload = _read_json(json_path)
             processo = _clean_spaces(str(payload.get("processo", "") or ""))
-            records.append(build_normalized_record(payload, preview_map.get(processo, {}), json_path))
+            preview = preview_map.get(processo, {})
+            record = build_normalized_record(payload, preview, json_path)
+            records.append(record)
+            payloads_by_record[id(record)] = payload
+            previews_by_record[id(record)] = preview
         except Exception as exc:
             _log(logger, "warning", "Normalizador PT: falha ao processar %s (%s).", json_path, exc)
 
@@ -1392,6 +1521,22 @@ def export_normalized_csv(output_dir: Path, logger: Any = None) -> Dict[str, Any
     # Ambos os arquivos publicam apenas o subconjunto gold; a dashboard deve consumir o export consolidado.
     csv_writer.write_csv(published_rows, csv_path, columns=columns)
     csv_writer.write_csv(published_rows, complete_path, columns=columns)
+    v2_path = None
+    if get_settings().v2_dual_write:
+        envelope = {
+            "schema_version": V2_SCHEMA_VERSION,
+            "legacy_artifact": csv_path.name,
+            "records": [
+                build_pt_v2_record(
+                    record,
+                    payloads_by_record[id(record)],
+                    previews_by_record[id(record)],
+                    source_path=Path(str(record.get("json_path", ""))).relative_to(output_dir).as_posix(),
+                )
+                for record in published_rows
+            ],
+        }
+        v2_path = write_v2_sidecar(v2_sidecar_path(csv_path), envelope)
 
     _log(
         logger,
@@ -1410,4 +1555,5 @@ def export_normalized_csv(output_dir: Path, logger: Any = None) -> Dict[str, Any
         "diagnostics_path": diagnostics_path,
         "complete_path": complete_path,
         "complete_latest_path": complete_path,
+        "v2_path": v2_path,
     }
