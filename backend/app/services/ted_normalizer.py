@@ -8,10 +8,21 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Sequence
+from typing import Any, Dict, Iterable, List, Sequence, Tuple
+from urllib.parse import parse_qs, urlparse
 
+from app.config import get_settings
 from app.output import csv_writer
 from app.services.act_normalizer import PUBLICATION_STATUS_GOLD
+from app.services.contract_adapters import (
+    V2_SCHEMA_VERSION,
+    adapt_legacy_record,
+    v2_sidecar_path,
+    write_v2_sidecar,
+)
+from app.services.field_states import FieldResult, FieldState
+from app.services.gold_contracts import EvidenceLocation, FieldEvidence, SourceKind
+from app.services.normalization_contract import DocumentIdentity
 
 
 RICH_COLUMNS = [
@@ -978,6 +989,129 @@ def build_normalized_record(payload: Dict[str, Any], json_path: Path | str) -> t
     return row, diagnostics
 
 
+_TED_DERIVED_FIELDS = {
+    "vigencia_regra_inicio",
+    "vigencia_inicio_origem",
+    "vigencia_fim_origem",
+    "vigencia_warning",
+}
+
+
+def _ted_document_identity(record: Dict[str, Any], payload: Dict[str, Any]) -> DocumentIdentity:
+    collection = payload.get("collection", {}) if isinstance(payload.get("collection", {}), dict) else {}
+    snapshot = payload.get("snapshot", {}) if isinstance(payload.get("snapshot", {}), dict) else {}
+    source_url = _clean_spaces(collection.get("source_url") or snapshot.get("url") or "") or None
+    query = parse_qs(urlparse(source_url).query) if source_url else {}
+    document_values = query.get("id_documento", ())
+    candidate_values = query.get("id_anexo", ())
+    document_id = _clean_spaces(collection.get("document_id", "")) or None
+    candidate_id = _clean_spaces(collection.get("candidate_id", "")) or None
+    if document_id is None and len(document_values) == 1 and document_values[0].strip().isdigit():
+        document_id = document_values[0].strip()
+    if candidate_id is None and len(candidate_values) == 1 and candidate_values[0].strip().isdigit():
+        candidate_id = candidate_values[0].strip()
+    if document_id == _clean_spaces(record.get("processo", "")):
+        document_id = None
+    return DocumentIdentity(
+        process_id=record.get("processo", ""),
+        document_id=document_id,
+        candidate_id=candidate_id,
+        source_url=source_url,
+    )
+
+
+def _diagnostic_index(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+def _ted_source_kind(field_name: str, diagnostic: Dict[str, Any]) -> SourceKind | None:
+    if diagnostic.get("source") == "missing":
+        return None
+    rule_id = _clean_spaces(diagnostic.get("rule_id", ""))
+    if field_name in _TED_DERIVED_FIELDS or rule_id.endswith(".calculated"):
+        return SourceKind.DERIVED
+    source = _clean_spaces(diagnostic.get("source", ""))
+    if source == "snapshot.text" or source.startswith("snapshot.tables["):
+        return SourceKind.DOCUMENT
+    return None
+
+
+def _ted_field_state(diagnostic: Dict[str, Any]) -> FieldState:
+    if diagnostic.get("value") is not None and _clean_spaces(diagnostic.get("value", "")):
+        return FieldState.PRESENT
+    if _clean_spaces(diagnostic.get("warning", "")) == "ambiguous_unit_candidates":
+        return FieldState.CONFLICT
+    return FieldState.NOT_EVALUATED
+
+
+def build_ted_v2_record(
+    record: Dict[str, Any],
+    payload: Dict[str, Any],
+    diagnostics: Sequence[Dict[str, Any]],
+    *,
+    source_path: str | Path | None = None,
+) -> Dict[str, Any]:
+    """Adapt existing TED field diagnostics without changing legacy resolution."""
+
+    identity = _ted_document_identity(record, payload)
+    field_results: List[FieldResult] = []
+    for diagnostic in diagnostics:
+        field_name = _clean_spaces(diagnostic.get("field_name", ""))
+        if not field_name:
+            continue
+        state = _ted_field_state(diagnostic)
+        evidences: Tuple[FieldEvidence, ...] = ()
+        if state is FieldState.PRESENT:
+            source_kind = _ted_source_kind(field_name, diagnostic)
+            if source_kind is not None:
+                table_index = _diagnostic_index(diagnostic.get("table_index"))
+                row_index = _diagnostic_index(diagnostic.get("row_index"))
+                column_index = _diagnostic_index(diagnostic.get("column_index"))
+                has_structural_location = any(value is not None for value in (table_index, row_index, column_index))
+                location = (
+                    EvidenceLocation(
+                        source_path=str(source_path) if source_path else None,
+                        table_index=table_index,
+                        row_index=row_index,
+                        column_index=column_index,
+                    )
+                    if has_structural_location
+                    else None
+                )
+                evidences = (
+                    FieldEvidence(
+                        field_name=field_name,
+                        source_kind=source_kind,
+                        source_document=identity if source_kind is SourceKind.DOCUMENT else None,
+                        rule_id=_clean_spaces(diagnostic.get("rule_id", "")) or None,
+                        location=location,
+                        raw_evidence=_clean_spaces(diagnostic.get("raw_value", "")) or None,
+                    ),
+                )
+        field_results.append(
+            FieldResult(
+                field_name=field_name,
+                state=state,
+                value=diagnostic.get("value") if state is FieldState.PRESENT else None,
+                evidences=evidences,
+            )
+        )
+
+    adapted = adapt_legacy_record(
+        {
+            **record,
+            "process_id": identity.process_id,
+            "document_id": identity.document_id,
+            "candidate_id": identity.candidate_id,
+            "source_url": identity.source_url,
+        }
+    )
+    adapted["fields"] = [field.to_dict() for field in field_results]
+    adapted["ted_field_diagnostics"] = [dict(item) for item in diagnostics]
+    adapted["legacy_publication_status"] = record.get("publication_status")
+    return adapted
+
+
 def _iter_gold_records(records: Iterable[Dict[str, Any]]) -> Iterable[Dict[str, Any]]:
     for record in records:
         if record.get("publication_status") == PUBLICATION_STATUS_GOLD and record.get("json_path"):
@@ -993,6 +1127,7 @@ def export_normalized_csv(
     csv_writer.ensure_output_dir(output_dir)
     rows: List[Dict[str, Any]] = []
     diagnostics: List[Dict[str, Any]] = []
+    v2_inputs: List[tuple[Dict[str, Any], Dict[str, Any], List[Dict[str, Any]], Path]] = []
 
     if records is None:
         json_paths = sorted(output_dir.glob("termo_execucao_descentralizada_*.json"))
@@ -1014,14 +1149,26 @@ def export_normalized_csv(
             row["publication_status"] = _clean_spaces(record.get("publication_status", ""))
         rows.append(row)
         diagnostics.extend(field_diagnostics)
+        v2_inputs.append((row, payload, field_diagnostics, json_path))
 
     csv_path = output_dir / "ted_normalizado_latest.csv"
     diagnostics_path = output_dir / "ted_field_diagnostics_latest.csv"
     csv_writer.write_csv(rows, csv_path, columns=RICH_COLUMNS + RAW_SOURCE_COLUMNS)
     csv_writer.write_csv(diagnostics, diagnostics_path, columns=DIAGNOSTIC_COLUMNS)
+    v2_path = None
+    if get_settings().v2_dual_write:
+        envelope = {
+            "schema_version": V2_SCHEMA_VERSION,
+            "legacy_artifact": csv_path.name,
+            "records": [
+                build_ted_v2_record(row, payload, field_diagnostics, source_path=json_path.name)
+                for row, payload, field_diagnostics, json_path in v2_inputs
+            ],
+        }
+        v2_path = write_v2_sidecar(v2_sidecar_path(csv_path), envelope)
     if logger is not None:
         try:
             logger.info("Relatorio TED normalizado gerado: registros=%d latest=%s diagnosticos=%s", len(rows), csv_path, diagnostics_path)
         except Exception:
             pass
-    return {"records": len(rows), "latest_path": csv_path, "diagnostics_path": diagnostics_path}
+    return {"records": len(rows), "latest_path": csv_path, "diagnostics_path": diagnostics_path, "v2_path": v2_path}
