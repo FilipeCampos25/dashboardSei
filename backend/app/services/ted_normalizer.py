@@ -1165,7 +1165,7 @@ def export_normalized_csv(
                 for row, payload, field_diagnostics, json_path in v2_inputs
             ],
         }
-        v2_path = write_v2_sidecar(v2_sidecar_path(csv_path), envelope)
+        v2_path = write_v2_sidecar(v2_sidecar_path(csv_path), envelope, family="TED")
     if logger is not None:
         try:
             logger.info("Relatorio TED normalizado gerado: registros=%d latest=%s diagnosticos=%s", len(rows), csv_path, diagnostics_path)

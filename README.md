@@ -47,6 +47,11 @@ Variaveis principais:
 - `DESCRICOES_MATCH_MODE`: `contains` ou `equals`.
 - `DOCUMENT_TYPES`: tipos documentais habilitados, separados por virgula. Valores atuais: `pt`, `act`, `memorando`, `ted`.
 - `EXPORT_RAW_FIELDS_CSV`: quando ligado, gera `pt_fields_raw.csv`.
+- `V2_DUAL_WRITE`: gera sidecars V2 quando `true`; permanece `false` por padrao.
+- `PROVENANCE_ENFORCEMENT_MODE`: controla a validacao dos sidecars V2: `off`
+  preserva o payload anterior, `warn` inclui relatorio estruturado e continua, e
+  `error` rejeita o sidecar antes da escrita quando encontra violacoes. O default
+  e `off`, e a configuracao nao afeta o CSV legado quando o dual-write esta desligado.
 - `TESSERACT_CMD` e `POPPLER_PATH`: caminhos opcionais para OCR/PDF.
 
 Exemplo:

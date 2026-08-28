@@ -2659,7 +2659,7 @@ def export_normalized_csv(output_dir: Path, logger: Any = None) -> Dict[str, Any
                 for record in canonical_records
             ],
         }
-        v2_path = write_v2_sidecar(v2_sidecar_path(csv_path), envelope)
+        v2_path = write_v2_sidecar(v2_sidecar_path(csv_path), envelope, family="ACT")
     diagnostic_columns = [
         "processo", "campo", "valor", "raw_value", "source_type", "confidence",
         "rule_id", "evidence", "evidences", "warning",

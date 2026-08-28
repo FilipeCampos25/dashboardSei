@@ -13,6 +13,7 @@ from app.services.field_states import FieldResult, FieldState
 from app.services.gold_contracts import FieldEvidence, SourceKind
 from app.services.normalization_contract import DocumentIdentity
 from app.services.portable_paths import PortableArtifactRef, PortablePathError
+from app.services.provenance_enforcement import ProvenanceEnforcementMode, enforce_provenance
 from app.services.pipeline_states import (
     AccessState,
     AcquisitionState,
@@ -185,14 +186,33 @@ def v2_sidecar_path(legacy_path: str | Path) -> Path:
     return legacy.parent / "v2" / f"{stem}.v2.json"
 
 
-def write_v2_sidecar(path: str | Path, payload: Mapping[str, Any]) -> Path:
+def write_v2_sidecar(
+    path: str | Path,
+    payload: Mapping[str, Any],
+    *,
+    family: str = "generic",
+    enforcement_mode: ProvenanceEnforcementMode | str | None = None,
+) -> Path:
     """Atomically publish a complete V2 sidecar or raise explicitly."""
 
     target = Path(path)
+    mode = (
+        get_settings().provenance_enforcement_mode
+        if enforcement_mode is None
+        else enforcement_mode
+    )
+    resolved_mode = ProvenanceEnforcementMode(mode)
+    serialized_payload = dict(payload)
+    if resolved_mode is not ProvenanceEnforcementMode.OFF:
+        records = payload.get("records", ())
+        if not isinstance(records, Sequence) or isinstance(records, (str, bytes)):
+            raise TypeError("V2 payload records must be a sequence")
+        report = enforce_provenance(records, family=family, mode=resolved_mode)
+        serialized_payload["provenance_enforcement"] = report.to_dict()
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_suffix(target.suffix + ".tmp")
     try:
-        temporary.write_text(serialize_v2(payload), encoding="utf-8")
+        temporary.write_text(serialize_v2(serialized_payload), encoding="utf-8")
         os.replace(temporary, target)
     except BaseException:
         try:

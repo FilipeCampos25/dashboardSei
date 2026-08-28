@@ -102,6 +102,14 @@ class Settings(BaseSettings):
         default=False,
         validation_alias=AliasChoices("V2_DUAL_WRITE", "v2_dual_write"),
     )
+    provenance_enforcement_mode: str = Field(
+        default="off",
+        pattern="^(off|warn|error)$",
+        validation_alias=AliasChoices(
+            "PROVENANCE_ENFORCEMENT_MODE",
+            "provenance_enforcement_mode",
+        ),
+    )
 
 
 settings = Settings()

@@ -5,6 +5,7 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from app.config import get_settings
 from app.output import csv_writer
 from app.services.act_normalizer import (
     DOC_CLASS_MEMORANDO,
@@ -12,6 +13,10 @@ from app.services.act_normalizer import (
     _extract_signature_dates,
     classify_cooperation_snapshot,
 )
+from app.services.contract_adapters import V2_SCHEMA_VERSION, adapt_legacy_record, v2_sidecar_path, write_v2_sidecar
+from app.services.field_states import FieldResult, FieldState
+from app.services.gold_contracts import EvidenceLocation, FieldEvidence, SourceKind
+from app.services.normalization_contract import DocumentIdentity
 
 DATE_PATTERN = r"\d{1,2}(?:[./-]\d{1,2}[./-]\d{4}|\s+de\s+[A-Za-z\u00c0-\u00ff]+\s+de\s+\d{4})"
 PROCESS_PATTERN = r"[0-9]{5}\.[0-9]{6}/[0-9]{4}-[0-9]{2}"
@@ -40,6 +45,30 @@ NORMALIZED_COLUMNS = [
     "snapshot_mode",
     "json_path",
 ]
+
+_ADMIN_V2_FIELDS = (
+    "resolved_document_type", "funcao_administrativa", "origem", "destino", "data",
+    "data_assinatura", "datas_assinatura", "assunto", "resumo", "acao_solicitada",
+    "prazo", "documentos_mencionados",
+)
+
+_ADMIN_DERIVED_RULES = {
+    "resolved_document_type": "administrativo.classificacao.legacy",
+    "funcao_administrativa": "administrativo.funcao.markers",
+}
+
+_ADMIN_DOCUMENT_RULES = {
+    "origem": "administrativo.line_value.origem",
+    "destino": "administrativo.line_value.destino",
+    "data": "administrativo.data.first_match",
+    "data_assinatura": "administrativo.assinatura.max_date",
+    "datas_assinatura": "administrativo.assinatura.all_dates",
+    "assunto": "administrativo.assunto.line_or_title",
+    "resumo": "administrativo.resumo.first_useful_sentences",
+    "acao_solicitada": "administrativo.acao.marker",
+    "prazo": "administrativo.prazo.pattern",
+    "documentos_mencionados": "administrativo.documentos.regex",
+}
 
 
 def _clean_spaces(value: Any) -> str:
@@ -180,9 +209,78 @@ def build_normalized_record(payload: Dict[str, Any], json_path: Path, fallback_r
     }
 
 
+def _admin_identity(record: Dict[str, Any], payload: Dict[str, Any]) -> DocumentIdentity:
+    collection = payload.get("collection", {}) if isinstance(payload.get("collection"), dict) else {}
+    snapshot = payload.get("snapshot", {}) if isinstance(payload.get("snapshot"), dict) else {}
+    document_id = _clean_spaces(collection.get("document_id")) or None
+    if document_id == _clean_spaces(record.get("processo")):
+        document_id = None
+    return DocumentIdentity(
+        process_id=_clean_spaces(record.get("processo")),
+        document_id=document_id,
+        candidate_id=_clean_spaces(collection.get("candidate_id")) or None,
+        source_url=_clean_spaces(collection.get("source_url") or snapshot.get("url")) or None,
+    )
+
+
+def _admin_raw_evidence(field_name: str, record: Dict[str, Any], payload: Dict[str, Any]) -> str | None:
+    snapshot = payload.get("snapshot", {}) if isinstance(payload.get("snapshot"), dict) else {}
+    text = _snapshot_text(snapshot)
+    if field_name in _ADMIN_DERIVED_RULES:
+        source = _clean_spaces(text or snapshot.get("title"))
+        return source[:600] or None
+    if field_name == "assunto" and record.get("assunto") == _clean_spaces(snapshot.get("title")):
+        return _clean_spaces(snapshot.get("title")) or None
+    value = _clean_spaces(record.get(field_name))
+    return value or None
+
+
+def build_administrativo_v2_record(
+    record: Dict[str, Any], payload: Dict[str, Any], *, source_path: str | Path | None = None
+) -> Dict[str, Any]:
+    """Add auditable field provenance while preserving every legacy value."""
+
+    identity = _admin_identity(record, payload)
+    location = EvidenceLocation(source_path=str(source_path)) if source_path else None
+    fields: List[FieldResult] = []
+    for field_name in _ADMIN_V2_FIELDS:
+        value = record.get(field_name)
+        present = value is not None and (not isinstance(value, str) or bool(value.strip()))
+        evidences = ()
+        if present:
+            derived = field_name in _ADMIN_DERIVED_RULES
+            evidences = (
+                FieldEvidence(
+                    field_name=field_name,
+                    source_kind=SourceKind.DERIVED if derived else SourceKind.DOCUMENT,
+                    source_document=None if derived else identity,
+                    rule_id=(_ADMIN_DERIVED_RULES | _ADMIN_DOCUMENT_RULES)[field_name],
+                    location=None if derived else location,
+                    raw_evidence=_admin_raw_evidence(field_name, record, payload),
+                ),
+            )
+        fields.append(FieldResult(
+            field_name=field_name,
+            state=FieldState.PRESENT if present else FieldState.NOT_EVALUATED,
+            value=value if present else None,
+            evidences=evidences,
+        ))
+    adapted = adapt_legacy_record({
+        **record,
+        "process_id": identity.process_id,
+        "document_id": identity.document_id,
+        "candidate_id": identity.candidate_id,
+        "source_url": identity.source_url,
+    })
+    adapted["fields"] = [field.to_dict() for field in fields]
+    adapted["legacy_publication_status"] = record.get("publication_status")
+    return adapted
+
+
 def export_normalized_csv(output_dir: Path, records: List[Dict[str, Any]], logger: Any = None) -> Dict[str, Any]:
     csv_writer.ensure_output_dir(output_dir)
     normalized_rows: List[Dict[str, Any]] = []
+    v2_inputs: List[tuple[Dict[str, Any], Dict[str, Any], Path]] = []
     for record in records:
         if record.get("publication_status") != PUBLICATION_STATUS_GOLD or not record.get("json_path"):
             continue
@@ -190,11 +288,26 @@ def export_normalized_csv(output_dir: Path, records: List[Dict[str, Any]], logge
         payload = _read_json(json_path)
         if not payload:
             continue
-        normalized_rows.append(build_normalized_record(payload, json_path, fallback_record=record))
+        normalized = build_normalized_record(payload, json_path, fallback_record=record)
+        normalized_rows.append(normalized)
+        v2_inputs.append((normalized, payload, json_path))
 
     public_rows = [{column: row.get(column, "") for column in NORMALIZED_COLUMNS} for row in normalized_rows]
     admin_path = output_dir / "documento_administrativo_normalizado_latest.csv"
     csv_writer.write_csv(public_rows, admin_path, columns=NORMALIZED_COLUMNS)
+    v2_path = None
+    if get_settings().v2_dual_write:
+        envelope = {
+            "schema_version": V2_SCHEMA_VERSION,
+            "legacy_artifact": admin_path.name,
+            "records": [
+                build_administrativo_v2_record(row, payload, source_path=json_path.name)
+                for row, payload, json_path in v2_inputs
+            ],
+        }
+        v2_path = write_v2_sidecar(
+            v2_sidecar_path(admin_path), envelope, family="Administrativos"
+        )
 
     memorando_rows = [
         {column: row.get(column, "") for column in NORMALIZED_COLUMNS}
@@ -216,4 +329,5 @@ def export_normalized_csv(output_dir: Path, records: List[Dict[str, Any]], logge
         "memorando_records": len(memorando_rows),
         "latest_path": admin_path,
         "memorando_path": memorando_path,
+        "v2_path": v2_path,
     }

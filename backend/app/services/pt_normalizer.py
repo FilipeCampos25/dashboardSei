@@ -1536,7 +1536,7 @@ def export_normalized_csv(output_dir: Path, logger: Any = None) -> Dict[str, Any
                 for record in published_rows
             ],
         }
-        v2_path = write_v2_sidecar(v2_sidecar_path(csv_path), envelope)
+        v2_path = write_v2_sidecar(v2_sidecar_path(csv_path), envelope, family="PT")
 
     _log(
         logger,

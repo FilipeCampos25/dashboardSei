@@ -9,7 +9,12 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+from app.config import get_settings
 from app.output import csv_writer
+from app.services.contract_adapters import V2_SCHEMA_VERSION, adapt_legacy_record, v2_sidecar_path, write_v2_sidecar
+from app.services.field_states import FieldResult, FieldState
+from app.services.gold_contracts import EvidenceLocation, FieldEvidence, SourceKind
+from app.services.normalization_contract import DocumentIdentity
 
 SOURCE_FILENAME = "parcerias_descontinuadas_latest.csv"
 OUTPUT_FILENAME = "parcerias_descontinuadas_normalizado_latest.csv"
@@ -176,6 +181,28 @@ def _extract_fields_from_anotacoes(anotacoes: str) -> Dict[str, str]:
     return record
 
 
+def _annotation_evidence(anotacoes: str) -> Dict[str, Dict[str, Any]]:
+    """Capture the label and zero-based line position without changing parsing."""
+    evidence: Dict[str, Dict[str, Any]] = {}
+    current_multiline_field = ""
+    for position, raw_line in enumerate(str(anotacoes or "").replace("\r", "\n").splitlines()):
+        line = _clean_spaces(raw_line)
+        if not line:
+            continue
+        labeled = _split_labeled_line(line)
+        if labeled:
+            field, value = labeled
+            current_multiline_field = field if field in _MULTILINE_FIELDS else ""
+            label = line[: max(0, len(line) - len(value))].strip(" :-") if value else line.strip(" :-")
+            if value and field not in evidence:
+                evidence[field] = {"label": label, "position": position, "raw": value}
+            continue
+        if current_multiline_field and current_multiline_field in evidence:
+            previous = evidence[current_multiline_field]["raw"]
+            evidence[current_multiline_field]["raw"] = _clean_spaces(f"{previous} {line}")
+    return evidence
+
+
 def _extract_termo_number(termo_raw: str) -> str:
     text = _clean_spaces(termo_raw)
     match = re.search(r"(?:N[º°oO]?\s*)?([0-9]+(?:/[0-9]{2,4})?)", text, flags=re.IGNORECASE)
@@ -312,6 +339,59 @@ def build_normalized_record(
     return {column: record.get(column, "") for column in NORMALIZED_COLUMNS}
 
 
+def build_descontinuada_v2_record(row: Dict[str, Any], record: Dict[str, str]) -> Dict[str, Any]:
+    annotations = _clean_multiline(row.get("anotacoes", ""))
+    annotation_fields = _annotation_evidence(annotations)
+    identity = DocumentIdentity(process_id=_clean_spaces(record.get("processo")))
+    fields: List[FieldResult] = []
+    derived_rules = {
+        "numero_termo_encerramento": "descontinuadas.termo.number",
+        "status_normalizado": "descontinuadas.status.normalize_legacy",
+        "status_calculado": "descontinuadas.status.calculate_legacy",
+        "status_categoria": "descontinuadas.status.category_legacy",
+        "status_evidencia": "descontinuadas.status.evidence_codes",
+        "status_data_referencia": "descontinuadas.status.reference_date",
+        "normalization_status": "descontinuadas.completeness.legacy",
+        "missing_fields": "descontinuadas.missing_fields.legacy",
+    }
+    status_inputs = " | ".join(
+        annotation_fields[name]["raw"]
+        for name in ("status_raw", "data_vencimento", "termo_encerramento_raw")
+        if name in annotation_fields
+    )
+    for field_name in NORMALIZED_COLUMNS:
+        value = record.get(field_name)
+        present = value is not None and (not isinstance(value, str) or bool(value.strip()))
+        evidences = ()
+        if present:
+            annotation = annotation_fields.get(field_name)
+            derived = field_name in derived_rules
+            if field_name == "numero_termo_encerramento" and "termo_encerramento_raw" in annotation_fields:
+                raw = annotation_fields["termo_encerramento_raw"]["raw"]
+            elif field_name in {"status_normalizado", "status_calculado", "status_categoria", "status_evidencia"}:
+                raw = status_inputs
+            else:
+                raw = annotation["raw"] if annotation else _clean_spaces(value)
+            evidences = (FieldEvidence(
+                field_name=field_name,
+                source_kind=SourceKind.DERIVED if derived else SourceKind.PREVIEW,
+                source_document=None,
+                rule_id=derived_rules.get(field_name) or "descontinuadas.annotation.parse",
+                location=(EvidenceLocation(section=annotation["label"], position=annotation["position"])
+                          if annotation and not derived else None),
+                raw_evidence=raw or None,
+            ),)
+        fields.append(FieldResult(
+            field_name=field_name,
+            state=FieldState.PRESENT if present else FieldState.NOT_EVALUATED,
+            value=value if present else None,
+            evidences=evidences,
+        ))
+    adapted = adapt_legacy_record({**record, "process_id": identity.process_id})
+    adapted["fields"] = [field.to_dict() for field in fields]
+    return adapted
+
+
 def normalize_rows(
     rows: Iterable[Dict[str, Any]], *, reference_date: date | datetime | pd.Timestamp | str | None = None
 ) -> List[Dict[str, str]]:
@@ -340,6 +420,16 @@ def export_normalized_csv(
     normalized_rows = normalize_rows(rows, reference_date=reference_date)
     csv_path = output_path / OUTPUT_FILENAME
     csv_writer.write_csv(normalized_rows, csv_path, columns=NORMALIZED_COLUMNS)
+    v2_path = None
+    if get_settings().v2_dual_write:
+        envelope = {
+            "schema_version": V2_SCHEMA_VERSION,
+            "legacy_artifact": csv_path.name,
+            "records": [build_descontinuada_v2_record(row, record) for row, record in zip(rows, normalized_rows)],
+        }
+        v2_path = write_v2_sidecar(
+            v2_sidecar_path(csv_path), envelope, family="Descontinuadas"
+        )
 
     if logger is not None:
         logger.info(
@@ -347,4 +437,4 @@ def export_normalized_csv(
             len(normalized_rows),
             csv_path,
         )
-    return {"records": len(normalized_rows), "latest_path": csv_path}
+    return {"records": len(normalized_rows), "latest_path": csv_path, "v2_path": v2_path}
