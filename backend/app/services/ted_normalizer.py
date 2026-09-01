@@ -13,7 +13,7 @@ from urllib.parse import parse_qs, urlparse
 
 from app.config import get_settings
 from app.output import csv_writer
-from app.services.act_normalizer import PUBLICATION_STATUS_GOLD
+from app.services.act_normalizer import PUBLICATION_STATUS_GOLD, PUBLICATION_STATUS_SILVER
 from app.services.contract_adapters import (
     V2_SCHEMA_VERSION,
     adapt_legacy_record,
@@ -23,6 +23,9 @@ from app.services.contract_adapters import (
 from app.services.field_states import FieldResult, FieldState
 from app.services.gold_contracts import EvidenceLocation, FieldEvidence, SourceKind
 from app.services.normalization_contract import DocumentIdentity
+from app.services.pipeline_states import AcquisitionState
+from app.services.publication_policy import evaluate_document_gold
+from app.services.semantic_states import SemanticState
 
 
 RICH_COLUMNS = [
@@ -955,7 +958,7 @@ def build_normalized_record(payload: Dict[str, Any], json_path: Path | str) -> t
         "processo": _clean_spaces(payload.get("processo", "")),
         "documento": _clean_spaces(payload.get("documento", "")) or _clean_spaces(collection.get("chosen_documento", "")),
         "validation_status": _clean_spaces(analysis.get("validation_status", "")),
-        "publication_status": _clean_spaces(analysis.get("publication_status", "")) or PUBLICATION_STATUS_GOLD,
+        "publication_status": _clean_spaces(analysis.get("publication_status", "")) or PUBLICATION_STATUS_SILVER,
         "normalization_status": normalization_status,
         "quality_status": quality_status,
         "quality_notes": "; ".join(notes),
@@ -1054,6 +1057,9 @@ def build_ted_v2_record(
     """Adapt existing TED field diagnostics without changing legacy resolution."""
 
     identity = _ted_document_identity(record, payload)
+    snapshot = payload.get("snapshot", {}) if isinstance(payload.get("snapshot", {}), dict) else {}
+    collection = payload.get("collection", {}) if isinstance(payload.get("collection", {}), dict) else {}
+    text = str(snapshot.get("text", "") or "")
     field_results: List[FieldResult] = []
     for diagnostic in diagnostics:
         field_name = _clean_spaces(diagnostic.get("field_name", ""))
@@ -1104,11 +1110,21 @@ def build_ted_v2_record(
             "document_id": identity.document_id,
             "candidate_id": identity.candidate_id,
             "source_url": identity.source_url,
+            "found": collection.get("found"),
+            "acquisition_state": collection.get("acquisition_state") or payload.get("acquisition_state"),
         }
     )
     adapted["fields"] = [field.to_dict() for field in field_results]
     adapted["ted_field_diagnostics"] = [dict(item) for item in diagnostics]
     adapted["legacy_publication_status"] = record.get("publication_status")
+    acquisition = AcquisitionState.from_dict(adapted["acquisition_state"])
+    decision = evaluate_document_gold(
+        identity=identity,
+        acquisition=acquisition,
+        semantic=SemanticState.from_dict(adapted["semantic_state"]),
+        has_verifiable_content=bool(text.strip()) or bool(snapshot.get("tables", []) or []),
+    )
+    adapted["document_gold_decision"] = decision.to_dict()
     return adapted
 
 
@@ -1130,8 +1146,7 @@ def export_normalized_csv(
     v2_inputs: List[tuple[Dict[str, Any], Dict[str, Any], List[Dict[str, Any]], Path]] = []
 
     if records is None:
-        json_paths = sorted(output_dir.glob("termo_execucao_descentralizada_*.json"))
-        source_records = [{"json_path": str(path), "publication_status": PUBLICATION_STATUS_GOLD} for path in json_paths]
+        source_records = []
     else:
         source_records = list(_iter_gold_records(records))
 

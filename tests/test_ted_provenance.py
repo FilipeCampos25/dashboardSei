@@ -11,6 +11,8 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 
 from app.services.field_states import FieldResult, FieldState
+from app.services.pipeline_states import AccessState, DiscoveryState, ExtractionState, OpeningState
+from app.services.publication_policy import PublicationReasonCode
 from app.services.provenance_validation import validate_field_provenance
 from app.services.ted_normalizer import (
     build_normalized_record,
@@ -71,15 +73,69 @@ class TEDProvenanceTests(unittest.TestCase):
         reports = [validate_field_provenance(FieldResult.from_dict(item)) for item in v2["fields"]]
         self.assertTrue(all(report.is_valid for report in reports), [report.codes for report in reports])
 
-    def test_empty_ted_has_no_fabricated_evidence_and_keeps_legacy_publication(self) -> None:
+    def test_empty_ted_has_no_fabricated_evidence_and_fails_closed_without_status(self) -> None:
         payload = load_fixture("ted_empty.json")["payload"]
         row, diagnostics = build_normalized_record(payload, "ted_empty.json")
         v2 = build_ted_v2_record(row, payload, diagnostics)
 
-        self.assertEqual("published_gold", row["publication_status"])
-        self.assertEqual("published_gold", v2["legacy_publication_status"])
+        self.assertEqual("retained_silver", row["publication_status"])
+        self.assertEqual("retained_silver", v2["legacy_publication_status"])
         self.assertTrue(all(item["state"] != "PRESENT" for item in v2["fields"]))
         self.assertTrue(all(not item["evidences"] for item in v2["fields"]))
+        self.assertEqual("BLOCKED", v2["document_gold_decision"]["semantic_state"]["publication"])
+        self.assertEqual(
+            [PublicationReasonCode.DISCOVERY_NOT_COMPLETED.value],
+            v2["document_gold_decision"]["reason_codes"],
+        )
+
+    def test_title_only_ted_is_blocked_by_existing_publication_gate(self) -> None:
+        payload = {
+            "processo": "test-only:ted-title-only",
+            "snapshot": {
+                "title": "Termo de Execucao Descentralizada",
+                "text": "",
+                "tables": [],
+            },
+            "collection": {
+                "found": True,
+                "acquisition_state": {
+                    "discovery": DiscoveryState.FOUND.value,
+                    "opening": OpeningState.OPENED.value,
+                    "access": AccessState.ACCESSIBLE.value,
+                    "extraction": ExtractionState.EMPTY_CONTENT.value,
+                },
+            },
+            "analysis": {"publication_status": "published_gold"},
+        }
+        row, diagnostics = build_normalized_record(payload, "title_only.json")
+
+        v2 = build_ted_v2_record(row, payload, diagnostics)
+
+        self.assertEqual("BLOCKED", v2["document_gold_decision"]["semantic_state"]["publication"])
+        self.assertEqual(
+            [PublicationReasonCode.EMPTY_CONTENT.value],
+            v2["document_gold_decision"]["reason_codes"],
+        )
+
+    def test_readable_ted_passes_content_gate_when_acquisition_is_confirmed(self) -> None:
+        payload, row, diagnostics = self._rich()
+        payload["collection"].update({
+            "found": True,
+            "acquisition_state": {
+                "discovery": DiscoveryState.FOUND.value,
+                "opening": OpeningState.OPENED.value,
+                "access": AccessState.ACCESSIBLE.value,
+                "extraction": ExtractionState.EXTRACTED.value,
+            },
+        })
+
+        v2 = build_ted_v2_record(row, payload, diagnostics)
+
+        self.assertEqual("PUBLISHED", v2["document_gold_decision"]["semantic_state"]["publication"])
+        self.assertEqual(
+            [PublicationReasonCode.ELIGIBLE_VERIFIABLE_CONTENT.value],
+            v2["document_gold_decision"]["reason_codes"],
+        )
 
     def test_dual_write_is_opt_in_and_keeps_legacy_bytes_equal(self) -> None:
         payload, _, _ = self._rich()

@@ -231,6 +231,31 @@ class TEDNormalizerTests(unittest.TestCase):
         finally:
             shutil.rmtree(output_dir, ignore_errors=True)
 
+    def test_missing_publication_status_fails_closed(self) -> None:
+        payload = {"processo": "test-only:ted-missing-status", "snapshot": {"text": "", "tables": []}}
+
+        row, _ = build_normalized_record(payload, "missing_status.json")
+
+        self.assertEqual(row["publication_status"], "retained_silver")
+
+    def test_records_none_does_not_promote_discovered_snapshots(self) -> None:
+        output_dir = Path(__file__).resolve().parent / "_tmp_ted_records_none"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            target = output_dir / "termo_execucao_descentralizada_test_only.json"
+            target.write_text(json.dumps({
+                "processo": "test-only:ted-records-none",
+                "snapshot": {"title": "Termo de Execucao Descentralizada", "text": "", "tables": []},
+            }), encoding="utf-8")
+
+            result = export_normalized_csv(output_dir, records=None)
+
+            self.assertEqual(result["records"], 0)
+            with result["latest_path"].open("r", encoding="utf-8-sig", newline="") as file_obj:
+                self.assertEqual(list(csv.DictReader(file_obj)), [])
+        finally:
+            shutil.rmtree(output_dir, ignore_errors=True)
+
     def test_dashboard_ready_includes_ted_process_without_preview(self) -> None:
         fixture = load_fixture("ted_normalizer_rich.json")
         output_dir = Path(__file__).resolve().parent / "_tmp_ted_dashboard"
