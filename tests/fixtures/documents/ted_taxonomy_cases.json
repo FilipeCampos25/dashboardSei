@@ -1,0 +1,21 @@
+{
+  "metadata": {
+    "id": "ted_taxonomy_cases",
+    "description": "Synthetic TED document-function taxonomy cases.",
+    "family": "ted",
+    "document_role": "taxonomy_cases",
+    "extraction_method": "html_dom",
+    "technical_state": "EXTRACTED",
+    "origin": "synthetic"
+  },
+  "payload": {
+    "cases": [
+      {"id": "instrument", "title": "TED 01/2026", "text": "TERMO DE EXECUCAO DESCENTRALIZADA. OBJETO: atividade sintetica. UNIDADE DESCENTRALIZADORA: ORGAO A.", "expected_function": "ted.instrument"},
+      {"id": "work_plan", "title": "TED 01/2026", "text": "PLANO DE TRABALHO do Termo de Execucao Descentralizada TED 01/2026.", "expected_function": "ted.work_plan"},
+      {"id": "meeting_minutes", "title": "TED 01/2026", "text": "ATA DE REUNIAO sobre o Termo de Execucao Descentralizada TED 01/2026.", "expected_function": "ted.meeting_minutes"},
+      {"id": "amendment", "title": "TED 01/2026", "text": "PRIMEIRO TERMO ADITIVO ao PLANO DE TRABALHO do Termo de Execucao Descentralizada TED 01/2026.", "expected_function": "ted.amendment"},
+      {"id": "extract", "title": "Extrato TED", "text": "EXTRATO do Termo de Execucao Descentralizada TED 01/2026.", "expected_function": "ted.extract"},
+      {"id": "related", "title": "TED 01/2026", "text": "OFICIO que encaminha relatorio referente ao TED 01/2026.", "expected_function": "ted.related"}
+    ]
+  }
+}

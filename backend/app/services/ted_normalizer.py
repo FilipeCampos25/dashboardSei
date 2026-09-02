@@ -25,7 +25,8 @@ from app.services.gold_contracts import EvidenceLocation, FieldEvidence, SourceK
 from app.services.normalization_contract import DocumentIdentity
 from app.services.pipeline_states import AcquisitionState
 from app.services.publication_policy import evaluate_document_gold
-from app.services.semantic_states import SemanticState
+from app.services.semantic_states import ClassificationState, DocumentFunctionState, SemanticState
+from app.services.ted_classifier import classify_ted_snapshot
 
 
 RICH_COLUMNS = [
@@ -1117,6 +1118,21 @@ def build_ted_v2_record(
     adapted["fields"] = [field.to_dict() for field in field_results]
     adapted["ted_field_diagnostics"] = [dict(item) for item in diagnostics]
     adapted["legacy_publication_status"] = record.get("publication_status")
+    ted_classification = classify_ted_snapshot(snapshot)
+    previous_semantic = SemanticState.from_dict(adapted["semantic_state"])
+    adapted["semantic_state"] = SemanticState(
+        classification=ClassificationState(ted_classification.classification),
+        function=DocumentFunctionState(ted_classification.function),
+        affinity=previous_semantic.affinity,
+        canonical=previous_semantic.canonical,
+        publication=previous_semantic.publication,
+        resolved_class=ted_classification.resolved_class,
+        resolved_function=ted_classification.resolved_function,
+    ).to_dict()
+    adapted["ted_classification"] = {
+        "reason": ted_classification.reason,
+        "evidence_source": ted_classification.evidence_source,
+    }
     acquisition = AcquisitionState.from_dict(adapted["acquisition_state"])
     decision = evaluate_document_gold(
         identity=identity,
