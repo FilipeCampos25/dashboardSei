@@ -27,6 +27,7 @@ from app.services.pipeline_states import AcquisitionState
 from app.services.publication_policy import evaluate_document_gold
 from app.services.semantic_states import CanonicalState, ClassificationState, DocumentFunctionState, SemanticState
 from app.services.ted_classifier import TED_FUNCTION_INSTRUMENT, classify_ted_snapshot
+from app.services.ted_field_policy import apply_ted_field_policy
 
 
 RICH_COLUMNS = [
@@ -1061,12 +1062,16 @@ def build_ted_v2_record(
     snapshot = payload.get("snapshot", {}) if isinstance(payload.get("snapshot", {}), dict) else {}
     collection = payload.get("collection", {}) if isinstance(payload.get("collection", {}), dict) else {}
     text = str(snapshot.get("text", "") or "")
+    ted_classification = classify_ted_snapshot(snapshot)
+    policy_results = apply_ted_field_policy(ted_classification.resolved_function, list(diagnostics))
     field_results: List[FieldResult] = []
     for diagnostic in diagnostics:
         field_name = _clean_spaces(diagnostic.get("field_name", ""))
         if not field_name:
             continue
         state = _ted_field_state(diagnostic)
+        if state is not FieldState.CONFLICT and field_name in policy_results:
+            state = policy_results[field_name][1]
         evidences: Tuple[FieldEvidence, ...] = ()
         if state is FieldState.PRESENT:
             source_kind = _ted_source_kind(field_name, diagnostic)
@@ -1118,7 +1123,7 @@ def build_ted_v2_record(
     adapted["fields"] = [field.to_dict() for field in field_results]
     adapted["ted_field_diagnostics"] = [dict(item) for item in diagnostics]
     adapted["legacy_publication_status"] = record.get("publication_status")
-    ted_classification = classify_ted_snapshot(snapshot)
+    adapted["legacy_json_name"] = Path(str(record.get("json_path", ""))).name or None
     previous_semantic = SemanticState.from_dict(adapted["semantic_state"])
     adapted["semantic_state"] = SemanticState(
         classification=ClassificationState(ted_classification.classification),
@@ -1133,6 +1138,22 @@ def build_ted_v2_record(
         "reason": ted_classification.reason,
         "evidence_source": ted_classification.evidence_source,
     }
+    adapted["ted_field_policy"] = {
+        field_name: policy.value for field_name, (policy, _) in policy_results.items()
+    }
+    required_states = [state for policy, state in policy_results.values() if policy.value == "REQUIRED"]
+    missing_required = sum(state is not FieldState.PRESENT for state in required_states)
+    adapted["normalization_status_v2"] = (
+        "completo_padronizado" if required_states and not missing_required
+        else "parcial_padronizado" if required_states
+        else "not_evaluated"
+    )
+    adapted["quality_status_v2"] = (
+        "high" if required_states and not missing_required
+        else "medium" if required_states and missing_required < len(required_states)
+        else "low" if required_states
+        else "not_evaluated"
+    )
     acquisition = AcquisitionState.from_dict(adapted["acquisition_state"])
     semantic = SemanticState.from_dict(adapted["semantic_state"])
     has_verifiable_content = bool(text.strip()) or bool(snapshot.get("tables", []) or [])

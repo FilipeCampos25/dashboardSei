@@ -173,7 +173,15 @@ def _issue(
 
 def _required_field_issues(document_type: str, row: Dict[str, str]) -> List[Dict[str, Any]]:
     issues: List[Dict[str, Any]] = []
-    for field in REQUIRED_FIELDS.get(document_type, ()):
+    if document_type == "ted" and isinstance(row.get("_field_results_v2"), list):
+        required = [
+            str(item.get("field_name", ""))
+            for item in row["_field_results_v2"]  # type: ignore[index]
+            if isinstance(item, dict) and item.get("state") == "ABSENT"
+        ]
+    else:
+        required = list(REQUIRED_FIELDS.get(document_type, ()))
+    for field in required:
         if not _is_missing(row.get(field, "")):
             continue
         gold_missing = _is_gold(row)
@@ -190,6 +198,50 @@ def _required_field_issues(document_type: str, row: Dict[str, str]) -> List[Dict
             )
         )
     return issues
+
+
+def _ted_v2_state(row: Dict[str, Any], field_name: str) -> str | None:
+    fields = row.get("_field_results_v2")
+    if not isinstance(fields, list):
+        return None
+    for item in fields:
+        if isinstance(item, dict) and item.get("field_name") == field_name:
+            return str(item.get("state", ""))
+    return None
+
+
+def _attach_ted_v2_rows(output_path: Path, rows: List[Dict[str, str]], logger: Any = None) -> None:
+    sidecar = output_path / "v2" / "ted_normalizado_latest.v2.json"
+    if not sidecar.is_file():
+        return
+    try:
+        records = json.loads(sidecar.read_text(encoding="utf-8")).get("records", [])
+    except (OSError, TypeError, ValueError) as exc:
+        _log(logger, "warning", "Fila de revisao: falha ao ler sidecar TED V2 %s (%s).", sidecar, exc)
+        return
+    available = [record for record in records if isinstance(record, dict)]
+    for row in rows:
+        process_id = row.get("process_id", "") or row.get("processo", "")
+        json_name = Path(row.get("json_path", "")).name
+        matches = [
+            record for record in available
+            if (
+                record.get("process_id", "")
+                or record.get("processo", "")
+                or (record.get("identity", {}) if isinstance(record.get("identity"), dict) else {}).get("process_id", "")
+            ) == process_id
+            and (
+                not json_name
+                or record.get("legacy_json_name") == json_name
+                or (
+                    not record.get("legacy_json_name")
+                    and record.get("json_path")
+                    and Path(str(record.get("json_path", ""))).name == json_name
+                )
+            )
+        ]
+        if len(matches) == 1:
+            row["_field_results_v2"] = matches[0].get("fields", [])  # type: ignore[assignment]
 
 
 def _preview_or_fallback_issues(document_type: str, row: Dict[str, str], source_fields: Iterable[str]) -> List[Dict[str, Any]]:
@@ -459,7 +511,8 @@ def _ted_issues(rows: List[Dict[str, str]], status_rows: List[Dict[str, str]]) -
     issues: List[Dict[str, Any]] = []
     for row in rows:
         issues.extend(_required_field_issues("ted", row))
-        if _is_missing(row.get("valor_global", "")):
+        value_state = _ted_v2_state(row, "valor_global")
+        if (value_state == "ABSENT") or (value_state is None and _is_missing(row.get("valor_global", ""))):
             issues.append(
                 _issue(
                     code="ted_missing_financial_value",
@@ -472,7 +525,8 @@ def _ted_issues(rows: List[Dict[str, str]], status_rows: List[Dict[str, str]]) -
                     is_gold_missing=_is_gold(row),
                 )
             )
-        if _is_missing(row.get("plano_aplicacao", "")):
+        plan_state = _ted_v2_state(row, "plano_aplicacao")
+        if (plan_state == "ABSENT") or (plan_state is None and _is_missing(row.get("plano_aplicacao", ""))):
             issues.append(
                 _issue(
                     code="ted_without_application_plan",
@@ -485,7 +539,8 @@ def _ted_issues(rows: List[Dict[str, str]], status_rows: List[Dict[str, str]]) -
                     is_gold_missing=_is_gold(row),
                 )
             )
-        if _is_generic_object(row.get("objeto", "")):
+        object_state = _ted_v2_state(row, "objeto")
+        if object_state in {None, "ABSENT", "PRESENT"} and _is_generic_object(row.get("objeto", "")):
             issues.append(
                 _issue(
                     code="object_too_short_or_generic",
@@ -629,7 +684,9 @@ def collect_review_issues(output_dir: Path | str, logger: Any = None) -> List[Di
     issues: List[Dict[str, Any]] = []
     issues.extend(_pt_issues(_read_csv_rows(output_path / "pt_normalizado_latest.csv", logger), _read_csv_rows(output_path / "pt_status_execucao_latest.csv", logger)))
     issues.extend(_act_issues(_read_csv_rows(output_path / "act_classificacao_latest.csv", logger)))
-    issues.extend(_ted_issues(_read_csv_rows(output_path / "ted_normalizado_latest.csv", logger), _read_csv_rows(output_path / "ted_status_execucao_latest.csv", logger)))
+    ted_rows = _read_csv_rows(output_path / "ted_normalizado_latest.csv", logger)
+    _attach_ted_v2_rows(output_path, ted_rows, logger)
+    issues.extend(_ted_issues(ted_rows, _read_csv_rows(output_path / "ted_status_execucao_latest.csv", logger)))
     issues.extend(
         _administrative_issues(
             _read_csv_rows(output_path / "documento_administrativo_normalizado_latest.csv", logger),
