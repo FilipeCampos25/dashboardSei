@@ -4,7 +4,7 @@ import calendar
 import json
 import re
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -25,8 +25,8 @@ from app.services.gold_contracts import EvidenceLocation, FieldEvidence, SourceK
 from app.services.normalization_contract import DocumentIdentity
 from app.services.pipeline_states import AcquisitionState
 from app.services.publication_policy import evaluate_document_gold
-from app.services.semantic_states import ClassificationState, DocumentFunctionState, SemanticState
-from app.services.ted_classifier import classify_ted_snapshot
+from app.services.semantic_states import CanonicalState, ClassificationState, DocumentFunctionState, SemanticState
+from app.services.ted_classifier import TED_FUNCTION_INSTRUMENT, classify_ted_snapshot
 
 
 RICH_COLUMNS = [
@@ -1134,11 +1134,23 @@ def build_ted_v2_record(
         "evidence_source": ted_classification.evidence_source,
     }
     acquisition = AcquisitionState.from_dict(adapted["acquisition_state"])
+    semantic = SemanticState.from_dict(adapted["semantic_state"])
+    has_verifiable_content = bool(text.strip()) or bool(snapshot.get("tables", []) or [])
+    instrument_gate_semantic = semantic
+    if has_verifiable_content and not (
+        semantic.function is DocumentFunctionState.INSTRUMENT
+        and semantic.resolved_function == TED_FUNCTION_INSTRUMENT
+    ):
+        instrument_gate_semantic = replace(
+            semantic,
+            function=DocumentFunctionState.INELIGIBLE,
+            canonical=CanonicalState.INELIGIBLE,
+        )
     decision = evaluate_document_gold(
         identity=identity,
         acquisition=acquisition,
-        semantic=SemanticState.from_dict(adapted["semantic_state"]),
-        has_verifiable_content=bool(text.strip()) or bool(snapshot.get("tables", []) or []),
+        semantic=instrument_gate_semantic,
+        has_verifiable_content=has_verifiable_content,
     )
     adapted["document_gold_decision"] = decision.to_dict()
     return adapted

@@ -137,6 +137,72 @@ class TEDProvenanceTests(unittest.TestCase):
             v2["document_gold_decision"]["reason_codes"],
         )
 
+    def test_non_instrument_ted_functions_do_not_cross_document_gold_gate(self) -> None:
+        cases = (
+            ("meeting", "ATA DE REUNIAO sobre o TED 01/2026.", "ted.meeting_minutes"),
+            ("related", "Memorando que encaminha documentos do TED 01/2026.", "ted.related"),
+            ("unresolved", "Documento que cita o TED 01/2026 sem identificar sua funcao.", None),
+        )
+        for name, text, expected_function in cases:
+            with self.subTest(name=name):
+                payload = {
+                    "processo": f"test-only:ted-{name}",
+                    "snapshot": {"title": "TED 01/2026", "text": text, "tables": []},
+                    "collection": {
+                        "found": True,
+                        "acquisition_state": {
+                            "discovery": DiscoveryState.FOUND.value,
+                            "opening": OpeningState.OPENED.value,
+                            "access": AccessState.ACCESSIBLE.value,
+                            "extraction": ExtractionState.EXTRACTED.value,
+                        },
+                    },
+                    "analysis": {"publication_status": "published_gold"},
+                }
+                row, diagnostics = build_normalized_record(payload, f"{name}.json")
+
+                v2 = build_ted_v2_record(row, payload, diagnostics)
+
+                self.assertEqual(expected_function, v2["semantic_state"]["resolved_function"])
+                self.assertEqual("INELIGIBLE", v2["document_gold_decision"]["semantic_state"]["function"])
+                self.assertEqual("INELIGIBLE", v2["document_gold_decision"]["semantic_state"]["canonical"])
+                self.assertEqual("BLOCKED", v2["document_gold_decision"]["semantic_state"]["publication"])
+                self.assertEqual(
+                    [PublicationReasonCode.FUNCTION_INELIGIBLE.value],
+                    v2["document_gold_decision"]["reason_codes"],
+                )
+                self.assertEqual("published_gold", v2["legacy_publication_status"])
+                self.assertTrue(v2["fields"])
+
+    def test_quality_note_for_meeting_is_resolved_by_function_gate(self) -> None:
+        payload = {
+            "processo": "test-only:ted-meeting-note",
+            "snapshot": {
+                "title": "TED 01/2026",
+                "text": "ATA DE REUNIAO sobre o Termo de Execucao Descentralizada TED 01/2026.",
+                "tables": [],
+            },
+            "collection": {
+                "found": True,
+                "acquisition_state": {
+                    "discovery": DiscoveryState.FOUND.value,
+                    "opening": OpeningState.OPENED.value,
+                    "access": AccessState.ACCESSIBLE.value,
+                    "extraction": ExtractionState.EXTRACTED.value,
+                },
+            },
+            "analysis": {"publication_status": "published_gold"},
+        }
+        row, diagnostics = build_normalized_record(payload, "meeting-note.json")
+
+        v2 = build_ted_v2_record(row, payload, diagnostics)
+
+        self.assertIn("possivel_ata_ou_documento_relacionado", row["quality_notes"])
+        self.assertEqual("ted.meeting_minutes", v2["semantic_state"]["resolved_function"])
+        self.assertEqual("RELATED", v2["semantic_state"]["function"])
+        self.assertEqual("INELIGIBLE", v2["document_gold_decision"]["semantic_state"]["function"])
+        self.assertEqual("BLOCKED", v2["document_gold_decision"]["semantic_state"]["publication"])
+
     def test_dual_write_is_opt_in_and_keeps_legacy_bytes_equal(self) -> None:
         payload, _, _ = self._rich()
         output_dir = Path(__file__).resolve().parent / "_tmp_ted_provenance"
