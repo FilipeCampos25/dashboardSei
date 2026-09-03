@@ -102,6 +102,15 @@ class Settings(BaseSettings):
         default=False,
         validation_alias=AliasChoices("V2_DUAL_WRITE", "v2_dual_write"),
     )
+    ted_canonical_minimum_score: float = Field(
+        default=2.0,
+        validation_alias=AliasChoices("TED_CANONICAL_MINIMUM_SCORE", "ted_canonical_minimum_score"),
+    )
+    ted_canonical_minimum_margin: float = Field(
+        default=1.0,
+        ge=0,
+        validation_alias=AliasChoices("TED_CANONICAL_MINIMUM_MARGIN", "ted_canonical_minimum_margin"),
+    )
     provenance_enforcement_mode: str = Field(
         default="off",
         pattern="^(off|warn|error)$",

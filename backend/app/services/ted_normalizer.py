@@ -14,6 +14,7 @@ from urllib.parse import parse_qs, urlparse
 from app.config import get_settings
 from app.output import csv_writer
 from app.services.act_normalizer import PUBLICATION_STATUS_GOLD, PUBLICATION_STATUS_SILVER
+from app.services.canonical_selection import CanonicalCandidate, select_canonical
 from app.services.contract_adapters import (
     V2_SCHEMA_VERSION,
     adapt_legacy_record,
@@ -25,9 +26,20 @@ from app.services.gold_contracts import EvidenceLocation, FieldEvidence, SourceK
 from app.services.normalization_contract import DocumentIdentity
 from app.services.pipeline_states import AcquisitionState
 from app.services.publication_policy import evaluate_document_gold
-from app.services.semantic_states import CanonicalState, ClassificationState, DocumentFunctionState, SemanticState
+from app.services.semantic_states import (
+    CanonicalState,
+    ClassificationState,
+    DocumentFunctionState,
+    PublicationState,
+    SemanticState,
+)
 from app.services.ted_classifier import TED_FUNCTION_INSTRUMENT, classify_ted_snapshot
 from app.services.ted_field_policy import apply_ted_field_policy
+
+
+TED_CANONICAL_MINIMUM_SCORE = 2.0
+TED_CANONICAL_MINIMUM_MARGIN = 1.0
+_TED_CANONICAL_QUALITY_SCORES = {"not_evaluated": 0.0, "low": 1.0, "medium": 2.0, "high": 3.0}
 
 
 RICH_COLUMNS = [
@@ -1183,6 +1195,102 @@ def _iter_gold_records(records: Iterable[Dict[str, Any]]) -> Iterable[Dict[str, 
             yield record
 
 
+def _ted_canonical_score(record: Dict[str, Any]) -> float:
+    """Adapt the existing V2 quality grade to the common selector's numeric contract."""
+
+    return _TED_CANONICAL_QUALITY_SCORES.get(_clean_spaces(record.get("quality_status_v2", "")).lower(), 0.0)
+
+
+def _replace_canonical_state(record: Dict[str, Any], state: CanonicalState) -> None:
+    semantic = SemanticState.from_dict(record["semantic_state"])
+    record["semantic_state"] = replace(semantic, canonical=state).to_dict()
+    gold = record["document_gold_decision"]
+    gold_semantic = SemanticState.from_dict(gold["semantic_state"])
+    gold["semantic_state"] = replace(
+        gold_semantic,
+        canonical=state,
+        publication=PublicationState.PUBLISHED if state is CanonicalState.SELECTED else PublicationState.BLOCKED,
+    ).to_dict()
+
+
+def apply_ted_canonical_selection(
+    records: Sequence[Dict[str, Any]],
+    *,
+    threshold: float = TED_CANONICAL_MINIMUM_SCORE,
+    min_margin: float = TED_CANONICAL_MINIMUM_MARGIN,
+) -> List[Dict[str, Any]]:
+    """Apply the common selector per validated process identity in V2 shadow data."""
+
+    selected_records = [dict(record) for record in records]
+    groups: Dict[str, List[Dict[str, Any]]] = {}
+    eligible_by_process: Dict[str, List[Dict[str, Any]]] = {}
+
+    for record in selected_records:
+        record["document_gold_decision"] = {
+            **record["document_gold_decision"],
+            "semantic_state": dict(record["document_gold_decision"]["semantic_state"]),
+            "reason_codes": list(record["document_gold_decision"].get("reason_codes", [])),
+        }
+        identity = DocumentIdentity.from_dict(record["identity"])
+        gate_semantic = SemanticState.from_dict(record["document_gold_decision"]["semantic_state"])
+        eligible = (
+            bool(identity.process_id)
+            and bool(identity.candidate_id)
+            and gate_semantic.publication is PublicationState.PUBLISHED
+            and gate_semantic.function is DocumentFunctionState.INSTRUMENT
+            and gate_semantic.resolved_function == TED_FUNCTION_INSTRUMENT
+        )
+        record["ted_canonical_candidate"] = {
+            "eligible": eligible,
+            "score": _ted_canonical_score(record) if eligible else None,
+        }
+        if not identity.process_id:
+            decision = select_canonical([], threshold=threshold, min_margin=min_margin)
+            record["canonical_decision"] = decision.to_dict()
+            _replace_canonical_state(record, CanonicalState.UNRESOLVED)
+            record["document_gold_decision"]["reason_codes"].append(decision.reason.value)
+            continue
+        groups.setdefault(identity.process_id, []).append(record)
+        if eligible:
+            eligible_by_process.setdefault(identity.process_id, []).append(record)
+
+    for process_id, process_records in groups.items():
+        eligible_records = eligible_by_process.get(process_id, [])
+        candidate_ids = [DocumentIdentity.from_dict(record["identity"]).candidate_id for record in eligible_records]
+        duplicated_ids = {candidate_id for candidate_id in candidate_ids if candidate_ids.count(candidate_id) > 1}
+        competing = [
+            record for record in eligible_records
+            if DocumentIdentity.from_dict(record["identity"]).candidate_id not in duplicated_ids
+        ]
+        decision = select_canonical(
+            [
+                CanonicalCandidate(
+                    identity=DocumentIdentity.from_dict(record["identity"]),
+                    score=_ted_canonical_score(record),
+                )
+                for record in competing
+            ],
+            threshold=threshold,
+            min_margin=min_margin,
+        )
+        winner_id = decision.winner_candidate_id
+        for record in process_records:
+            identity = DocumentIdentity.from_dict(record["identity"])
+            gate_semantic = SemanticState.from_dict(record["document_gold_decision"]["semantic_state"])
+            record["canonical_decision"] = decision.to_dict()
+            if gate_semantic.canonical is CanonicalState.INELIGIBLE:
+                state = CanonicalState.INELIGIBLE
+            elif not record["ted_canonical_candidate"]["eligible"]:
+                state = CanonicalState.UNRESOLVED
+            elif decision.canonical_state is CanonicalState.SELECTED:
+                state = CanonicalState.SELECTED if identity.candidate_id == winner_id else CanonicalState.UNRESOLVED
+            else:
+                state = decision.canonical_state
+            _replace_canonical_state(record, state)
+            record["document_gold_decision"]["reason_codes"].append(decision.reason.value)
+    return selected_records
+
+
 def export_normalized_csv(
     output_dir: Path,
     *,
@@ -1190,6 +1298,7 @@ def export_normalized_csv(
     logger: Any = None,
 ) -> Dict[str, Any]:
     csv_writer.ensure_output_dir(output_dir)
+    settings = get_settings()
     rows: List[Dict[str, Any]] = []
     diagnostics: List[Dict[str, Any]] = []
     v2_inputs: List[tuple[Dict[str, Any], Dict[str, Any], List[Dict[str, Any]], Path]] = []
@@ -1197,7 +1306,11 @@ def export_normalized_csv(
     if records is None:
         source_records = []
     else:
-        source_records = list(_iter_gold_records(records))
+        source_records = (
+            [record for record in records if record.get("json_path")]
+            if settings.v2_dual_write
+            else list(_iter_gold_records(records))
+        )
 
     for record in source_records:
         json_path = _resolve_path(record.get("json_path", ""), output_dir)
@@ -1211,23 +1324,33 @@ def export_normalized_csv(
             row["validation_status"] = _clean_spaces(record.get("validation_status", ""))
         if not row.get("publication_status"):
             row["publication_status"] = _clean_spaces(record.get("publication_status", ""))
-        rows.append(row)
-        diagnostics.extend(field_diagnostics)
-        v2_inputs.append((row, payload, field_diagnostics, json_path))
+        if record.get("publication_status") == PUBLICATION_STATUS_GOLD:
+            rows.append(row)
+            diagnostics.extend(field_diagnostics)
+        if settings.v2_dual_write:
+            v2_row = dict(row)
+            v2_row["publication_status"] = _clean_spaces(record.get("publication_status", "")) or row["publication_status"]
+            v2_inputs.append((v2_row, payload, field_diagnostics, json_path))
 
     csv_path = output_dir / "ted_normalizado_latest.csv"
     diagnostics_path = output_dir / "ted_field_diagnostics_latest.csv"
     csv_writer.write_csv(rows, csv_path, columns=RICH_COLUMNS + RAW_SOURCE_COLUMNS)
     csv_writer.write_csv(diagnostics, diagnostics_path, columns=DIAGNOSTIC_COLUMNS)
     v2_path = None
-    if get_settings().v2_dual_write:
+    if settings.v2_dual_write:
+        v2_records = [
+            build_ted_v2_record(row, payload, field_diagnostics, source_path=json_path.name)
+            for row, payload, field_diagnostics, json_path in v2_inputs
+        ]
+        v2_records = apply_ted_canonical_selection(
+            v2_records,
+            threshold=getattr(settings, "ted_canonical_minimum_score", TED_CANONICAL_MINIMUM_SCORE),
+            min_margin=getattr(settings, "ted_canonical_minimum_margin", TED_CANONICAL_MINIMUM_MARGIN),
+        )
         envelope = {
             "schema_version": V2_SCHEMA_VERSION,
             "legacy_artifact": csv_path.name,
-            "records": [
-                build_ted_v2_record(row, payload, field_diagnostics, source_path=json_path.name)
-                for row, payload, field_diagnostics, json_path in v2_inputs
-            ],
+            "records": v2_records,
         }
         v2_path = write_v2_sidecar(v2_sidecar_path(csv_path), envelope, family="TED")
     if logger is not None:
