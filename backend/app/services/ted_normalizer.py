@@ -35,6 +35,7 @@ from app.services.semantic_states import (
 )
 from app.services.ted_classifier import TED_FUNCTION_INSTRUMENT, classify_ted_snapshot
 from app.services.ted_field_policy import apply_ted_field_policy
+from app.services.ted_field_consolidation import consolidate_ted_fields
 
 
 TED_CANONICAL_MINIMUM_SCORE = 2.0
@@ -1347,6 +1348,7 @@ def export_normalized_csv(
             threshold=getattr(settings, "ted_canonical_minimum_score", TED_CANONICAL_MINIMUM_SCORE),
             min_margin=getattr(settings, "ted_canonical_minimum_margin", TED_CANONICAL_MINIMUM_MARGIN),
         )
+        v2_records = consolidate_ted_fields(v2_records)
         envelope = {
             "schema_version": V2_SCHEMA_VERSION,
             "legacy_artifact": csv_path.name,

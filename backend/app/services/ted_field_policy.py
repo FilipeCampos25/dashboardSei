@@ -75,6 +75,17 @@ def field_policy_for_function(resolved_function: str | None, field_name: str) ->
     return RequirementPolicy.NOT_EVALUATED
 
 
+def may_complement_instrument(source_function: str | None, field_name: str) -> bool:
+    """Allow only a field expected on the instrument and required by its source function."""
+
+    return (
+        field_policy_for_function(TED_FUNCTION_INSTRUMENT, field_name)
+        is RequirementPolicy.EXPECTED_ELSEWHERE
+        and field_policy_for_function(source_function, field_name)
+        is RequirementPolicy.REQUIRED
+    )
+
+
 def field_state_for_policy(policy: RequirementPolicy, *, value_present: bool) -> FieldState:
     if value_present:
         return FieldState.PRESENT

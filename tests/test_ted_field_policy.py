@@ -21,6 +21,7 @@ from app.services.ted_field_policy import (
     RequirementPolicy,
     field_policy_for_function,
     field_state_for_policy,
+    may_complement_instrument,
 )
 from app.output import csv_writer
 from app.services.normalization_review import _ted_issues, collect_review_issues
@@ -68,6 +69,13 @@ class TEDFieldPolicyTests(unittest.TestCase):
                     RequirementPolicy.NOT_EVALUATED,
                     field_policy_for_function(function, "objeto"),
                 )
+
+    def test_only_work_plan_sections_are_authorized_for_automatic_consolidation(self) -> None:
+        for field_name in ("plano_aplicacao", "cronograma_desembolso", "metas"):
+            self.assertTrue(may_complement_instrument(TED_FUNCTION_WORK_PLAN, field_name))
+        for function in (TED_FUNCTION_AMENDMENT, TED_FUNCTION_EXTRACT, TED_FUNCTION_RELATED, TED_FUNCTION_MEETING_MINUTES):
+            self.assertFalse(may_complement_instrument(function, "metas"))
+        self.assertFalse(may_complement_instrument(TED_FUNCTION_WORK_PLAN, "objeto"))
 
     def test_policy_maps_to_existing_field_states_without_fabricating_value(self) -> None:
         cases = (
