@@ -10,7 +10,15 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 
 from app.services.dashboard_exporter import export_dashboard_ready_csv
-from app.services.ted_normalizer import RICH_COLUMNS, build_normalized_record, export_normalized_csv, parse_brl_money
+from app.services.ted_normalizer import (
+    RICH_COLUMNS,
+    UnitCandidate,
+    _select_unit_candidate,
+    build_normalized_record,
+    build_ted_v2_record,
+    export_normalized_csv,
+    parse_brl_money,
+)
 from tests.fixture_loader import load_fixture
 
 
@@ -27,6 +35,59 @@ class TEDNormalizerTests(unittest.TestCase):
         self.assertEqual(parse_brl_money("R$ 1.255.800,00"), "1255800.00")
         self.assertEqual(parse_brl_money("valor total de R$ 2.500.000,00"), "2500000.00")
         self.assertEqual(parse_brl_money("130.000,00"), "130000.00")
+
+    def test_document_heading_extracts_number_and_year_before_referenced_ted(self) -> None:
+        row, diagnostics = self._normalize_tables([], text=(
+            "TERMO DE EXECUCAO DESCENTRALIZADA (TED) nº 1/2026 - ORGAO A/ORGAO B\n"
+            "Historico: o TED nº 8/2024 foi encerrado."
+        ))
+
+        self.assertEqual((row["numero_ted"], row["ano_ted"]), ("1", "2026"))
+        identity = {
+            item["field_name"]: item for item in diagnostics
+            if item["field_name"] in {"numero_ted", "ano_ted"}
+        }
+        self.assertEqual(identity["numero_ted"]["source"], "snapshot.text")
+        self.assertIn("1/2026", identity["numero_ted"]["raw_value"])
+
+    def test_confirmed_title_identity_is_used_but_title_only_does_not_create_gold(self) -> None:
+        payload = {
+            "processo": "test-only:title-identity",
+            "snapshot": {
+                "title": "TED nº 1/2026",
+                "text": "TERMO DE EXECUCAO DESCENTRALIZADA. OBJETO: entrega verificavel.",
+                "tables": [],
+            },
+        }
+        row, diagnostics = build_normalized_record(payload, "title-identity.json")
+        self.assertEqual((row["numero_ted"], row["ano_ted"]), ("1", "2026"))
+        numero = next(item for item in diagnostics if item["field_name"] == "numero_ted")
+        self.assertEqual(numero["source"], "snapshot.title")
+
+        title_only, _ = build_normalized_record({
+            "snapshot": {"title": "TED nº 1/2026", "text": "", "tables": []},
+        }, "title-only-identity.json")
+        self.assertEqual((title_only["numero_ted"], title_only["ano_ted"]), ("1", "2026"))
+        self.assertEqual(title_only["publication_status"], "retained_silver")
+
+    def test_equally_plausible_identity_pairs_abstain_and_partial_pair_is_not_fabricated(self) -> None:
+        ambiguous, diagnostics = self._normalize_tables([], text=(
+            "TED nº 1/2026\nTERMO DE EXECUCAO DESCENTRALIZADA nº 2/2025\nOBJETO: entrega."
+        ))
+        self.assertEqual((ambiguous["numero_ted"], ambiguous["ano_ted"]), ("", ""))
+        self.assertTrue(all(
+            item["warning"] == "ambiguous_ted_identity_candidates"
+            for item in diagnostics if item["field_name"] in {"numero_ted", "ano_ted"}
+        ))
+        v2 = build_ted_v2_record(ambiguous, {
+            "snapshot": {"text": "TED nº 1/2026\nTERMO DE EXECUCAO DESCENTRALIZADA nº 2/2025"}
+        }, diagnostics)
+        numero = next(item for item in v2["fields"] if item["field_name"] == "numero_ted")
+        self.assertEqual(numero["state"], "CONFLICT")
+        self.assertEqual(len(numero["evidences"]), 2)
+
+        partial, _ = self._normalize_tables([], text="TED nº 4. Exercicio financeiro de 2023.")
+        self.assertEqual((partial["numero_ted"], partial["ano_ted"]), ("", ""))
 
     def test_versioned_rich_ted_extracts_both_units_with_table_provenance(self) -> None:
         payload = load_fixture("ted_normalizer_rich.json")["payload"]
@@ -182,6 +243,36 @@ class TEDNormalizerTests(unittest.TestCase):
         self.assertIn("unidade_descentralizadora:ambiguous_unit_candidates", row["quality_notes"])
         diagnostic = next(item for item in diagnostics if item["field_name"] == "unidade_descentralizadora")
         self.assertEqual(diagnostic["warning"], "ambiguous_unit_candidates")
+
+    def test_incidental_unit_mentions_do_not_compete_with_labeled_entity(self) -> None:
+        row, _ = self._normalize_tables([{"rows": [
+            ["2. DADOS CADASTRAIS DA UNIDADE DESCENTRALIZADA"],
+            ["Nome do orgao ou entidade descentralizada: Universidade Alfa (UA)"],
+            ["4. OBRIGACOES"],
+            ["A Unidade Descentralizada apresentara relatorio a Unidade Descentralizadora."],
+        ]}])
+        self.assertEqual(row["unidade_descentralizada"], "Universidade Alfa (UA)")
+
+    def test_unit_selection_is_order_independent_for_agreement_and_conflict(self) -> None:
+        def candidate(value: str, row: int) -> UnitCandidate:
+            return UnitCandidate(
+                field_name="unidade_descentralizada", value=value, raw_value=value,
+                matched_key="Nome do orgao ou entidade descentralizada", table_index=1,
+                row_index=row, column_index=1, confidence="high",
+                rule_id="ted.unit.entity_name.inline", source="snapshot.tables[1]",
+            )
+
+        agreeing = [candidate("Universidade Alfa", 3), candidate("Universidade Alfa", 2)]
+        forward = _select_unit_candidate("unidade_descentralizada", agreeing)
+        reverse = _select_unit_candidate("unidade_descentralizada", list(reversed(agreeing)))
+        self.assertEqual(vars(forward), vars(reverse))
+
+        conflicting = [candidate("Universidade Alfa", 2), candidate("Universidade Beta", 3)]
+        forward = _select_unit_candidate("unidade_descentralizada", conflicting)
+        reverse = _select_unit_candidate("unidade_descentralizada", list(reversed(conflicting)))
+        self.assertEqual(vars(forward), vars(reverse))
+        self.assertEqual(forward.warning, "ambiguous_unit_candidates")
+        self.assertEqual(len(forward.candidate_evidences), 2)
 
     def test_signature_schedule_censipam_and_act_pt_payload_are_not_unit_sources(self) -> None:
         payload = {

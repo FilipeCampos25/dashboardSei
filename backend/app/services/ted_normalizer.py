@@ -178,6 +178,7 @@ class ExtractedField:
     column_index: int | str = ""
     confidence: str = "low"
     warning: str = ""
+    candidate_evidences: Tuple[Dict[str, Any], ...] = ()
 
     @property
     def status(self) -> str:
@@ -541,20 +542,41 @@ def _extract_vigencia(snapshot: Dict[str, Any], text: str) -> Dict[str, Extracte
 
 def _extract_numero_ano(snapshot: Dict[str, Any], text: str) -> tuple[ExtractedField, ExtractedField]:
     title = _clean_spaces(snapshot.get("title", ""))
-    haystack = "\n".join([title, text])
-    normalized_haystack = _norm(haystack)
-    patterns = [
-        r"termo\s+de\s+execucao\s+descentralizada\s*(?:n\S{0,4}\s*)?(\d+)(?:\s*/\s*[a-z]+)?\s*/\s*(20\d{2}|19\d{2})",
-        r"ted\s*(?:n\S{0,4}\s*)?(\d+)(?:\s*/\s*[a-z]+)?\s*/\s*(20\d{2}|19\d{2})",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, normalized_haystack, flags=re.IGNORECASE)
-        if match:
-            raw = _clean_spaces(match.group(0))
+    pattern = re.compile(
+        r"(?:termo\s+de\s+execucao\s+descentralizada\s*(?:\(\s*ted\s*\))?|ted)"
+        r"\s*(?:n(?:umero|[oº°])?\.?\s*)?(\d+)\s*/\s*(20\d{2}|19\d{2})",
+        flags=re.IGNORECASE,
+    )
+    candidates: List[tuple[int, str, str, str, str]] = []
+    for source, raw_source, source_rank in (("snapshot.title", title, 3), ("snapshot.text", text, 2)):
+        for raw_line in str(raw_source or "").splitlines() or (str(raw_source or ""),):
+            line = _clean_spaces(raw_line)
+            normalized_line = _norm(line)
+            for match in pattern.finditer(normalized_line):
+                # A TED identity used as the line heading is stronger than an incidental body reference.
+                contextual_rank = source_rank if source == "snapshot.title" or match.start() <= 4 else 1
+                candidates.append((contextual_rank, match.group(1), match.group(2), line[match.start():match.end()], source))
+    if candidates:
+        best_rank = max(candidate[0] for candidate in candidates)
+        best = [candidate for candidate in candidates if candidate[0] == best_rank]
+        pairs = {(candidate[1], candidate[2]) for candidate in best}
+        candidate_evidences = tuple(
+            {
+                "raw_value": candidate[3], "source": candidate[4],
+                "rule_id": "ted.identity.candidate",
+            }
+            for candidate in sorted(best, key=lambda item: (item[1], item[2], item[4], item[3]))
+        )
+        if len(pairs) == 1:
+            chosen = sorted(best, key=lambda item: (item[4], item[3]))[0]
             return (
-                ExtractedField(value=match.group(1), raw_value=raw, source="snapshot.text", rule_id="ted.numero"),
-                ExtractedField(value=match.group(2), raw_value=raw, source="snapshot.text", rule_id="ted.ano"),
+                ExtractedField(value=chosen[1], raw_value=chosen[3], source=chosen[4], rule_id="ted.numero", candidate_evidences=candidate_evidences),
+                ExtractedField(value=chosen[2], raw_value=chosen[3], source=chosen[4], rule_id="ted.ano", candidate_evidences=candidate_evidences),
             )
+        return (
+            ExtractedField(rule_id="ted.numero.ambiguous", warning="ambiguous_ted_identity_candidates", candidate_evidences=candidate_evidences),
+            ExtractedField(rule_id="ted.ano.ambiguous", warning="ambiguous_ted_identity_candidates", candidate_evidences=candidate_evidences),
+        )
     return ExtractedField(rule_id="ted.numero"), ExtractedField(rule_id="ted.ano")
 
 
@@ -720,6 +742,8 @@ def _collect_unit_candidates(snapshot: Dict[str, Any], text: str) -> Dict[str, L
                     if context and field_name != context:
                         continue
                     for alias in aliases:
+                        if alias.rule == "block_name" and not _alias_pattern(alias.text).match(cell_norm):
+                            continue
                         candidate = _candidate_from_cell(
                             field_name=field_name,
                             alias=alias,
@@ -788,13 +812,20 @@ def _select_unit_candidate(field_name: str, candidates: Sequence[UnitCandidate])
         return ExtractedField(rule_id=f"ted.{field_name}", warning="missing")
     rank = {"high": 2, "medium": 1, "low": 0}
     best_rank = max(rank.get(candidate.confidence, 0) for candidate in candidates)
-    best = [candidate for candidate in candidates if rank.get(candidate.confidence, 0) == best_rank]
+    best = sorted(
+        (candidate for candidate in candidates if rank.get(candidate.confidence, 0) == best_rank),
+        key=lambda candidate: (
+            _norm(candidate.value), candidate.source, str(candidate.table_index),
+            str(candidate.row_index), str(candidate.column_index), candidate.rule_id, candidate.raw_value,
+        ),
+    )
     values = {_norm(candidate.value) for candidate in best}
     if len(values) > 1:
         return ExtractedField(
             rule_id=f"ted.{field_name}.ambiguous",
             confidence=best[0].confidence,
             warning="ambiguous_unit_candidates",
+            candidate_evidences=tuple(vars(candidate) for candidate in best),
         )
     chosen = best[0]
     return ExtractedField(
@@ -807,6 +838,7 @@ def _select_unit_candidate(field_name: str, candidates: Sequence[UnitCandidate])
         row_index=chosen.row_index,
         column_index=chosen.column_index,
         confidence=chosen.confidence,
+        candidate_evidences=tuple(vars(candidate) for candidate in best),
     )
 
 
@@ -968,6 +1000,8 @@ def build_normalized_record(payload: Dict[str, Any], json_path: Path | str) -> t
     for name in ("unidade_descentralizadora", "unidade_descentralizada"):
         if fields[name].warning and fields[name].warning != "missing":
             notes.append(f"{name}:{fields[name].warning}")
+    if fields["numero_ted"].warning:
+        notes.append(f"numero_ano:{fields['numero_ted'].warning}")
 
     row: Dict[str, Any] = {
         "processo": _clean_spaces(payload.get("processo", "")),
@@ -1000,6 +1034,7 @@ def build_normalized_record(payload: Dict[str, Any], json_path: Path | str) -> t
             "column_index": field.column_index,
             "confidence": field.confidence,
             "warning": field.warning,
+            "candidate_evidences": field.candidate_evidences,
             "json_path": str(json_path),
         }
         for name, field in fields.items()
@@ -1049,7 +1084,7 @@ def _ted_source_kind(field_name: str, diagnostic: Dict[str, Any]) -> SourceKind 
     if field_name in _TED_DERIVED_FIELDS or rule_id.endswith(".calculated"):
         return SourceKind.DERIVED
     source = _clean_spaces(diagnostic.get("source", ""))
-    if source == "snapshot.text" or source.startswith("snapshot.tables["):
+    if source in {"snapshot.text", "snapshot.title"} or source.startswith("snapshot.tables["):
         return SourceKind.DOCUMENT
     return None
 
@@ -1057,7 +1092,9 @@ def _ted_source_kind(field_name: str, diagnostic: Dict[str, Any]) -> SourceKind 
 def _ted_field_state(diagnostic: Dict[str, Any]) -> FieldState:
     if diagnostic.get("value") is not None and _clean_spaces(diagnostic.get("value", "")):
         return FieldState.PRESENT
-    if _clean_spaces(diagnostic.get("warning", "")) == "ambiguous_unit_candidates":
+    if _clean_spaces(diagnostic.get("warning", "")) in {
+        "ambiguous_unit_candidates", "ambiguous_ted_identity_candidates"
+    }:
         return FieldState.CONFLICT
     return FieldState.NOT_EVALUATED
 
@@ -1086,12 +1123,16 @@ def build_ted_v2_record(
         if state is not FieldState.CONFLICT and field_name in policy_results:
             state = policy_results[field_name][1]
         evidences: Tuple[FieldEvidence, ...] = ()
-        if state is FieldState.PRESENT:
-            source_kind = _ted_source_kind(field_name, diagnostic)
-            if source_kind is not None:
-                table_index = _diagnostic_index(diagnostic.get("table_index"))
-                row_index = _diagnostic_index(diagnostic.get("row_index"))
-                column_index = _diagnostic_index(diagnostic.get("column_index"))
+        evidence_diagnostics = diagnostic.get("candidate_evidences") or (diagnostic,)
+        if state in {FieldState.PRESENT, FieldState.CONFLICT}:
+            evidence_items: List[FieldEvidence] = []
+            for evidence_diagnostic in evidence_diagnostics:
+                source_kind = _ted_source_kind(field_name, evidence_diagnostic)
+                if source_kind is None:
+                    continue
+                table_index = _diagnostic_index(evidence_diagnostic.get("table_index"))
+                row_index = _diagnostic_index(evidence_diagnostic.get("row_index"))
+                column_index = _diagnostic_index(evidence_diagnostic.get("column_index"))
                 has_structural_location = any(value is not None for value in (table_index, row_index, column_index))
                 location = (
                     EvidenceLocation(
@@ -1103,16 +1144,15 @@ def build_ted_v2_record(
                     if has_structural_location
                     else None
                 )
-                evidences = (
-                    FieldEvidence(
-                        field_name=field_name,
-                        source_kind=source_kind,
-                        source_document=identity if source_kind is SourceKind.DOCUMENT else None,
-                        rule_id=_clean_spaces(diagnostic.get("rule_id", "")) or None,
-                        location=location,
-                        raw_evidence=_clean_spaces(diagnostic.get("raw_value", "")) or None,
-                    ),
-                )
+                evidence_items.append(FieldEvidence(
+                    field_name=field_name,
+                    source_kind=source_kind,
+                    source_document=identity if source_kind is SourceKind.DOCUMENT else None,
+                    rule_id=_clean_spaces(evidence_diagnostic.get("rule_id", "")) or None,
+                    location=location,
+                    raw_evidence=_clean_spaces(evidence_diagnostic.get("raw_value", "")) or None,
+                ))
+            evidences = tuple(evidence_items)
         field_results.append(
             FieldResult(
                 field_name=field_name,
