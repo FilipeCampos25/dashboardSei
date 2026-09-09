@@ -17,7 +17,10 @@ from app.services.documento_administrativo_normalizer import (
 )
 from app.services.field_states import FieldResult, FieldState
 from app.services.gold_contracts import SourceKind
+from app.services.pipeline_states import AccessState, DiscoveryState, ExtractionState, OpeningState
 from app.services.provenance_validation import validate_field_provenance
+from app.services.publication_policy import PublicationReasonCode
+from app.services.semantic_states import PublicationState
 
 
 class AdministrativoProvenanceTests(unittest.TestCase):
@@ -57,8 +60,15 @@ class AdministrativoProvenanceTests(unittest.TestCase):
         root.mkdir()
         try:
             source = root / "documento_administrativo_fixture.json"
-            source.write_text(json.dumps(self._payload()), encoding="utf-8")
-            records = [{"publication_status": "published_gold", "json_path": str(source)}]
+            payload = self._payload()
+            payload["collection"].pop("acquisition_state")
+            source.write_text(json.dumps(payload), encoding="utf-8")
+            records = [{
+                "publication_status": "published_gold",
+                "json_path": str(source),
+                "found": True,
+                "acquisition_state": self._successful_state(ExtractionState.EXTRACTED),
+            }]
             with patch("app.services.documento_administrativo_normalizer.get_settings", return_value=SimpleNamespace(v2_dual_write=False)):
                 off = export_normalized_csv(root, records)
             legacy = off["latest_path"].read_bytes()
@@ -67,8 +77,74 @@ class AdministrativoProvenanceTests(unittest.TestCase):
                 on = export_normalized_csv(root, records)
             self.assertEqual(legacy, on["latest_path"].read_bytes())
             self.assertTrue(on["v2_path"].is_file())
+            sidecar = json.loads(on["v2_path"].read_text(encoding="utf-8"))
+            self.assertEqual(
+                PublicationState.PUBLISHED.value,
+                sidecar["records"][0]["document_gold_decision"]["semantic_state"]["publication"],
+            )
         finally:
             shutil.rmtree(root, ignore_errors=True)
+
+    def test_empty_whitespace_and_title_only_are_blocked_from_document_gold(self) -> None:
+        cases = (
+            ("empty", "", ""),
+            ("whitespace", "Nota Técnica nº 12/2020", " \n\t "),
+            ("title-only", "Ofício nº 7/2024", ""),
+        )
+        for name, title, text in cases:
+            with self.subTest(case=name):
+                payload = self._payload()
+                payload["snapshot"].update({"title": title, "text": text, "tables": []})
+                payload["collection"]["acquisition_state"] = self._successful_state(
+                    ExtractionState.EMPTY_CONTENT if not text.strip() else ExtractionState.EXTRACTED
+                )
+                legacy = build_normalized_record(payload, Path(f"{name}.json"))
+                v2 = build_administrativo_v2_record(legacy, payload)
+
+                self.assertEqual(PublicationState.BLOCKED.value, v2["document_gold_decision"]["semantic_state"]["publication"])
+                self.assertEqual(
+                    [PublicationReasonCode.EMPTY_CONTENT.value],
+                    v2["document_gold_decision"]["reason_codes"],
+                )
+
+    def test_technical_failure_is_not_reinterpreted_as_empty_content(self) -> None:
+        payload = self._payload()
+        payload["snapshot"].update({"title": "Memorando nº 1/2020", "text": "", "tables": []})
+        payload["collection"]["acquisition_state"] = {
+            "discovery": DiscoveryState.FOUND.value,
+            "opening": OpeningState.OPENED.value,
+            "access": AccessState.IFRAME_UNAVAILABLE.value,
+            "extraction": ExtractionState.NOT_ATTEMPTED.value,
+        }
+        legacy = build_normalized_record(payload, Path("iframe.json"))
+        v2 = build_administrativo_v2_record(legacy, payload)
+
+        self.assertEqual(
+            [PublicationReasonCode.IFRAME_UNAVAILABLE.value],
+            v2["document_gold_decision"]["reason_codes"],
+        )
+        self.assertEqual(payload["collection"]["acquisition_state"], v2["acquisition_state"])
+
+    def test_verifiable_content_remains_eligible_for_document_gold(self) -> None:
+        payload = self._payload()
+        payload["collection"]["acquisition_state"] = self._successful_state(ExtractionState.EXTRACTED)
+        legacy = build_normalized_record(payload, Path("administrativo.json"))
+        v2 = build_administrativo_v2_record(legacy, payload)
+
+        self.assertEqual(PublicationState.PUBLISHED.value, v2["document_gold_decision"]["semantic_state"]["publication"])
+        self.assertEqual(
+            [PublicationReasonCode.ELIGIBLE_VERIFIABLE_CONTENT.value],
+            v2["document_gold_decision"]["reason_codes"],
+        )
+
+    @staticmethod
+    def _successful_state(extraction: ExtractionState) -> dict[str, str]:
+        return {
+            "discovery": DiscoveryState.FOUND.value,
+            "opening": OpeningState.OPENED.value,
+            "access": AccessState.ACCESSIBLE.value,
+            "extraction": extraction.value,
+        }
 
     @staticmethod
     def _fields(v2: dict[str, object]) -> dict[str, FieldResult]:
@@ -89,7 +165,12 @@ class AdministrativoProvenanceTests(unittest.TestCase):
                     "Documento assinado eletronicamente em 20/04/2020."
                 ),
             },
-            "collection": {"document_id": "4455667", "candidate_id": "candidate-admin"},
+            "collection": {
+                "document_id": "4455667",
+                "candidate_id": "candidate-admin",
+                "found": True,
+                "acquisition_state": AdministrativoProvenanceTests._successful_state(ExtractionState.EXTRACTED),
+            },
         }
 
 

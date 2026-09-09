@@ -17,6 +17,9 @@ from app.services.contract_adapters import V2_SCHEMA_VERSION, adapt_legacy_recor
 from app.services.field_states import FieldResult, FieldState
 from app.services.gold_contracts import EvidenceLocation, FieldEvidence, SourceKind
 from app.services.normalization_contract import DocumentIdentity
+from app.services.pipeline_states import AcquisitionState
+from app.services.publication_policy import evaluate_document_gold
+from app.services.semantic_states import SemanticState
 
 DATE_PATTERN = r"\d{1,2}(?:[./-]\d{1,2}[./-]\d{4}|\s+de\s+[A-Za-z\u00c0-\u00ff]+\s+de\s+\d{4})"
 PROCESS_PATTERN = r"[0-9]{5}\.[0-9]{6}/[0-9]{4}-[0-9]{2}"
@@ -206,6 +209,22 @@ def build_normalized_record(payload: Dict[str, Any], json_path: Path, fallback_r
         "snapshot_mode": _clean_spaces(snapshot.get("extraction_mode") or fallback_record.get("snapshot_mode")),
         "json_path": str(json_path),
         "doc_class": _clean_spaces(analysis.get("doc_class")),
+        "found": collection.get("found", fallback_record.get("found")),
+        "acquisition_state": (
+            collection.get("acquisition_state")
+            or payload.get("acquisition_state")
+            or fallback_record.get("acquisition_state")
+        ),
+        "acquisition_diagnostic_code": _clean_spaces(
+            collection.get("acquisition_diagnostic_code")
+            or payload.get("acquisition_diagnostic_code")
+            or fallback_record.get("acquisition_diagnostic_code")
+        ),
+        "acquisition_diagnostic_stage": _clean_spaces(
+            collection.get("acquisition_diagnostic_stage")
+            or payload.get("acquisition_diagnostic_stage")
+            or fallback_record.get("acquisition_diagnostic_stage")
+        ),
     }
 
 
@@ -241,6 +260,9 @@ def build_administrativo_v2_record(
     """Add auditable field provenance while preserving every legacy value."""
 
     identity = _admin_identity(record, payload)
+    collection = payload.get("collection", {}) if isinstance(payload.get("collection"), dict) else {}
+    snapshot = payload.get("snapshot", {}) if isinstance(payload.get("snapshot"), dict) else {}
+    text = _snapshot_text(snapshot)
     location = EvidenceLocation(source_path=str(source_path)) if source_path else None
     fields: List[FieldResult] = []
     for field_name in _ADMIN_V2_FIELDS:
@@ -271,9 +293,34 @@ def build_administrativo_v2_record(
         "document_id": identity.document_id,
         "candidate_id": identity.candidate_id,
         "source_url": identity.source_url,
+        "found": record.get("found", collection.get("found")),
+        "acquisition_state": (
+            record.get("acquisition_state")
+            or collection.get("acquisition_state")
+            or collection.get("acquisition_state_v2")
+            or payload.get("acquisition_state")
+            or payload.get("acquisition_state_v2")
+        ),
+        "acquisition_diagnostic_code": (
+            record.get("acquisition_diagnostic_code")
+            or collection.get("acquisition_diagnostic_code")
+            or payload.get("acquisition_diagnostic_code")
+        ),
+        "acquisition_diagnostic_stage": (
+            record.get("acquisition_diagnostic_stage")
+            or collection.get("acquisition_diagnostic_stage")
+            or payload.get("acquisition_diagnostic_stage")
+        ),
     })
     adapted["fields"] = [field.to_dict() for field in fields]
     adapted["legacy_publication_status"] = record.get("publication_status")
+    decision = evaluate_document_gold(
+        identity=identity,
+        acquisition=AcquisitionState.from_dict(adapted["acquisition_state"]),
+        semantic=SemanticState.from_dict(adapted["semantic_state"]),
+        has_verifiable_content=bool(text.strip()) or bool(snapshot.get("tables", []) or []),
+    )
+    adapted["document_gold_decision"] = decision.to_dict()
     return adapted
 
 
