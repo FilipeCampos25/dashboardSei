@@ -90,8 +90,16 @@ class CooperationDocumentHandler:
     ) -> Optional[Path]:
         csv_writer.ensure_output_dir(output_dir)
         snapshot = sanitize_snapshot(snapshot)
-        analysis = analysis or classify_cooperation_snapshot(snapshot, spec.key, collection_context, processo=processo)
+        classification_request = "administrativo" if spec.key == "memorando" else spec.key
+        analysis = analysis or classify_cooperation_snapshot(
+            snapshot, classification_request, collection_context, processo=processo
+        )
         resolved_document_type = analysis.get("resolved_document_type", "")
+        requested_type = (
+            resolved_document_type
+            if spec.key == "memorando" and analysis.get("doc_class") in spec.accepted_doc_classes
+            else classification_request
+        )
         snapshot_prefix = analysis.get("requested_snapshot_prefix", spec.snapshot_prefix)
         snapshot_output_dir = output_dir
         filename_suffix = None
@@ -115,7 +123,7 @@ class CooperationDocumentHandler:
                 "document_family": "cooperacao",
                 "resolved_document_type": resolved_document_type,
                 "snapshot_prefix": snapshot_prefix,
-                "requested_type": spec.key,
+                "requested_type": requested_type,
                 "collection": collection_context or {},
                 "analysis": analysis,
             },
@@ -130,7 +138,7 @@ class CooperationDocumentHandler:
         )
         record.update(
             {
-                "requested_type": spec.key,
+                "requested_type": requested_type,
                 "doc_class": analysis.get("doc_class", ""),
                 "resolved_document_type": resolved_document_type,
                 "snapshot_prefix": snapshot_prefix,
@@ -369,7 +377,17 @@ class CooperationDocumentHandler:
                 columns=["processo", "title", "source", "tree_score", "matched_terms", "disposition"],
             )
         if spec.key == "memorando":
-            csv_writer.write_csv(self._tracking_records, output_dir / "memorando_status_execucao_latest.csv", columns=columns)
+            # Compatibility alias: unlike the family status above, this legacy
+            # filename contains only records whose resolved class is memorando.
+            memorando_records = [
+                record for record in self._tracking_records
+                if record.get("doc_class") == "memorando"
+            ]
+            csv_writer.write_csv(
+                memorando_records,
+                output_dir / "memorando_status_execucao_latest.csv",
+                columns=columns,
+            )
         logger.info(
             "Relatorio %s gerado: total=%d arquivo=%s",
             spec.log_label,

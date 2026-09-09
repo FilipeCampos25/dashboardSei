@@ -341,11 +341,27 @@ def reprocess_snapshot(
         )
     try:
         source_root = source_path.parent if _relative_to is None else _relative_to
-        record_v2 = adapt_legacy_record(
-            legacy_record,
-            field_names=_FAMILY_FIELDS[resolved_family],
-            artifact_root=source_root,
-        )
+        if resolved_family == "administrative":
+            from app.services.documento_administrativo_normalizer import build_administrativo_v2_record
+
+            record_v2 = build_administrativo_v2_record(
+                dict(legacy_record),
+                dict(_fixture_payload(document)),
+                source_path=(
+                    source_path.name
+                    if _relative_to is None
+                    else source_path.relative_to(_relative_to).as_posix()
+                ),
+            )
+            record_v2["artifact_ref"] = PortableArtifactRef.from_path(
+                source_path, root=source_root
+            ).to_dict()
+        else:
+            record_v2 = adapt_legacy_record(
+                legacy_record,
+                field_names=_FAMILY_FIELDS[resolved_family],
+                artifact_root=source_root,
+            )
         recovered, backfill_metadata = _historical_backfill(document)
         record_v2["identity"] = recovered["identity"]
         record_v2["acquisition_state"] = recovered["acquisition_state"]

@@ -19,7 +19,11 @@ from app.services.gold_contracts import EvidenceLocation, FieldEvidence, SourceK
 from app.services.normalization_contract import DocumentIdentity
 from app.services.pipeline_states import AcquisitionState
 from app.services.publication_policy import evaluate_document_gold
-from app.services.semantic_states import SemanticState
+from app.services.semantic_states import (
+    ClassificationState,
+    DocumentFunctionState,
+    SemanticState,
+)
 
 DATE_PATTERN = r"\d{1,2}(?:[./-]\d{1,2}[./-]\d{4}|\s+de\s+[A-Za-z\u00c0-\u00ff]+\s+de\s+\d{4})"
 PROCESS_PATTERN = r"[0-9]{5}\.[0-9]{6}/[0-9]{4}-[0-9]{2}"
@@ -178,7 +182,7 @@ def build_normalized_record(payload: Dict[str, Any], json_path: Path, fallback_r
     collection = payload.get("collection", {}) if isinstance(payload.get("collection"), dict) else {}
     processo = _clean_spaces(payload.get("processo") or fallback_record.get("processo"))
     documento = _clean_spaces(payload.get("documento") or fallback_record.get("documento"))
-    analysis = classify_cooperation_snapshot(snapshot, "memorando", collection_context=collection, processo=processo)
+    analysis = classify_cooperation_snapshot(snapshot, "administrativo", collection_context=collection, processo=processo)
     text = _snapshot_text(snapshot)
     origem = _line_value(text, ("De", "Origem", "Remetente"))
     destino = _line_value(text, ("Para", "Ao", "A", "Destino", "Destinatario", "Destinatário"))
@@ -187,7 +191,7 @@ def build_normalized_record(payload: Dict[str, Any], json_path: Path, fallback_r
 
     return {
         "captured_at": _clean_spaces(collection.get("captured_at") or fallback_record.get("captured_at")),
-        "requested_type": "memorando",
+        "requested_type": _clean_spaces(analysis.get("resolved_document_type")) or "administrativo",
         "processo": processo,
         "documento": documento,
         "resolved_document_type": _clean_spaces(analysis.get("resolved_document_type")),
@@ -313,12 +317,38 @@ def build_administrativo_v2_record(
         ),
     })
     adapted["fields"] = [field.to_dict() for field in fields]
+    adapted["document_family"] = "administrativo"
+    adapted["requested_type"] = record.get("requested_type")
+    adapted["resolved_document_type"] = record.get("resolved_document_type")
     adapted["legacy_publication_status"] = record.get("publication_status")
+    previous_semantic = SemanticState.from_dict(adapted["semantic_state"])
+    resolved_class = _clean_spaces(record.get("doc_class") or record.get("resolved_document_type")) or None
+    has_verifiable_content = bool(text.strip()) or bool(snapshot.get("tables", []) or [])
+    resolved_function = (
+        _clean_spaces(record.get("funcao_administrativa")) or None
+        if has_verifiable_content
+        else None
+    )
+    adapted["semantic_state"] = SemanticState(
+        classification=(
+            ClassificationState.CONFIRMED
+            if resolved_class and has_verifiable_content
+            else ClassificationState.CANDIDATE
+            if resolved_class
+            else ClassificationState.NOT_CLASSIFIED
+        ),
+        function=(DocumentFunctionState.RELATED if resolved_function else DocumentFunctionState.NOT_EVALUATED),
+        affinity=previous_semantic.affinity,
+        canonical=previous_semantic.canonical,
+        publication=previous_semantic.publication,
+        resolved_class=resolved_class,
+        resolved_function=resolved_function,
+    ).to_dict()
     decision = evaluate_document_gold(
         identity=identity,
         acquisition=AcquisitionState.from_dict(adapted["acquisition_state"]),
         semantic=SemanticState.from_dict(adapted["semantic_state"]),
-        has_verifiable_content=bool(text.strip()) or bool(snapshot.get("tables", []) or []),
+        has_verifiable_content=has_verifiable_content,
     )
     adapted["document_gold_decision"] = decision.to_dict()
     return adapted

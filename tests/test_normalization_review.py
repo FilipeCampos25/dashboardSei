@@ -129,7 +129,7 @@ class NormalizationReviewTests(unittest.TestCase):
                     "json_path": "",
                 }
             ],
-            self.tmp_dir / "memorando_status_execucao_latest.csv",
+            self.tmp_dir / "documento_administrativo_status_execucao_latest.csv",
         )
 
         issues = collect_review_issues(self.tmp_dir)
@@ -182,7 +182,7 @@ class NormalizationReviewTests(unittest.TestCase):
                     "json_path": "",
                 }
             ],
-            self.tmp_dir / "memorando_status_execucao_latest.csv",
+            self.tmp_dir / "documento_administrativo_status_execucao_latest.csv",
         )
 
         result = export_review_queue(self.tmp_dir)

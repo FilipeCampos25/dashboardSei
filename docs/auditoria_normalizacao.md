@@ -196,6 +196,8 @@ Mesmo conjunto comum de snapshot e `analysis` da familia de cooperacao:
 
 `memorando_normalizado_latest.csv` contem somente a visao filtrada de `documento_administrativo_normalizado_latest.csv` para `doc_class=memorando`.
 
+O handler historico continua registrado pela chave `memorando` apenas para compatibilidade de coleta. Nos registros administrativos, `requested_type` identifica a classe documental resolvida (`nota_tecnica`, `memorando`, `despacho`, `oficio` ou outra classe administrativa suportada). `documento_administrativo_status_execucao_latest.csv` e o status da familia completa; `memorando_status_execucao_latest.csv` e um alias legado filtrado para `doc_class=memorando`.
+
 ### Status possiveis
 
 Iguais aos da familia de cooperacao, com gold quando `doc_class` pertence a familia administrativa:

@@ -690,7 +690,7 @@ def collect_review_issues(output_dir: Path | str, logger: Any = None) -> List[Di
     issues.extend(
         _administrative_issues(
             _read_csv_rows(output_path / "documento_administrativo_normalizado_latest.csv", logger),
-            _read_csv_rows(output_path / "memorando_status_execucao_latest.csv", logger),
+            _read_csv_rows(output_path / "documento_administrativo_status_execucao_latest.csv", logger),
         )
     )
     issues.extend(_dashboard_issues(_read_csv_rows(output_path / "dashboard_ready_latest.csv", logger)))

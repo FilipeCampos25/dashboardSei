@@ -255,11 +255,14 @@ Silver da familia ACT.
 - `act_normalizado_latest.csv`
 Gold da familia ACT.
 
+- `documento_administrativo_status_execucao_latest.csv`
+Status operacional da familia administrativa completa.
+
 - `memorando_status_execucao_latest.csv`
-Silver da familia memorando.
+Alias legado de compatibilidade, filtrado para a classe documental `memorando`.
 
 - `memorando_normalizado_latest.csv`
-Gold da familia memorando.
+Visao legada filtrada para a classe documental `memorando`.
 
 - `ted_status_execucao_latest.csv`
 Silver da familia TED.

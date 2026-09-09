@@ -127,6 +127,7 @@ DOC_CLASS_SNAPSHOT_PREFIX = {
 
 REQUESTED_TYPE_TO_PREFIX = {
     "act": SNAPSHOT_PREFIX_ACT,
+    "administrativo": SNAPSHOT_PREFIX_MEMORANDO,
     "memorando": SNAPSHOT_PREFIX_MEMORANDO,
     "ted": SNAPSHOT_PREFIX_TED,
 }
@@ -509,7 +510,12 @@ def _classify_snapshot_core(
 def _accepted_doc_classes_for_requested_type(requested_type: str) -> Tuple[str, ...]:
     return {
         "act": (DOC_CLASS_ACT_FINAL,),
+        "administrativo": ADMINISTRATIVE_DOC_CLASSES,
         "memorando": ADMINISTRATIVE_DOC_CLASSES,
+        "nota_tecnica": (DOC_CLASS_NOTA_TECNICA,),
+        "informacao_tecnica": (DOC_CLASS_INFORMACAO_TECNICA,),
+        "despacho": (DOC_CLASS_DESPACHO,),
+        "oficio": (DOC_CLASS_OFICIO,),
         "ted": (DOC_CLASS_TED,),
     }.get(requested_type, ())
 
