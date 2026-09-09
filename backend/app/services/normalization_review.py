@@ -173,7 +173,7 @@ def _issue(
 
 def _required_field_issues(document_type: str, row: Dict[str, str]) -> List[Dict[str, Any]]:
     issues: List[Dict[str, Any]] = []
-    if document_type == "ted" and isinstance(row.get("_field_results_v2"), list):
+    if document_type in {"ted", "documento_administrativo"} and isinstance(row.get("_field_results_v2"), list):
         required = [
             str(item.get("field_name", ""))
             for item in row["_field_results_v2"]  # type: ignore[index]
@@ -239,6 +239,32 @@ def _attach_ted_v2_rows(output_path: Path, rows: List[Dict[str, str]], logger: A
                     and Path(str(record.get("json_path", ""))).name == json_name
                 )
             )
+        ]
+        if len(matches) == 1:
+            row["_field_results_v2"] = matches[0].get("fields", [])  # type: ignore[assignment]
+
+
+def _attach_administrative_v2_rows(output_path: Path, rows: List[Dict[str, str]], logger: Any = None) -> None:
+    sidecar = output_path / "v2" / "documento_administrativo_normalizado_latest.v2.json"
+    if not sidecar.is_file():
+        return
+    try:
+        records = json.loads(sidecar.read_text(encoding="utf-8")).get("records", [])
+    except (OSError, TypeError, ValueError) as exc:
+        _log(logger, "warning", "Fila de revisao: falha ao ler sidecar administrativo V2 %s (%s).", sidecar, exc)
+        return
+    available = [record for record in records if isinstance(record, dict)]
+    for row in rows:
+        process_id = row.get("process_id", "") or row.get("processo", "")
+        json_name = Path(row.get("json_path", "")).name
+        matches = [
+            record for record in available
+            if (
+                record.get("identity", {})
+                if isinstance(record.get("identity"), dict)
+                else {}
+            ).get("process_id", "") == process_id
+            and (not json_name or record.get("legacy_json_name") == json_name)
         ]
         if len(matches) == 1:
             row["_field_results_v2"] = matches[0].get("fields", [])  # type: ignore[assignment]
@@ -687,9 +713,11 @@ def collect_review_issues(output_dir: Path | str, logger: Any = None) -> List[Di
     ted_rows = _read_csv_rows(output_path / "ted_normalizado_latest.csv", logger)
     _attach_ted_v2_rows(output_path, ted_rows, logger)
     issues.extend(_ted_issues(ted_rows, _read_csv_rows(output_path / "ted_status_execucao_latest.csv", logger)))
+    administrative_rows = _read_csv_rows(output_path / "documento_administrativo_normalizado_latest.csv", logger)
+    _attach_administrative_v2_rows(output_path, administrative_rows, logger)
     issues.extend(
         _administrative_issues(
-            _read_csv_rows(output_path / "documento_administrativo_normalizado_latest.csv", logger),
+            administrative_rows,
             _read_csv_rows(output_path / "documento_administrativo_status_execucao_latest.csv", logger),
         )
     )

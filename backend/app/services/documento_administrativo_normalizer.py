@@ -13,6 +13,12 @@ from app.services.act_normalizer import (
     _extract_signature_dates,
     classify_cooperation_snapshot,
 )
+from app.services.administrativo_field_policy import (
+    ADMINISTRATIVE_FIELD_PROFILES,
+    field_policy_for_class,
+    field_state_for_policy,
+    quality_status,
+)
 from app.services.contract_adapters import V2_SCHEMA_VERSION, adapt_legacy_record, v2_sidecar_path, write_v2_sidecar
 from app.services.field_states import FieldResult, FieldState
 from app.services.gold_contracts import EvidenceLocation, FieldEvidence, SourceKind
@@ -267,8 +273,15 @@ def build_administrativo_v2_record(
     collection = payload.get("collection", {}) if isinstance(payload.get("collection"), dict) else {}
     snapshot = payload.get("snapshot", {}) if isinstance(payload.get("snapshot"), dict) else {}
     text = _snapshot_text(snapshot)
+    acquisition = AcquisitionState.from_dict(adapt_legacy_record({
+        **record,
+        "found": record.get("found", collection.get("found")),
+        "acquisition_state": record.get("acquisition_state") or collection.get("acquisition_state"),
+    })["acquisition_state"])
+    resolved_class = _clean_spaces(record.get("doc_class") or record.get("resolved_document_type")) or None
     location = EvidenceLocation(source_path=str(source_path)) if source_path else None
     fields: List[FieldResult] = []
+    field_states: Dict[str, FieldState] = {}
     for field_name in _ADMIN_V2_FIELDS:
         value = record.get(field_name)
         present = value is not None and (not isinstance(value, str) or bool(value.strip()))
@@ -285,9 +298,15 @@ def build_administrativo_v2_record(
                     raw_evidence=_admin_raw_evidence(field_name, record, payload),
                 ),
             )
+        state = field_state_for_policy(
+            field_policy_for_class(resolved_class, field_name),
+            value_present=present,
+            acquisition=acquisition,
+        )
+        field_states[field_name] = state
         fields.append(FieldResult(
             field_name=field_name,
-            state=FieldState.PRESENT if present else FieldState.NOT_EVALUATED,
+            state=state,
             value=value if present else None,
             evidences=evidences,
         ))
@@ -317,12 +336,17 @@ def build_administrativo_v2_record(
         ),
     })
     adapted["fields"] = [field.to_dict() for field in fields]
+    profile = ADMINISTRATIVE_FIELD_PROFILES.get(resolved_class or "", {})
+    adapted["administrative_field_profile"] = {
+        field_name: policy.value for field_name, policy in profile.items()
+    }
+    adapted["quality_status_v2"] = quality_status(field_states, profile)
     adapted["document_family"] = "administrativo"
     adapted["requested_type"] = record.get("requested_type")
     adapted["resolved_document_type"] = record.get("resolved_document_type")
     adapted["legacy_publication_status"] = record.get("publication_status")
+    adapted["legacy_json_name"] = Path(str(record.get("json_path", ""))).name or None
     previous_semantic = SemanticState.from_dict(adapted["semantic_state"])
-    resolved_class = _clean_spaces(record.get("doc_class") or record.get("resolved_document_type")) or None
     has_verifiable_content = bool(text.strip()) or bool(snapshot.get("tables", []) or [])
     resolved_function = (
         _clean_spaces(record.get("funcao_administrativa")) or None
