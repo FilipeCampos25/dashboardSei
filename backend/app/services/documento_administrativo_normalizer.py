@@ -11,6 +11,7 @@ from app.services.act_normalizer import (
     DOC_CLASS_MEMORANDO,
     PUBLICATION_STATUS_GOLD,
     _extract_signature_dates,
+    _normalize_date_token,
     classify_cooperation_snapshot,
 )
 from app.services.administrativo_field_policy import (
@@ -109,8 +110,71 @@ def _line_value(text: str, labels: tuple[str, ...]) -> str:
 
 
 def _extract_data(text: str) -> str:
+    # Legacy CSV contract; contextual resolution is deliberately confined to V2.
     match = re.search(DATE_PATTERN, text, flags=re.IGNORECASE)
     return _clean_spaces(match.group(0)) if match else ""
+
+
+def _date_context(prefix: str, suffix: str) -> str:
+    """Recognize only explicit document datelines observed in the baseline.
+
+    Whole-line matching prevents an inline citation from becoming a dateline.
+    Unknown places and free-standing dates require further evidence.
+    """
+    if re.fullmatch(r"\s*[.;]?\s*", suffix):
+        if re.fullmatch(r"\s*Data(?:\s+(?:do documento|de emiss[ãa]o))?\s*:\s*", prefix, re.I):
+            return "document_label"
+        if re.fullmatch(
+            r"\s*(?:Bras[ií]lia(?:,\s*DF)?|Porto Velho|S[ãa]o Jos[eé] dos Campos)"
+            r"\s*,\s*(?:em\s+)?", prefix, re.I,
+        ):
+            return "city_date"
+    if re.search(r"\b(?:lei|portaria|decreto|norma|resolu[çc][ãa]o|instru[çc][ãa]o)\b", prefix[-160:], re.I):
+        return "normative_reference"
+    if re.search(r"assinad[oa].*\bem\s*$", prefix, re.I):
+        return "signature"
+    if re.search(r"\b(?:prazo|per[íi]odo|vig[êe]ncia|at[ée])\b", prefix, re.I):
+        return "period_or_deadline"
+    if re.search(r"\b(?:processo|documento|of[íi]cio|memorando|despacho|nota|hist[óo]rico)\b", prefix, re.I):
+        return "mentioned_document_or_history"
+    return "uncontextualized"
+
+
+def _resolve_document_date(
+    text: str, *, identity: DocumentIdentity, source_path: str | Path | None,
+    absent_state: FieldState,
+) -> FieldResult:
+    """Resolve V2 data without positional, signature or process-year fallbacks."""
+    candidates = []
+    for match in re.finditer(DATE_PATTERN, text, re.I):
+        start = text.rfind("\n", 0, match.start()) + 1
+        end = text.find("\n", match.end())
+        prefix = text[start:match.start()]
+        suffix = text[match.end():end if end >= 0 else len(text)]
+        context = _date_context(prefix, suffix)
+        value = _normalize_date_token(match.group())
+        evidence = FieldEvidence(
+            field_name="data", source_kind=SourceKind.DOCUMENT,
+            source_document=identity, raw_evidence=match.group(),
+            rule_id=f"administrativo.data.{context}" if value else "administrativo.data.invalid_calendar_date",
+            location=EvidenceLocation(
+                source_path=str(source_path) if source_path else None,
+                section=context, position=match.start(),
+            ),
+        )
+        candidates.append((value, context, evidence))
+    plausible = [c for c in candidates if c[0] and c[1] in {"document_label", "city_date"}]
+    values = {c[0] for c in plausible}
+    if len(values) == 1:
+        return FieldResult(
+            field_name="data", state=FieldState.PRESENT, value=next(iter(values)),
+            evidences=tuple(c[2] for c in plausible),
+        )
+    return FieldResult(
+        field_name="data",
+        state=FieldState.CONFLICT if len(values) > 1 else FieldState.UNRESOLVED if candidates else absent_state,
+        evidences=tuple(c[2] for c in candidates),
+    )
 
 
 def _extract_assunto(snapshot: Dict[str, Any], text: str) -> str:
@@ -267,7 +331,7 @@ def _admin_raw_evidence(field_name: str, record: Dict[str, Any], payload: Dict[s
 def build_administrativo_v2_record(
     record: Dict[str, Any], payload: Dict[str, Any], *, source_path: str | Path | None = None
 ) -> Dict[str, Any]:
-    """Add auditable field provenance while preserving every legacy value."""
+    """Preserve legacy output and resolve the administrative date contextually in V2."""
 
     identity = _admin_identity(record, payload)
     collection = payload.get("collection", {}) if isinstance(payload.get("collection"), dict) else {}
@@ -283,6 +347,17 @@ def build_administrativo_v2_record(
     fields: List[FieldResult] = []
     field_states: Dict[str, FieldState] = {}
     for field_name in _ADMIN_V2_FIELDS:
+        if field_name == "data":
+            field = _resolve_document_date(
+                text, identity=identity, source_path=source_path,
+                absent_state=field_state_for_policy(
+                    field_policy_for_class(resolved_class, field_name),
+                    value_present=False, acquisition=acquisition,
+                ),
+            )
+            field_states[field_name] = field.state
+            fields.append(field)
+            continue
         value = record.get(field_name)
         present = value is not None and (not isinstance(value, str) or bool(value.strip()))
         evidences = ()

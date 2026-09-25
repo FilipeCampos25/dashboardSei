@@ -32,7 +32,8 @@ class AdministrativoProvenanceTests(unittest.TestCase):
         ))
 
         self.assertEqual("12/03/1989", legacy["data"])
-        self.assertEqual(legacy["data"], fields["data"].value)
+        self.assertIsNone(fields["data"].value)
+        self.assertIs(fields["data"].state, FieldState.UNRESOLVED)
         self.assertIs(fields["data"].evidences[0].source_kind, SourceKind.DOCUMENT)
         self.assertEqual("12/03/1989", fields["data"].evidences[0].raw_evidence)
         self.assertEqual("candidates/administrativo.json", fields["data"].evidences[0].location.source_path)
