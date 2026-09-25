@@ -84,6 +84,19 @@ _ADMIN_DOCUMENT_RULES = {
     "documentos_mencionados": "administrativo.documentos.regex",
 }
 
+_CURRENT_ACTION_PATTERN = re.compile(
+    r"(?i)\b(?:solicita-se|solicito|solicitamos|solicitar|encaminha-se|encaminho|encaminhamos|encaminhar|"
+    r"submeto|submetemos|submeter|recomenda-se|recomendo|recomendamos|recomendar)\b"
+)
+_HISTORICAL_CONTEXT_PATTERN = re.compile(
+    r"(?i)\b(?:em\s+(?:19|20)\d{2}|anterior(?:mente)?|hist[oó]ric[oa]|procedimento anterior|"
+    r"documento citado|foi|foram|havia|era)\b"
+)
+_DEADLINE_PATTERN = re.compile(
+    r"(?i)\b(?:no\s+)?prazo\s+(?:de|para)?\s*[^\n.!?]{1,80}|"
+    r"\bat[eé]\s+" + DATE_PATTERN + r"|\bem\s+at[eé]\s+\d+\s+dias?"
+)
+
 
 def _clean_spaces(value: Any) -> str:
     return " ".join(str(value or "").replace("\r", "\n").split()).strip()
@@ -217,6 +230,119 @@ def _extract_prazo(text: str) -> str:
     return ""
 
 
+def _context_segments(text: str):
+    """Yield small observed text spans; context never crosses a sentence/line boundary."""
+    for match in re.finditer(r"[^\n.!?]+[.!?]?", text):
+        value = _clean_spaces(match.group())
+        if value:
+            yield value, match.start(), match.end()
+
+
+def _field_evidence(
+    field_name: str, raw: str, rule_id: str, section: str, position: int,
+    identity: DocumentIdentity, source_path: str | Path | None,
+) -> FieldEvidence:
+    return FieldEvidence(
+        field_name=field_name,
+        source_kind=SourceKind.DOCUMENT,
+        source_document=identity,
+        rule_id=rule_id,
+        raw_evidence=raw,
+        location=EvidenceLocation(
+            source_path=str(source_path) if source_path else None,
+            section=section,
+            position=position,
+        ),
+    )
+
+
+def _resolve_assunto(
+    snapshot: Dict[str, Any], text: str, *, identity: DocumentIdentity,
+    source_path: str | Path | None, absent_state: FieldState,
+) -> FieldResult:
+    match = re.search(r"(?im)^\s*(?:Assunto|Interessado|Refer[eê]ncia)\s*[:\-]\s*(.+?)\s*$", text)
+    if match:
+        value = _clean_spaces(match.group(1))
+        return FieldResult("assunto", FieldState.PRESENT, value, (
+            _field_evidence(
+                "assunto", match.group(0), "administrativo.assunto.explicit_line",
+                "body", match.start(), identity, source_path,
+            ),
+        ))
+    title = _clean_spaces(snapshot.get("title"))
+    if title:
+        return FieldResult("assunto", FieldState.PRESENT, title, (
+            _field_evidence(
+                "assunto", title, "administrativo.assunto.title_fallback",
+                "title", 0, identity, source_path,
+            ),
+        ))
+    return FieldResult("assunto", absent_state)
+
+
+def _resolve_action_and_deadline(
+    text: str, *, identity: DocumentIdentity, source_path: str | Path | None,
+    action_absent_state: FieldState, deadline_absent_state: FieldState,
+) -> tuple[FieldResult, FieldResult]:
+    action_candidates = []
+    deadline_candidates = []
+    for segment, start, end in _context_segments(text):
+        historical = bool(_HISTORICAL_CONTEXT_PATTERN.search(segment))
+        action_match = _CURRENT_ACTION_PATTERN.search(segment)
+        if action_match:
+            raw = segment[action_match.start():]
+            rule = "administrativo.acao.historical_context" if historical else "administrativo.acao.current_context"
+            evidence = _field_evidence(
+                "acao_solicitada", raw, rule,
+                "historical_context" if historical else "current_request",
+                start + action_match.start(), identity, source_path,
+            )
+            action_candidates.append((raw, historical, start, end, evidence))
+        for deadline_match in _DEADLINE_PATTERN.finditer(segment):
+            raw = _clean_spaces(deadline_match.group())
+            evidence = _field_evidence(
+                "prazo", raw,
+                "administrativo.prazo.historical_context" if historical else "administrativo.prazo.candidate",
+                "historical_context" if historical else "deadline_candidate",
+                start + deadline_match.start(), identity, source_path,
+            )
+            deadline_candidates.append((raw, historical, start, end, evidence))
+
+    current_actions = [candidate for candidate in action_candidates if not candidate[1]]
+    if len(current_actions) == 1:
+        action = FieldResult("acao_solicitada", FieldState.PRESENT, current_actions[0][0], (current_actions[0][4],))
+    elif action_candidates:
+        action = FieldResult(
+            "acao_solicitada", FieldState.UNRESOLVED,
+            evidences=tuple(candidate[4] for candidate in action_candidates),
+        )
+    else:
+        action = FieldResult("acao_solicitada", action_absent_state)
+
+    linked_deadlines = []
+    if len(current_actions) == 1:
+        action_span = current_actions[0][2:4]
+        linked_deadlines = [
+            candidate for candidate in deadline_candidates
+            if not candidate[1] and candidate[2:4] == action_span
+        ]
+    if len(linked_deadlines) == 1:
+        candidate = linked_deadlines[0]
+        linked_evidence = _field_evidence(
+            "prazo", candidate[0], "administrativo.prazo.linked_to_current_action",
+            "current_action_context", candidate[4].location.position, identity, source_path,
+        )
+        deadline = FieldResult("prazo", FieldState.PRESENT, candidate[0], (linked_evidence,))
+    elif deadline_candidates:
+        deadline = FieldResult(
+            "prazo", FieldState.UNRESOLVED,
+            evidences=tuple(candidate[4] for candidate in deadline_candidates),
+        )
+    else:
+        deadline = FieldResult("prazo", deadline_absent_state)
+    return action, deadline
+
+
 def _extract_documentos_mencionados(text: str, processo: str, documento: str) -> str:
     values: List[str] = []
     for item in re.findall(PROCESS_PATTERN, text):
@@ -346,6 +472,29 @@ def build_administrativo_v2_record(
     location = EvidenceLocation(source_path=str(source_path)) if source_path else None
     fields: List[FieldResult] = []
     field_states: Dict[str, FieldState] = {}
+    absent_states = {
+        field_name: field_state_for_policy(
+            field_policy_for_class(resolved_class, field_name),
+            value_present=False,
+            acquisition=acquisition,
+        )
+        for field_name in ("assunto", "acao_solicitada", "prazo")
+    }
+    contextual_action, contextual_deadline = _resolve_action_and_deadline(
+        text,
+        identity=identity,
+        source_path=source_path,
+        action_absent_state=absent_states["acao_solicitada"],
+        deadline_absent_state=absent_states["prazo"],
+    )
+    contextual_fields = {
+        "assunto": _resolve_assunto(
+            snapshot, text, identity=identity, source_path=source_path,
+            absent_state=absent_states["assunto"],
+        ),
+        "acao_solicitada": contextual_action,
+        "prazo": contextual_deadline,
+    }
     for field_name in _ADMIN_V2_FIELDS:
         if field_name == "data":
             field = _resolve_document_date(
@@ -355,6 +504,11 @@ def build_administrativo_v2_record(
                     value_present=False, acquisition=acquisition,
                 ),
             )
+            field_states[field_name] = field.state
+            fields.append(field)
+            continue
+        if field_name in contextual_fields:
+            field = contextual_fields[field_name]
             field_states[field_name] = field.state
             fields.append(field)
             continue

@@ -53,7 +53,8 @@ class AdministrativoProvenanceTests(unittest.TestCase):
         self.assertIs(fields["prazo"].state, FieldState.NOT_EVALUATED)
         self.assertIsNone(fields["prazo"].value)
         self.assertEqual((), fields["prazo"].evidences)
-        self.assertIsNone(fields["assunto"].evidences[0].location)
+        self.assertEqual("title", fields["assunto"].evidences[0].location.section)
+        self.assertEqual("administrativo.assunto.title_fallback", fields["assunto"].evidences[0].rule_id)
 
     def test_dual_write_is_opt_in_and_legacy_bytes_do_not_change(self) -> None:
         root = Path.cwd() / ".tmp_prov_p1_004_admin"
