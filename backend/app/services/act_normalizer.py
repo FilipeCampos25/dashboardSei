@@ -34,6 +34,7 @@ from app.services.normalization_contract import (
     make_missing_field,
 )
 from app.services.act_process_affinity import assess_act_process_affinity
+from app.services.semantic_states import ClassificationState, DocumentFunctionState, SemanticState
 
 DOC_CLASS_ACT_FINAL = "act_final"
 DOC_CLASS_MEMORANDO = "memorando"
@@ -47,6 +48,9 @@ DOC_CLASS_EXTRATO = "extrato"
 DOC_CLASS_MINUTA = "minuta"
 DOC_CLASS_TERMO_ADITIVO = "termo_aditivo"
 DOC_CLASS_TERMO_ADESAO = "termo_adesao"
+DOC_CLASS_RELATORIO = "relatorio"
+DOC_CLASS_PLANO_TRABALHO = "plano_trabalho"
+DOC_CLASS_PUBLICACAO = "publicacao"
 DOC_CLASS_STUB = "stub"
 DOC_CLASS_EMAIL_OUTRO = "email_outro"
 
@@ -77,6 +81,9 @@ DOC_CLASS_PRIORITY = {
     DOC_CLASS_MINUTA: 20,
     DOC_CLASS_TERMO_ADITIVO: 20,
     DOC_CLASS_TERMO_ADESAO: 20,
+    DOC_CLASS_RELATORIO: 20,
+    DOC_CLASS_PLANO_TRABALHO: 20,
+    DOC_CLASS_PUBLICACAO: 20,
     DOC_CLASS_STUB: 10,
     DOC_CLASS_EMAIL_OUTRO: 0,
 }
@@ -104,6 +111,9 @@ DOC_CLASS_RESOLVED_TYPE = {
     DOC_CLASS_MINUTA: RESOLVED_TYPE_ACT_RELATED,
     DOC_CLASS_TERMO_ADITIVO: RESOLVED_TYPE_ACT_RELATED,
     DOC_CLASS_TERMO_ADESAO: RESOLVED_TYPE_ACT_RELATED,
+    DOC_CLASS_RELATORIO: RESOLVED_TYPE_ACT_RELATED,
+    DOC_CLASS_PLANO_TRABALHO: RESOLVED_TYPE_ACT_RELATED,
+    DOC_CLASS_PUBLICACAO: RESOLVED_TYPE_ACT_RELATED,
     DOC_CLASS_STUB: RESOLVED_TYPE_ACT_RELATED,
     DOC_CLASS_EMAIL_OUTRO: RESOLVED_TYPE_ACT_RELATED,
 }
@@ -121,6 +131,9 @@ DOC_CLASS_SNAPSHOT_PREFIX = {
     DOC_CLASS_MINUTA: SNAPSHOT_PREFIX_ACT,
     DOC_CLASS_TERMO_ADITIVO: SNAPSHOT_PREFIX_ACT,
     DOC_CLASS_TERMO_ADESAO: SNAPSHOT_PREFIX_ACT,
+    DOC_CLASS_RELATORIO: SNAPSHOT_PREFIX_ACT,
+    DOC_CLASS_PLANO_TRABALHO: SNAPSHOT_PREFIX_ACT,
+    DOC_CLASS_PUBLICACAO: SNAPSHOT_PREFIX_ACT,
     DOC_CLASS_STUB: SNAPSHOT_PREFIX_ACT,
     DOC_CLASS_EMAIL_OUTRO: SNAPSHOT_PREFIX_ACT,
 }
@@ -199,6 +212,8 @@ NOMINATION_PUBLICATION_MARKERS = (
 )
 
 HEADER_REJECTION_MARKERS = {
+    "relatorio de encerramento": (DOC_CLASS_RELATORIO, "cabecalho_relatorio_encerramento"),
+    "relatorio final": (DOC_CLASS_RELATORIO, "cabecalho_relatorio_final"),
     "minuta": (DOC_CLASS_MINUTA, "cabecalho_minuta"),
     "extrato": (DOC_CLASS_EXTRATO, "cabecalho_extrato"),
     "termo de adesao": (DOC_CLASS_TERMO_ADESAO, "cabecalho_termo_adesao"),
@@ -212,10 +227,10 @@ HEADER_REJECTION_MARKERS = {
     "nota tecnica": (DOC_CLASS_NOTA_TECNICA, "cabecalho_nota_tecnica"),
     "termo de execucao descentralizada": (DOC_CLASS_TED, "cabecalho_ted"),
     "portaria": (DOC_CLASS_EMAIL_OUTRO, "cabecalho_portaria"),
-    "publicacao": (DOC_CLASS_EMAIL_OUTRO, "cabecalho_publicacao"),
+    "publicacao": (DOC_CLASS_PUBLICACAO, "cabecalho_publicacao"),
     "e-mail": (DOC_CLASS_EMAIL_OUTRO, "cabecalho_email"),
     "email": (DOC_CLASS_EMAIL_OUTRO, "cabecalho_email"),
-    "plano de trabalho": (DOC_CLASS_EMAIL_OUTRO, "cabecalho_plano_trabalho"),
+    "plano de trabalho": (DOC_CLASS_PLANO_TRABALHO, "cabecalho_plano_trabalho"),
     "reuniao": (DOC_CLASS_EMAIL_OUTRO, "cabecalho_reuniao"),
     "convenio": (DOC_CLASS_EMAIL_OUTRO, "cabecalho_convenio"),
 }
@@ -420,6 +435,40 @@ def _classification_record(doc_class: str, reason: str) -> Dict[str, Any]:
         "snapshot_prefix": DOC_CLASS_SNAPSHOT_PREFIX.get(doc_class, SNAPSHOT_PREFIX_ACT),
         "classification_reason": reason,
         "classification_priority": DOC_CLASS_PRIORITY.get(doc_class, 0),
+    }
+
+
+def _act_function_record(doc_class: str, reason: str) -> Dict[str, Any]:
+    related_functions = {
+        DOC_CLASS_RELATORIO: "act.report",
+        DOC_CLASS_PLANO_TRABALHO: "act.work_plan",
+        DOC_CLASS_EXTRATO: "act.extract",
+        DOC_CLASS_PUBLICACAO: "act.extract",
+        DOC_CLASS_TERMO_ADITIVO: "act.amendment",
+        DOC_CLASS_TERMO_ADESAO: "act.related",
+        DOC_CLASS_MINUTA: "act.related",
+    }
+    if doc_class == DOC_CLASS_ACT_FINAL:
+        classification = ClassificationState.CONFIRMED
+        function = DocumentFunctionState.INSTRUMENT
+        resolved_function = "act.instrument"
+    elif doc_class in related_functions:
+        classification = ClassificationState.RELATED
+        function = DocumentFunctionState.RELATED
+        resolved_function = related_functions[doc_class]
+    elif doc_class == DOC_CLASS_STUB:
+        classification = ClassificationState.REJECTED
+        function = DocumentFunctionState.INELIGIBLE
+        resolved_function = None
+    else:
+        classification = ClassificationState.AMBIGUOUS
+        function = DocumentFunctionState.AMBIGUOUS
+        resolved_function = None
+    return {
+        "classification_state": classification.value,
+        "document_function": function.value,
+        "resolved_function": resolved_function,
+        "function_reason": reason,
     }
 
 
@@ -644,6 +693,7 @@ def classify_cooperation_snapshot(
         "document_processos": process_alignment["document_processos"],
     }
     if requested == "act":
+        result.update(_act_function_record(doc_class, classification_reason))
         result["process_affinity"] = assess_act_process_affinity(
             snapshot,
             current_process=processo,
@@ -2177,6 +2227,26 @@ def build_act_v2_record(
         }
     )
     adapted["fields"] = [field.to_dict() for field in field_results]
+    previous_semantic = SemanticState.from_dict(adapted["semantic_state"])
+    classification = ClassificationState(
+        str(record.get("classification_state", ClassificationState.AMBIGUOUS.value))
+    )
+    function = DocumentFunctionState(
+        str(record.get("document_function", DocumentFunctionState.AMBIGUOUS.value))
+    )
+    adapted["semantic_state"] = SemanticState(
+        classification=classification,
+        function=function,
+        affinity=previous_semantic.affinity,
+        canonical=previous_semantic.canonical,
+        publication=previous_semantic.publication,
+        resolved_class=str(record.get("doc_class", "") or "") or None,
+        resolved_function=str(record.get("resolved_function", "") or "") or None,
+    ).to_dict()
+    adapted["act_classification"] = {
+        "reason": str(record.get("function_reason", "") or record.get("classification_reason", "") or ""),
+        "evidence_source": "snapshot.content",
+    }
     return adapted
 
 
@@ -2338,6 +2408,10 @@ def build_normalized_record(payload: Dict[str, Any], json_path: Path) -> Dict[st
         "normalization_status": analysis.get("normalization_status", ""),
         "discard_reason": analysis.get("discard_reason", ""),
         "classification_reason": analysis.get("classification_reason", ""),
+        "classification_state": analysis.get("classification_state", ""),
+        "document_function": analysis.get("document_function", ""),
+        "resolved_function": analysis.get("resolved_function"),
+        "function_reason": analysis.get("function_reason", ""),
         "canon_rejection_reason": ""
         if analysis.get("publication_status") == PUBLICATION_STATUS_GOLD
         else (analysis.get("classification_reason", "") or analysis.get("discard_reason", "")),

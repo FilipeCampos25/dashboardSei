@@ -21,15 +21,67 @@ from app.services.act_normalizer import (
     RESOLVED_TYPE_MEMORANDO,
     VALIDATION_STATUS_RELATED,
     VALIDATION_STATUS_VALID,
+    build_act_v2_record,
     build_normalized_record,
     classify_act_snapshot,
     classify_cooperation_snapshot,
     export_normalized_csv,
     resolve_act_vigencia,
 )
+from tests.fixture_loader import load_fixture
 
 
 class ACTNormalizerTests(unittest.TestCase):
+    def test_closing_report_with_copied_contract_language_is_not_act_final(self) -> None:
+        fixture = load_fixture("act_related.json")
+        result = classify_cooperation_snapshot(
+            fixture["payload"]["snapshot"],
+            requested_type="act",
+            collection_context={},
+        )
+
+        self.assertNotEqual(DOC_CLASS_ACT_FINAL, result["doc_class"])
+        self.assertEqual("act.report", result["resolved_function"])
+        self.assertFalse(result["is_canonical_candidate"])
+
+    def test_act_function_taxonomy_keeps_only_instrument_eligible(self) -> None:
+        cases = [
+            (
+                "instrument",
+                {"title": "Acordo de Cooperacao Tecnica", "text": "ACORDO DE COOPERACAO TECNICA que entre si celebram o CENSIPAM e o PARCEIRO. CLAUSULA PRIMEIRA - DO OBJETO."},
+                "act.instrument",
+                True,
+            ),
+            ("work_plan", {"title": "Plano de Trabalho do ACT", "text": "PLANO DE TRABALHO relacionado ao Acordo de Cooperacao Tecnica."}, "act.work_plan", False),
+            ("extract", {"title": "Extrato do ACT", "text": "EXTRATO DO ACORDO DE COOPERACAO TECNICA No 2/2026."}, "act.extract", False),
+            ("publication", {"title": "Publicacao do ACT", "text": "PUBLICACAO DO ACORDO DE COOPERACAO TECNICA No 2/2026."}, "act.extract", False),
+            ("amendment", {"title": "Termo Aditivo", "text": "PRIMEIRO TERMO ADITIVO AO ACORDO DE COOPERACAO TECNICA No 2/2026."}, "act.amendment", False),
+            ("ambiguous", {"title": "Documento sobre ACT", "text": "Documento que menciona o ACT 2/2026."}, None, False),
+        ]
+
+        for name, snapshot, expected_function, eligible in cases:
+            with self.subTest(name=name):
+                result = classify_cooperation_snapshot(snapshot, "act", {})
+                self.assertEqual(expected_function, result["resolved_function"])
+                self.assertEqual(eligible, result["is_canonical_candidate"])
+                self.assertEqual(eligible, result["doc_class"] == DOC_CLASS_ACT_FINAL)
+
+    def test_act_v2_sidecar_reuses_common_semantic_function_contract(self) -> None:
+        payload = {
+            "processo": "test-only:act-report",
+            "snapshot": {
+                "title": "Relatorio de encerramento do ACT",
+                "text": "RELATORIO DE ENCERRAMENTO DO ACORDO DE COOPERACAO TECNICA.",
+            },
+            "collection": {},
+        }
+        record = build_normalized_record(payload, Path("act-report.json"))
+        v2 = build_act_v2_record(record, payload)
+
+        self.assertEqual("RELATED", v2["semantic_state"]["classification"])
+        self.assertEqual("RELATED", v2["semantic_state"]["function"])
+        self.assertEqual("act.report", v2["semantic_state"]["resolved_function"])
+
     def test_resolve_act_vigencia_uses_signature_base_date(self) -> None:
         result = resolve_act_vigencia(
             "O prazo de vigencia sera de 5 anos a partir da data da ultima assinatura.",
