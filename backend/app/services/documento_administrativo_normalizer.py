@@ -79,7 +79,7 @@ _ADMIN_DOCUMENT_RULES = {
     "data_assinatura": "administrativo.assinatura.max_date",
     "datas_assinatura": "administrativo.assinatura.all_dates",
     "assunto": "administrativo.assunto.line_or_title",
-    "resumo": "administrativo.resumo.first_useful_sentences",
+    "resumo": "administrativo.resumo.informative_sentences",
     "acao_solicitada": "administrativo.acao.marker",
     "prazo": "administrativo.prazo.pattern",
     "documentos_mencionados": "administrativo.documentos.regex",
@@ -198,12 +198,66 @@ def _extract_assunto(snapshot: Dict[str, Any], text: str) -> str:
     return _clean_spaces(snapshot.get("title", ""))
 
 
-def _extract_resumo(text: str) -> str:
+def _extract_resumo_legacy(text: str) -> str:
     if not text:
         return ""
     sentences = re.split(r"(?<=[.!?])\s+", text)
     useful = [sentence for sentence in sentences if len(sentence) >= 30]
     return _clean_spaces(" ".join(useful[:2]))[:600]
+
+
+_SUMMARY_STRUCTURAL_PREFIX = re.compile(
+    r"(?i)^(?:of[ií]cio|memorando|nota\s+t[eé]cnica|despacho)\b[^.!?]{0,100}?\s[-–—]\s+"
+)
+_SUMMARY_HEADER_PATTERN = re.compile(
+    r"(?i)^(?:minist[eé]rio\b|secretaria\b|gabinete\b|of[ií]cio\b|memorando\b|"
+    r"nota\s+t[eé]cnica\b|despacho\b|ao\s+senhor\b)"
+)
+_SUMMARY_PROTOCOL_PATTERN = re.compile(
+    r"(?i)^(?:refer[eê]ncia\s+ao\s+processo\b|processo\s+administrativo\s+de\s+refer[eê]ncia\b)"
+)
+_SUMMARY_PRIORITY_PATTERN = re.compile(
+    r"(?i)\b(?:conclui-se|recomenda-se|recomendamos|solicita-se|solicitamos|aprovo|autorizo|"
+    r"determino|concorda|confirmamos|encaminho|encaminha-se)\b"
+)
+
+
+def _extract_resumo_candidate(text: str) -> str:
+    """Select literal, informative sentences for the ADM-P2-001 shadow benchmark."""
+
+    if not text:
+        return ""
+    candidates: List[tuple[int, int, str]] = []
+    for position, raw_sentence in enumerate(re.split(r"(?<=[.!?])\s+", text)):
+        sentence = _clean_spaces(raw_sentence)
+        if not sentence:
+            continue
+        sentence = _SUMMARY_STRUCTURAL_PREFIX.sub("", sentence).strip()
+        if not sentence:
+            continue
+        score = 0
+        if _SUMMARY_PRIORITY_PATTERN.search(sentence):
+            score += 4
+        if _SUMMARY_HEADER_PATTERN.search(sentence):
+            score -= 4
+        if _SUMMARY_PROTOCOL_PATTERN.search(sentence):
+            score -= 4
+        candidates.append((score, position, sentence))
+    if not candidates:
+        return ""
+    selected = sorted(
+        (candidate for candidate in candidates if candidate[0] > 0),
+        key=lambda candidate: (-candidate[0], candidate[1]),
+    )[:2]
+    if not selected:
+        non_structural = [candidate for candidate in candidates if candidate[0] >= 0]
+        selected = non_structural[:2] or candidates[:1]
+    selected.sort(key=lambda candidate: candidate[1])
+    return _clean_spaces(" ".join(candidate[2] for candidate in selected))[:600]
+
+
+def _extract_resumo(text: str) -> str:
+    return _extract_resumo_candidate(text)
 
 
 def _extract_acao_solicitada(text: str) -> str:

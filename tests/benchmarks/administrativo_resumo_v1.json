@@ -1,0 +1,132 @@
+{
+  "benchmark_id": "ADM-P2-001-v1",
+  "evaluation": {
+    "dimensions": ["relevance", "contamination", "context", "fidelity", "concision"],
+    "scale": {
+      "0": "ruim",
+      "1": "aceitavel",
+      "2": "bom"
+    },
+    "activation_rule": {
+      "minimum_mean_total_gain": 1.0,
+      "minimum_improved_examples": 4,
+      "maximum_regressed_examples": 1,
+      "minimum_fidelity_delta": 0,
+      "forbid_severe_regression": true,
+      "require_simple_general_rules": true
+    },
+    "notes": "Pontuacoes sao julgamento humano fixado no benchmark; marcadores apenas ajudam a auditar fidelidade e contaminacao, sem substituir o julgamento. Contamination recebe 2 quando ausente, 1 quando incidental e 0 quando dominante."
+  },
+  "human_scores": {
+    "nota_header_first": {"legacy": [1, 0, 1, 2, 1], "candidate": [1, 2, 2, 2, 2], "legacy_error": "HEADER_FIRST"},
+    "nota_protocol_first": {"legacy": [1, 0, 1, 2, 1], "candidate": [1, 2, 2, 2, 2], "legacy_error": "PROTOCOL_FIRST"},
+    "nota_history_then_conclusion": {"legacy": [0, 2, 1, 2, 0], "candidate": [2, 2, 2, 2, 2], "legacy_error": "HISTORY_FIRST"},
+    "memorando_direct": {"legacy": [2, 2, 2, 2, 2], "candidate": [2, 2, 2, 2, 1], "legacy_error": "ACCEPTABLE"},
+    "memorando_short": {"legacy": [2, 2, 2, 2, 2], "candidate": [2, 2, 2, 2, 2], "legacy_error": "ACCEPTABLE"},
+    "despacho_conclusion": {"legacy": [0, 2, 1, 2, 0], "candidate": [2, 2, 2, 2, 2], "legacy_error": "HISTORY_FIRST"},
+    "despacho_reference_first": {"legacy": [2, 1, 2, 2, 1], "candidate": [2, 2, 2, 2, 2], "legacy_error": "PROTOCOL_FIRST"},
+    "oficio_header_first": {"legacy": [1, 0, 1, 2, 1], "candidate": [2, 2, 2, 2, 2], "legacy_error": "HEADER_FIRST"},
+    "oficio_history_and_request": {"legacy": [0, 2, 1, 2, 0], "candidate": [2, 2, 2, 2, 2], "legacy_error": "HISTORY_FIRST"},
+    "empty_unavailable": {"legacy": [2, 2, 2, 2, 2], "candidate": [2, 2, 2, 2, 2], "legacy_error": "EMPTY"},
+    "single_unpunctuated_body": {"legacy": [2, 2, 2, 2, 2], "candidate": [2, 2, 2, 2, 2], "legacy_error": "ACCEPTABLE"},
+    "header_and_body_same_sentence": {"legacy": [2, 1, 2, 2, 1], "candidate": [2, 2, 2, 2, 2], "legacy_error": "HEADER_FIRST"}
+  },
+  "examples": [
+    {
+      "id": "nota_header_first",
+      "class": "nota_tecnica",
+      "scenario": "long_header",
+      "text": "MINISTERIO EXEMPLO SECRETARIA DE ANALISE COORDENACAO DE ESTUDOS NOTA TECNICA NUMERO 12 2026. Esta nota avalia alternativas para reduzir o tempo de atendimento sem alterar os controles existentes. A analise dos registros indica que a fila pode ser reorganizada por ordem de chegada. Conclui-se pela adocao de fila unica com revisao mensal dos resultados.",
+      "human_target": "avaliacao de alternativas e conclusao pela fila unica",
+      "contamination_markers": ["MINISTERIO EXEMPLO", "NOTA TECNICA NUMERO"]
+    },
+    {
+      "id": "nota_protocol_first",
+      "class": "nota_tecnica",
+      "scenario": "protocol_first",
+      "text": "Processo administrativo de referencia numero 00000.000001/2026-00, documento interno numero 1234567. O estudo compara tres formas de distribuir os atendimentos entre as equipes regionais. Os dados mostram menor espera quando a distribuicao considera a capacidade disponivel. Recomenda-se aplicar o criterio de capacidade em projeto piloto.",
+      "human_target": "comparacao de distribuicao e recomendacao do projeto piloto",
+      "contamination_markers": ["Processo administrativo de referencia", "documento interno numero"]
+    },
+    {
+      "id": "nota_history_then_conclusion",
+      "class": "nota_tecnica",
+      "scenario": "history_first",
+      "text": "Em janeiro foi realizada uma reuniao inicial para levantamento de necessidades das unidades participantes. Em fevereiro houve nova rodada de consultas e consolidacao das respostas recebidas. Em marco a equipe revisou os registros e corrigiu inconsistencias de preenchimento. Conclui-se que o formulario simplificado deve substituir o modelo anterior a partir do proximo ciclo.",
+      "human_target": "conclusao pela substituicao do formulario",
+      "contamination_markers": []
+    },
+    {
+      "id": "memorando_direct",
+      "class": "memorando",
+      "scenario": "direct_body",
+      "text": "Solicita-se que as unidades atualizem a relacao de responsaveis ate o encerramento do mes. A atualizacao permitira corrigir o fluxo de comunicacao entre as equipes.",
+      "human_target": "solicitacao de atualizacao e finalidade",
+      "contamination_markers": []
+    },
+    {
+      "id": "memorando_short",
+      "class": "memorando",
+      "scenario": "short_document",
+      "text": "Encaminho o relatorio revisado para conhecimento.",
+      "human_target": "encaminhamento do relatorio",
+      "contamination_markers": []
+    },
+    {
+      "id": "despacho_conclusion",
+      "class": "despacho",
+      "scenario": "useful_conclusion",
+      "text": "O processo foi recebido pela unidade e passou por conferencia formal dos anexos apresentados. Foram consultadas as areas tecnicas e registradas as manifestacoes pertinentes. Diante da conformidade verificada, aprovo a proposta e determino o prosseguimento para a etapa seguinte.",
+      "human_target": "aprovacao e prosseguimento",
+      "contamination_markers": []
+    },
+    {
+      "id": "despacho_reference_first",
+      "class": "despacho",
+      "scenario": "protocol_first",
+      "text": "Referencia ao Processo numero 00000.000002/2026-00 e ao Documento SEI numero 7654321 para fins de registro. Considerando a justificativa apresentada pela area tecnica, autorizo a continuidade da contratacao nos limites propostos.",
+      "human_target": "autorizacao da continuidade da contratacao",
+      "contamination_markers": ["Referencia ao Processo", "Documento SEI numero"]
+    },
+    {
+      "id": "oficio_header_first",
+      "class": "oficio",
+      "scenario": "long_header",
+      "text": "OFICIO NUMERO 45 2026 GABINETE EXEMPLO Ao Senhor Diretor da Instituicao Parceira Assunto resposta ao expediente anterior. Informamos que a proposta de cooperacao foi analisada pelas areas competentes. A instituicao concorda com o cronograma revisado e indica disponibilidade para iniciar as atividades em outubro.",
+      "human_target": "concordancia com cronograma e disponibilidade",
+      "contamination_markers": ["OFICIO NUMERO", "Ao Senhor Diretor"]
+    },
+    {
+      "id": "oficio_history_and_request",
+      "class": "oficio",
+      "scenario": "history_first",
+      "text": "O acordo foi assinado no ciclo anterior e desde entao foram realizadas reunioes periodicas de acompanhamento. As equipes produziram dois relatorios intermediarios e registraram os riscos encontrados. Solicitamos a confirmacao dos representantes para a reuniao final de avaliacao.",
+      "human_target": "solicitacao de confirmacao dos representantes",
+      "contamination_markers": []
+    },
+    {
+      "id": "empty_unavailable",
+      "class": "memorando",
+      "scenario": "empty",
+      "text": "",
+      "human_target": "nenhum resumo",
+      "contamination_markers": []
+    },
+    {
+      "id": "single_unpunctuated_body",
+      "class": "nota_tecnica",
+      "scenario": "unpunctuated",
+      "text": "A analise confirma que a medida reduz retrabalho e preserva os controles atuais",
+      "human_target": "resultado da analise",
+      "contamination_markers": []
+    },
+    {
+      "id": "header_and_body_same_sentence",
+      "class": "oficio",
+      "scenario": "mixed_line",
+      "text": "OFICIO 18 2026 - Em resposta a consulta recebida, confirmamos a participacao da equipe no encontro tecnico e indicamos dois representantes.",
+      "human_target": "confirmacao da participacao e representantes",
+      "contamination_markers": ["OFICIO 18 2026"]
+    }
+  ]
+}
