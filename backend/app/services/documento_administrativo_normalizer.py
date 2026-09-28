@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from app.config import get_settings
+from app.documents.common import identity_from_source_url
 from app.output import csv_writer
 from app.services.act_normalizer import (
     DOC_CLASS_MEMORANDO,
@@ -343,16 +344,103 @@ def _resolve_action_and_deadline(
     return action, deadline
 
 
+_MENTIONED_DOCUMENT_PATTERN = re.compile(
+    r"(?i)\b(?P<label>documento\s+SEI|documento|doc\.?\s+SEI|SEI)"
+    r"(?:\s*(?:n(?:[.\u00ba\u00b0o])?|n[u\u00fa]mero))?\s*[:#-]?\s*"
+    r"\(?(?P<identifier>\d{6,})\)?"
+)
+_MENTIONED_URL_PATTERN = re.compile(r"https?://[^\s<>\"']+")
+
+
+def _mentioned_reference_candidates(text: str) -> List[Dict[str, Any]]:
+    """Return only references supported by SEI syntax or explicit context."""
+    candidates: List[Dict[str, Any]] = []
+    for match in re.finditer(PROCESS_PATTERN, text):
+        candidates.append({
+            "kind": "process", "identifier": match.group(), "raw": match.group(),
+            "rule_id": "administrativo.referencia.process_pattern", "position": match.start(),
+            "source_url": None,
+        })
+    for match in _MENTIONED_URL_PATTERN.finditer(text):
+        raw_url = match.group().rstrip(".,;:)")
+        parsed = identity_from_source_url(raw_url)
+        if parsed["document_id"]:
+            candidates.append({
+                "kind": "document", "identifier": parsed["document_id"], "raw": raw_url,
+                "rule_id": "administrativo.referencia.url.id_documento", "position": match.start(),
+                "source_url": raw_url,
+            })
+        if parsed["candidate_id"]:
+            candidates.append({
+                "kind": "unresolved", "identifier": parsed["candidate_id"], "raw": raw_url,
+                "rule_id": "administrativo.referencia.url.id_anexo", "position": match.start(),
+                "source_url": raw_url,
+            })
+    for match in _MENTIONED_DOCUMENT_PATTERN.finditer(text):
+        candidates.append({
+            "kind": "document", "identifier": match.group("identifier"), "raw": match.group(),
+            "rule_id": "administrativo.referencia.explicit_document_context", "position": match.start(),
+            "source_url": None,
+        })
+    return candidates
+
+
+def _typed_documentos_mencionados(
+    text: str,
+    processo: str,
+    documento: str,
+    *,
+    source_identity: DocumentIdentity | None = None,
+    source_path: str | Path | None = None,
+) -> List[Dict[str, Any]]:
+    references: List[Dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    # Preserve the legacy process-before-document ordering while deduplicating by semantic type.
+    for candidate in _mentioned_reference_candidates(text):
+        kind = candidate["kind"]
+        identifier = candidate["identifier"]
+        if (kind == "process" and identifier == processo) or (kind == "document" and identifier == documento):
+            continue
+        semantic_key = (kind, identifier)
+        if semantic_key in seen:
+            continue
+        seen.add(semantic_key)
+        reference_identity = DocumentIdentity(
+            process_id=identifier if kind == "process" else None,
+            document_id=identifier if kind == "document" else None,
+            candidate_id=identifier if kind == "unresolved" else None,
+            source_url=candidate["source_url"],
+        )
+        evidence = FieldEvidence(
+            field_name="documentos_mencionados",
+            source_kind=SourceKind.DOCUMENT,
+            source_document=source_identity,
+            raw_evidence=candidate["raw"],
+            rule_id=candidate["rule_id"],
+            location=EvidenceLocation(
+                source_path=str(source_path) if source_path else None,
+                section="body",
+                position=candidate["position"],
+            ),
+        )
+        references.append({
+            "kind": kind,
+            "identity": reference_identity.to_dict(),
+            "raw": candidate["raw"],
+            "rule_id": candidate["rule_id"],
+            "evidence": evidence.to_dict(),
+        })
+    return references[:20]
+
+
 def _extract_documentos_mencionados(text: str, processo: str, documento: str) -> str:
-    values: List[str] = []
-    for item in re.findall(PROCESS_PATTERN, text):
-        if item != processo and item not in values:
-            values.append(item)
-    for item in re.findall(r"\b(?:SEI\s*)?\d{6,}\b", text, flags=re.IGNORECASE):
-        cleaned = _clean_spaces(item)
-        if cleaned != documento and cleaned not in values:
-            values.append(cleaned)
-    return " | ".join(values[:20])
+    values = []
+    for reference in _typed_documentos_mencionados(text, processo, documento):
+        identity = reference["identity"]
+        value = identity["process_id"] or identity["document_id"]
+        if value:
+            values.append(value)
+    return " | ".join(values)
 
 
 def _classify_funcao(text: str) -> str:
@@ -463,6 +551,13 @@ def build_administrativo_v2_record(
     collection = payload.get("collection", {}) if isinstance(payload.get("collection"), dict) else {}
     snapshot = payload.get("snapshot", {}) if isinstance(payload.get("snapshot"), dict) else {}
     text = _snapshot_text(snapshot)
+    mentioned_references = _typed_documentos_mencionados(
+        text,
+        _clean_spaces(record.get("processo")),
+        _clean_spaces(record.get("documento")),
+        source_identity=identity,
+        source_path=source_path,
+    )
     acquisition = AcquisitionState.from_dict(adapt_legacy_record({
         **record,
         "found": record.get("found", collection.get("found")),
@@ -565,6 +660,7 @@ def build_administrativo_v2_record(
         ),
     })
     adapted["fields"] = [field.to_dict() for field in fields]
+    adapted["mentioned_references"] = mentioned_references
     profile = ADMINISTRATIVE_FIELD_PROFILES.get(resolved_class or "", {})
     adapted["administrative_field_profile"] = {
         field_name: policy.value for field_name, policy in profile.items()
