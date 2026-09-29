@@ -22,6 +22,7 @@ class ACTHandlerTests(unittest.TestCase):
         handler.reset_run()
         snapshot = {
             "text": (
+                "PROCESSO No 60090.000001/2026-00. "
                 "ACORDO DE COOPERACAO TECNICA No 1/2026 QUE ENTRE SI CELEBRAM A UNIAO, "
                 "REPRESENTADA PELO MINISTERIO DA DEFESA, POR INTERMEDIO DO CENSIPAM, E A VISIONA. "
                 "CLAUSULA PRIMEIRA - DO OBJETO. O objeto do presente Acordo de Cooperacao Tecnica e a cooperacao."

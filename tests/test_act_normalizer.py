@@ -48,7 +48,7 @@ class ACTNormalizerTests(unittest.TestCase):
         cases = [
             (
                 "instrument",
-                {"title": "Acordo de Cooperacao Tecnica", "text": "ACORDO DE COOPERACAO TECNICA que entre si celebram o CENSIPAM e o PARCEIRO. CLAUSULA PRIMEIRA - DO OBJETO."},
+                {"title": "Acordo de Cooperacao Tecnica", "text": "PROCESSO No 60090.000001/2026-00. ACORDO DE COOPERACAO TECNICA que entre si celebram o CENSIPAM e o PARCEIRO. CLAUSULA PRIMEIRA - DO OBJETO."},
                 "act.instrument",
                 True,
             ),
@@ -61,7 +61,9 @@ class ACTNormalizerTests(unittest.TestCase):
 
         for name, snapshot, expected_function, eligible in cases:
             with self.subTest(name=name):
-                result = classify_cooperation_snapshot(snapshot, "act", {})
+                result = classify_cooperation_snapshot(
+                    snapshot, "act", {}, processo="60090.000001/2026-00"
+                )
                 self.assertEqual(expected_function, result["resolved_function"])
                 self.assertEqual(eligible, result["is_canonical_candidate"])
                 self.assertEqual(eligible, result["doc_class"] == DOC_CLASS_ACT_FINAL)
@@ -460,8 +462,9 @@ class ACTNormalizerTests(unittest.TestCase):
         }
 
         record = build_normalized_record(payload, Path("acordo_cooperacao_tecnica_60090.000702_2025-10.json"))
-        self.assertEqual(record["validation_status"], VALIDATION_STATUS_VALID)
-        self.assertEqual(record["publication_status"], PUBLICATION_STATUS_GOLD)
+        self.assertEqual(record["validation_status"], VALIDATION_STATUS_RELATED)
+        self.assertEqual(record["publication_status"], PUBLICATION_STATUS_SILVER)
+        self.assertEqual(record["affinity_status"], "ambiguous")
         self.assertEqual(record["data_inicio_vigencia"], "2026-01-05")
         self.assertEqual(record["data_fim_vigencia"], "2031-01-04")
         self.assertIn("instituto nacional de pesquisas espaciais", record["orgao_convenente"].lower())
@@ -980,7 +983,7 @@ class ACTNormalizerTests(unittest.TestCase):
             self.assertIn("party_extraction", alias_payload["analysis"])
             self.assertEqual(alias_payload["analysis"]["party_extraction"]["source_scope"], "snapshot_act_canonico")
             self.assertIn("process_affinity", alias_payload["analysis"])
-            self.assertTrue(alias_payload["analysis"]["process_affinity"]["shadow_only"])
+            self.assertFalse(alias_payload["analysis"]["process_affinity"]["shadow_only"])
 
             with audit_path.open("r", encoding="utf-8-sig", newline="") as file_obj:
                 audit_rows = list(csv.DictReader(file_obj))

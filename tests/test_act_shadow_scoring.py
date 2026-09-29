@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import csv
-import hashlib
 import json
 import shutil
 import unittest
@@ -97,17 +96,16 @@ class ACTShadowScoringTests(unittest.TestCase):
             self._write_csv(output_dir / "act_status_execucao_latest.csv", [{"processo": processo, "found": "True"}])
             export_normalized_csv(output_dir)
             gold = output_dir / "acordo_cooperacao_tecnica_60093.000015_2020-60.json"
-            gold_before = hashlib.sha256(gold.read_bytes()).hexdigest()
+            self.assertFalse(gold.exists())
             result = export_shadow_report(output_dir)
-            gold_after = hashlib.sha256(gold.read_bytes()).hexdigest()
             detail = json.loads((output_dir / "act_shadow_comparison_latest.json").read_text(encoding="utf-8"))["processes"][0]
 
-            self.assertEqual(detail["current_selected_candidate"], "1139528")
+            self.assertEqual(detail["current_selected_candidate"], "")
             self.assertEqual(detail["shadow_selected_candidate"], "2208807")
             self.assertTrue(detail["winner_changed"])
             report = next(item for item in detail["candidates"] if item["candidate_id"] == "9395250")
             self.assertFalse(report["shadow_score_breakdown"]["eligible"])
-            self.assertEqual(gold_before, gold_after)
+            self.assertFalse(gold.exists())
             self.assertTrue(result["metrics"]["gold_immutable"])
             self.assertEqual(detail["shadow_scoring_version"], SHADOW_SCORING_VERSION)
         finally:

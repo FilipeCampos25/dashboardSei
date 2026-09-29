@@ -8,7 +8,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "backend"))
 
-from app.services.act_normalizer import build_normalized_record
+from app.services.act_normalizer import build_normalized_record, classify_act_snapshot
 from app.services.act_process_affinity import AFFINITY_RULE_VERSION, assess_act_process_affinity
 from tests.fixture_loader import load_fixture
 
@@ -31,7 +31,7 @@ class ActProcessAffinityTests(unittest.TestCase):
         self.assertEqual(result["affinity_confidence"], "medium")
         self.assertEqual(result["document_origin_process"]["process"], "61074.007769/2025-46")
         self.assertEqual(result["document_origin_process"]["source"], "header.institutional_process_header")
-        self.assertTrue(result["shadow_only"])
+        self.assertFalse(result["shadow_only"])
         self.assertEqual(result["affinity_rule_version"], AFFINITY_RULE_VERSION)
         self.assertEqual(payload["processo"], "60090.001292/2025-24")
 
@@ -128,6 +128,114 @@ class ActProcessAffinityTests(unittest.TestCase):
         self.assertEqual(record["affinity_rule_version"], AFFINITY_RULE_VERSION)
         self.assertIn("current_metadata_link=true", record["affinity_evidence"])
         self.assertIsInstance(record["canonical_score"], int)
+
+    def test_host_origin_and_mentions_are_independent(self) -> None:
+        host = "60090.000001/2026-00"
+        origin = "60090.000002/2026-00"
+        mentioned = "60090.000003/2026-00"
+        result = assess_act_process_affinity(
+            {
+                "title": "Acordo de Cooperacao Tecnica",
+                "text": (
+                    f"PROCESSO MD {origin}. ACORDO DE COOPERACAO TECNICA. "
+                    "CLAUSULA PRIMEIRA - DO OBJETO. "
+                    f"Como antecedente, consulte-se o processo {mentioned}."
+                ),
+            },
+            current_process=host,
+            collection={"related_to_current_process": True},
+        )
+
+        self.assertEqual(result["host_process"], host)
+        self.assertEqual(result["origin_process"]["process"], origin)
+        self.assertEqual(
+            [item["process"] for item in result["mentioned_processes"]],
+            [mentioned],
+        )
+        self.assertEqual(result["affinity_status"], "related_document")
+        self.assertFalse(result["canonical_eligible"])
+        self.assertEqual(result["reason_code"], "act.affinity.related")
+
+    def test_body_mention_is_not_origin_evidence(self) -> None:
+        mentioned = "60090.000003/2026-00"
+        result = assess_act_process_affinity(
+            {
+                "title": "Acordo de Cooperacao Tecnica",
+                "text": (
+                    "ACORDO DE COOPERACAO TECNICA. CLAUSULA PRIMEIRA - DO OBJETO. "
+                    f"O processo {mentioned} e citado apenas como antecedente."
+                ),
+            },
+            current_process="60090.000001/2026-00",
+            collection={},
+        )
+
+        self.assertEqual(result["origin_process"]["process"], "")
+        self.assertEqual(result["mentioned_processes"][0]["process"], mentioned)
+        self.assertEqual(result["affinity_status"], "unknown")
+        self.assertFalse(result["canonical_eligible"])
+
+    def test_multiple_body_mentions_do_not_choose_an_origin(self) -> None:
+        mentioned = ("60090.000003/2026-00", "60090.000004/2026-00")
+        result = assess_act_process_affinity(
+            {
+                "title": "Acordo de Cooperacao Tecnica",
+                "text": (
+                    "ACORDO DE COOPERACAO TECNICA. CLAUSULA PRIMEIRA - DO OBJETO. "
+                    f"Antecedentes nos processos {mentioned[0]} e {mentioned[1]}."
+                ),
+            },
+            current_process="60090.000001/2026-00",
+            collection={},
+        )
+
+        self.assertEqual(result["origin_process"]["process"], "")
+        self.assertEqual(
+            {item["process"] for item in result["mentioned_processes"]}, set(mentioned)
+        )
+        self.assertEqual(result["affinity_status"], "unknown")
+
+    def test_conflicting_origin_evidence_is_ambiguous(self) -> None:
+        result = assess_act_process_affinity(
+            {
+                "title": "ACT",
+                "text": "PROCESSO MD 60090.000002/2026-00. ACORDO DE COOPERACAO TECNICA.",
+            },
+            current_process="60090.000001/2026-00",
+            collection={"processo_origem": "60090.000004/2026-00"},
+        )
+
+        self.assertEqual(result["affinity_status"], "ambiguous")
+        self.assertFalse(result["canonical_eligible"])
+        self.assertEqual(result["reason_code"], "act.affinity.ambiguous")
+
+    def test_affinity_controls_act_candidate_eligibility(self) -> None:
+        host = "60090.000001/2026-00"
+        base_text = (
+            "ACORDO DE COOPERACAO TECNICA QUE ENTRE SI CELEBRAM A UNIAO, "
+            "REPRESENTADA PELO CENSIPAM, E A PARTE SINTETICA. "
+            "CLAUSULA PRIMEIRA - DO OBJETO. Executar atividade conjunta."
+        )
+        same = classify_act_snapshot(
+            {"title": "ACT", "text": f"PROCESSO No {host}. {base_text}"},
+            processo=host,
+        )
+        external = classify_act_snapshot(
+            {"title": "ACT", "text": f"PROCESSO MD 60090.000002/2026-00. {base_text}"},
+            collection_context={"related_to_current_process": True},
+            processo=host,
+        )
+        unknown = classify_act_snapshot(
+            {"title": "ACT", "text": base_text},
+            processo=host,
+        )
+
+        self.assertTrue(same["is_canonical_candidate"])
+        self.assertEqual(same["publication_status"], "published_gold")
+        for result in (external, unknown):
+            self.assertFalse(result["is_canonical_candidate"])
+            self.assertEqual(result["publication_status"], "retained_silver")
+            self.assertTrue(result["affinity_reason_code"].startswith("act.affinity."))
 
 
 if __name__ == "__main__":

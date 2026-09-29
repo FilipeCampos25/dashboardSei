@@ -5,8 +5,9 @@ import unicodedata
 from typing import Any, Dict, List, Optional
 from urllib.parse import parse_qs, urlparse
 
+from app.services.semantic_states import AffinityState
 
-AFFINITY_RULE_VERSION = "act-process-affinity-v1-shadow"
+AFFINITY_RULE_VERSION = "act-process-affinity-v2"
 PROCESS_PATTERN = re.compile(r"(?<!\d)(\d{5}\.\d{6}/\d{4}-\d{2})(?!\d)")
 
 
@@ -178,20 +179,31 @@ def _origin_candidate(occurrences: List[Dict[str, Any]], metadata: List[Dict[str
         score = 0
         confidence = "low"
         source = f"{item['zone']}.{item['label']}"
-        if item["zone"] == "authentication_footer" and item["label"] == "reference_footer":
+        if (
+            item["zone"] == "authentication_footer"
+            and item["label"] == "reference_footer"
+            and re.search(
+                rf"referencia:\s*processo(?:\s+n)?\s*{re.escape(item['process'])}",
+                _norm(item["context"]),
+            )
+        ):
             score, confidence = 110, "high"
         elif item["zone"] == "header" and item["label"] == "institutional_process_header":
             score, confidence = 80, "medium"
-        elif item["zone"] == "preamble" and item["label"] in {"legal_reference", "labeled_process"}:
-            score, confidence = 55, "medium"
         if score:
             candidates.append(
                 {"process": item["process"], "source": source, "confidence": confidence, "score": score}
             )
     if not candidates:
-        return {"process": "", "source": "", "confidence": "low"}
+        return {"process": "", "source": "", "confidence": "low", "conflicting_processes": []}
     winner = max(candidates, key=lambda item: int(item["score"]))
-    return {key: winner[key] for key in ("process", "source", "confidence")}
+    conflicting_processes = list(dict.fromkeys(
+        item["process"] for item in candidates if item["process"] != winner["process"]
+    ))
+    return {
+        **{key: winner[key] for key in ("process", "source", "confidence")},
+        "conflicting_processes": conflicting_processes,
+    }
 
 
 def assess_act_process_affinity(
@@ -217,8 +229,12 @@ def assess_act_process_affinity(
         for item in metadata
     )
     origin_external = bool(origin["process"] and origin["process"] != current_process)
+    origin_conflict = bool(origin.get("conflicting_processes"))
 
-    if strong_current_zone or strong_current_metadata:
+    if origin_conflict:
+        status = "ambiguous"
+        confidence = "low"
+    elif strong_current_zone or strong_current_metadata:
         status = "strong_match"
         confidence = "high"
     elif origin_external and explicit_link:
@@ -235,7 +251,7 @@ def assess_act_process_affinity(
         status = "related_document"
         confidence = "medium"
     else:
-        status = "ambiguous"
+        status = "unknown"
         confidence = "low"
 
     external_processes: List[Dict[str, Any]] = []
@@ -248,14 +264,42 @@ def assess_act_process_affinity(
             {"process": process, "role": role, "occurrences": process_occurrences}
         )
 
+    mentioned_processes: List[Dict[str, Any]] = []
+    for process in dict.fromkeys(item["process"] for item in occurrences):
+        process_occurrences = [item for item in occurrences if item["process"] == process]
+        if process == origin["process"] and any(
+            item["zone"] in {"header", "authentication_footer"} for item in process_occurrences
+        ):
+            continue
+        mentioned_processes.append({"process": process, "occurrences": process_occurrences})
+
+    eligible = status == "strong_match"
+    reason_code = {
+        "strong_match": "act.affinity.matched",
+        "related_document": "act.affinity.related",
+        "probable_external_document": "act.affinity.external",
+        "ambiguous": "act.affinity.ambiguous",
+        "unknown": "act.affinity.unknown",
+    }[status]
+    semantic_state = (
+        AffinityState.MATCHED
+        if status == "strong_match"
+        else AffinityState.AMBIGUOUS
+        if status in {"ambiguous", "unknown"}
+        else AffinityState.MISMATCHED
+    )
+
     evidence = [
         f"current_content_occurrences={len(current_occurrences)}",
         f"external_processes={len(external_processes)}",
         f"origin={origin['process'] or 'unknown'}:{origin['source'] or 'none'}",
         f"current_metadata_link={str(explicit_link).lower()}",
-        "shadow_only=true",
+        f"reason_code={reason_code}",
     ]
     return {
+        "host_process": current_process,
+        "origin_process": origin,
+        "mentioned_processes": mentioned_processes,
         "current_process_explicit": {
             "found": bool(current_occurrences),
             "occurrences": current_occurrences,
@@ -268,7 +312,10 @@ def assess_act_process_affinity(
         "document_origin_process": origin,
         "affinity_status": status,
         "affinity_confidence": confidence,
+        "affinity_state": semantic_state.value,
+        "canonical_eligible": eligible,
+        "reason_code": reason_code,
         "affinity_evidence": evidence,
         "affinity_rule_version": AFFINITY_RULE_VERSION,
-        "shadow_only": True,
+        "shadow_only": False,
     }

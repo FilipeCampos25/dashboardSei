@@ -111,6 +111,15 @@ class Settings(BaseSettings):
         ge=0,
         validation_alias=AliasChoices("TED_CANONICAL_MINIMUM_MARGIN", "ted_canonical_minimum_margin"),
     )
+    act_canonical_minimum_score: float = Field(
+        default=0.0,
+        validation_alias=AliasChoices("ACT_CANONICAL_MINIMUM_SCORE", "act_canonical_minimum_score"),
+    )
+    act_canonical_minimum_margin: float = Field(
+        default=1.0,
+        ge=0,
+        validation_alias=AliasChoices("ACT_CANONICAL_MINIMUM_MARGIN", "act_canonical_minimum_margin"),
+    )
     provenance_enforcement_mode: str = Field(
         default="off",
         pattern="^(off|warn|error)$",

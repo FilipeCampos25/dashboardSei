@@ -11,6 +11,7 @@ from urllib.parse import parse_qs, urlparse
 
 from app.config import get_settings
 from app.output import csv_writer
+from app.services.canonical_selection import CanonicalCandidate, select_canonical
 from app.services.contract_adapters import (
     V2_SCHEMA_VERSION,
     adapt_legacy_record,
@@ -34,7 +35,14 @@ from app.services.normalization_contract import (
     make_missing_field,
 )
 from app.services.act_process_affinity import assess_act_process_affinity
-from app.services.semantic_states import ClassificationState, DocumentFunctionState, SemanticState
+from app.services.semantic_states import (
+    AffinityState,
+    CanonicalState,
+    ClassificationState,
+    DocumentFunctionState,
+    PublicationState,
+    SemanticState,
+)
 
 DOC_CLASS_ACT_FINAL = "act_final"
 DOC_CLASS_MEMORANDO = "memorando"
@@ -53,6 +61,9 @@ DOC_CLASS_PLANO_TRABALHO = "plano_trabalho"
 DOC_CLASS_PUBLICACAO = "publicacao"
 DOC_CLASS_STUB = "stub"
 DOC_CLASS_EMAIL_OUTRO = "email_outro"
+
+ACT_CANONICAL_MINIMUM_SCORE = 0.0
+ACT_CANONICAL_MINIMUM_MARGIN = 1.0
 
 RESOLVED_TYPE_ACT = "act"
 RESOLVED_TYPE_MEMORANDO = "memorando"
@@ -650,6 +661,7 @@ def classify_cooperation_snapshot(
     discard_reason = "" if is_canonical else doc_class
     has_internal_context = False
     process_alignment = {"status": "unknown", "document_processo": "", "document_processos": []}
+    process_affinity: Dict[str, Any] = {}
 
     if requested == "act" and doc_class == DOC_CLASS_ACT_FINAL:
         has_internal_context = _has_internal_act_context(snapshot, collection_context)
@@ -666,6 +678,15 @@ def classify_cooperation_snapshot(
             is_canonical = False
             classification_reason = "processo_divergente_documento"
             discard_reason = "processo_divergente_documento"
+
+        process_affinity = assess_act_process_affinity(
+            snapshot,
+            current_process=processo,
+            collection=collection_context,
+        )
+        if not process_affinity.get("canonical_eligible", False):
+            is_canonical = False
+            discard_reason = str(process_affinity.get("reason_code", "act.affinity.unknown"))
 
     validation_status = VALIDATION_STATUS_VALID if is_canonical else VALIDATION_STATUS_RELATED
     if doc_class in {DOC_CLASS_STUB, DOC_CLASS_EMAIL_OUTRO}:
@@ -694,11 +715,14 @@ def classify_cooperation_snapshot(
     }
     if requested == "act":
         result.update(_act_function_record(doc_class, classification_reason))
-        result["process_affinity"] = assess_act_process_affinity(
-            snapshot,
-            current_process=processo,
-            collection=collection_context,
-        )
+        if not process_affinity:
+            process_affinity = assess_act_process_affinity(
+                snapshot,
+                current_process=processo,
+                collection=collection_context,
+            )
+        result["process_affinity"] = process_affinity
+        result["affinity_reason_code"] = process_affinity.get("reason_code", "")
     return result
 
 
@@ -2145,6 +2169,21 @@ def _act_document_identity(record: Dict[str, Any], payload: Dict[str, Any]) -> D
     )
 
 
+def _act_canonical_identity(record: Dict[str, Any], payload: Dict[str, Any]) -> DocumentIdentity:
+    """Return the common-selector identity, with a stable local candidate fallback."""
+
+    identity = _act_document_identity(record, payload)
+    if identity.candidate_id:
+        return identity
+    candidate_path = Path(str(record.get("candidate_json_path", "") or record.get("json_path", "")))
+    return DocumentIdentity(
+        process_id=identity.process_id,
+        document_id=identity.document_id,
+        candidate_id=candidate_path.stem or None,
+        source_url=identity.source_url,
+    )
+
+
 def _act_field_evidences(
     field_name: str,
     field: Dict[str, Any],
@@ -2186,7 +2225,7 @@ def build_act_v2_record(
     *,
     source_path: str | Path | None = None,
 ) -> Dict[str, Any]:
-    """Build additive ACT V2 fields without changing legacy decisions or values."""
+    """Build additive ACT V2 fields while preserving legacy field values."""
 
     identity = _act_document_identity(record, payload)
     contract = record.get("normalization_contract", {})
@@ -2234,12 +2273,25 @@ def build_act_v2_record(
     function = DocumentFunctionState(
         str(record.get("document_function", DocumentFunctionState.AMBIGUOUS.value))
     )
+    affinity = AffinityState(
+        str(record.get("affinity_state", AffinityState.NOT_EVALUATED.value))
+    )
+    canonical_state = CanonicalState(
+        str(record.get("canonical_state", previous_semantic.canonical.value))
+    )
+    publication_state = (
+        PublicationState.PUBLISHED
+        if canonical_state is CanonicalState.SELECTED
+        else PublicationState.BLOCKED
+        if canonical_state in {CanonicalState.UNRESOLVED, CanonicalState.TIE}
+        else previous_semantic.publication
+    )
     adapted["semantic_state"] = SemanticState(
         classification=classification,
         function=function,
-        affinity=previous_semantic.affinity,
-        canonical=previous_semantic.canonical,
-        publication=previous_semantic.publication,
+        affinity=affinity,
+        canonical=canonical_state,
+        publication=publication_state,
         resolved_class=str(record.get("doc_class", "") or "") or None,
         resolved_function=str(record.get("resolved_function", "") or "") or None,
     ).to_dict()
@@ -2321,15 +2373,14 @@ def build_normalized_record(payload: Dict[str, Any], json_path: Path) -> Dict[st
     }
 
     if analysis.get("doc_class") == DOC_CLASS_ACT_FINAL:
-        if analysis.get("is_canonical_candidate"):
-            numero_result = _extract_numero_acordo(snapshot, collection)
-            numero_acordo = str(numero_result.get("value", "") or "")
-            field_source_numero_acordo = str(numero_result.get("field_source", "") or "")
-            numero_source_type = str(numero_result.get("source_type", "") or SOURCE_MISSING)
-            numero_confidence = str(numero_result.get("confidence", "") or CONFIDENCE_LOW)
-            numero_evidence = str(numero_result.get("evidence", "") or "")
-            numero_evidences = list(numero_result.get("evidences", []) or [])
-            numero_warning = str(numero_result.get("warning", "") or "")
+        numero_result = _extract_numero_acordo(snapshot, collection)
+        numero_acordo = str(numero_result.get("value", "") or "")
+        field_source_numero_acordo = str(numero_result.get("field_source", "") or "")
+        numero_source_type = str(numero_result.get("source_type", "") or SOURCE_MISSING)
+        numero_confidence = str(numero_result.get("confidence", "") or CONFIDENCE_LOW)
+        numero_evidence = str(numero_result.get("evidence", "") or "")
+        numero_evidences = list(numero_result.get("evidences", []) or [])
+        numero_warning = str(numero_result.get("warning", "") or "")
         signature_dates = _extract_signature_dates(str(snapshot.get("text", "") or ""))
         data_assinatura = max(signature_dates) if signature_dates else ""
         datas_assinatura = " | ".join(signature_dates)
@@ -2455,6 +2506,11 @@ def build_normalized_record(payload: Dict[str, Any], json_path: Path) -> Dict[st
         ),
         "affinity_status": str(process_affinity.get("affinity_status", "")),
         "affinity_confidence": str(process_affinity.get("affinity_confidence", "")),
+        "host_process": str(process_affinity.get("host_process", "")),
+        "mentioned_processes": json.dumps(process_affinity.get("mentioned_processes", []), ensure_ascii=False),
+        "affinity_state": str(process_affinity.get("affinity_state", "")),
+        "affinity_canonical_eligible": bool(process_affinity.get("canonical_eligible", False)),
+        "affinity_reason_code": str(process_affinity.get("reason_code", "")),
         "affinity_evidence": " | ".join(process_affinity.get("affinity_evidence", []) or []),
         "affinity_rule_version": str(process_affinity.get("affinity_rule_version", "")),
         "snapshot_mode": _clean_spaces(str(snapshot.get("extraction_mode", "") or "")),
@@ -2511,6 +2567,9 @@ def _build_field_diagnostics(records: List[Dict[str, Any]]) -> List[Dict[str, st
 
 def export_normalized_csv(output_dir: Path, logger: Any = None) -> Dict[str, Any]:
     csv_writer.ensure_output_dir(output_dir)
+    settings = get_settings()
+    threshold = getattr(settings, "act_canonical_minimum_score", ACT_CANONICAL_MINIMUM_SCORE)
+    min_margin = getattr(settings, "act_canonical_minimum_margin", ACT_CANONICAL_MINIMUM_MARGIN)
     json_paths = _collect_act_snapshot_paths(output_dir)
     if not json_paths:
         _log(logger, "info", "Normalizador ACT: nenhum JSON encontrado em %s.", output_dir)
@@ -2536,8 +2595,53 @@ def export_normalized_csv(output_dir: Path, logger: Any = None) -> Dict[str, Any
             for record in records
             if record.get("doc_class") == DOC_CLASS_ACT_FINAL
             and record.get("validation_status") == VALIDATION_STATUS_VALID
+            and record.get("is_canonical_candidate") is True
         ]
-        if not canonical_candidates:
+        candidates = [
+            CanonicalCandidate(
+                identity=_act_canonical_identity(record, payloads_by_record[id(record)]),
+                score=int(record.get("canonical_score", 0) or 0),
+            )
+            for record in canonical_candidates
+        ]
+        decision = select_canonical(candidates, threshold=threshold, min_margin=min_margin)
+        winner_id = decision.winner_candidate_id
+        for record in records:
+            record["canonical_candidate_id"] = _act_canonical_identity(
+                record, payloads_by_record[id(record)]
+            ).candidate_id or ""
+            record["canonical_decision"] = decision.to_dict()
+            record["canonical_state"] = (
+                decision.canonical_state.value
+                if record in canonical_candidates
+                else CanonicalState.INELIGIBLE.value
+            )
+            record["canonical_reason"] = (
+                decision.reason.value
+                if record in canonical_candidates
+                else str(
+                    record.get("affinity_reason_code", "")
+                    or record.get("function_reason", "")
+                    or record.get("classification_reason", "")
+                    or record.get("discard_reason", "")
+                    or CanonicalState.INELIGIBLE.value
+                )
+            )
+            record["canonical_selection_reason"] = decision.reason.value
+            record["canonical_threshold"] = decision.threshold
+            record["canonical_min_margin"] = decision.min_margin
+            record["canonical_runner_up_score"] = decision.runner_up_score
+            record["canonical_observed_margin"] = decision.observed_margin
+
+        canonical = next(
+            (
+                record
+                for record in canonical_candidates
+                if _act_canonical_identity(record, payloads_by_record[id(record)]).candidate_id == winner_id
+            ),
+            None,
+        )
+        if canonical is None:
             alias_path = _act_alias_path(output_dir, processo)
             if alias_path.exists() and any(Path(str(record.get("json_path", ""))).parent.name == "candidates" for record in records):
                 try:
@@ -2545,26 +2649,18 @@ def export_normalized_csv(output_dir: Path, logger: Any = None) -> Dict[str, Any
                 except OSError as exc:
                     _log(logger, "warning", "Normalizador ACT: falha ao remover alias nao canonico %s (%s).", alias_path, exc)
             for record in records:
-                record["normalization_status"] = "descartado_nao_canonico"
                 record["publication_status"] = PUBLICATION_STATUS_SILVER
-                if not record.get("discard_reason"):
-                    record["discard_reason"] = record.get("doc_class", "")
-                if not record.get("canon_rejection_reason"):
-                    record["canon_rejection_reason"] = record.get("classification_reason", "") or record.get(
-                        "discard_reason",
-                        "",
-                    )
+                if record in canonical_candidates:
+                    record["normalization_status"] = "retido_selecao_nao_resolvida"
+                    record["canon_rejection_reason"] = decision.reason.value
+                else:
+                    record["normalization_status"] = "descartado_nao_canonico"
+                    if not record.get("discard_reason"):
+                        record["discard_reason"] = record.get("doc_class", "")
+                    if not record.get("canon_rejection_reason"):
+                        record["canon_rejection_reason"] = record["canonical_reason"]
                 _refresh_contract(record)
             continue
-
-        canonical = max(
-            canonical_candidates,
-            key=lambda item: (
-                int(item.get("canonical_score", 0) or 0),
-                int(item.get("text_chars", 0) or 0),
-                len(item.get("objeto", "")),
-            ),
-        )
         for record in records:
             if record is canonical:
                 source_path = Path(str(record.get("candidate_json_path", "") or record.get("json_path", "")))
@@ -2587,6 +2683,7 @@ def export_normalized_csv(output_dir: Path, logger: Any = None) -> Dict[str, Any
                 record["publication_status"] = PUBLICATION_STATUS_SILVER
                 record["discard_reason"] = "act_final_nao_canonico"
                 record["canon_rejection_reason"] = "act_final_nao_canonico"
+                record["canonical_state"] = CanonicalState.UNRESOLVED.value
                 _refresh_contract(record)
             else:
                 record["normalization_status"] = "descartado_nao_canonico"
@@ -2655,13 +2752,26 @@ def export_normalized_csv(output_dir: Path, logger: Any = None) -> Dict[str, Any
         "document_origin_process",
         "document_origin_source",
         "document_origin_confidence",
+        "host_process",
+        "mentioned_processes",
         "affinity_status",
         "affinity_confidence",
+        "affinity_state",
+        "affinity_canonical_eligible",
+        "affinity_reason_code",
         "affinity_evidence",
         "affinity_rule_version",
         "snapshot_mode",
         "text_chars",
         "canonical_score",
+        "canonical_candidate_id",
+        "canonical_state",
+        "canonical_reason",
+        "canonical_selection_reason",
+        "canonical_threshold",
+        "canonical_min_margin",
+        "canonical_runner_up_score",
+        "canonical_observed_margin",
         "candidate_json_path",
         "json_path",
     ]
@@ -2677,6 +2787,9 @@ def export_normalized_csv(output_dir: Path, logger: Any = None) -> Dict[str, Any
         "affinity_status",
         "affinity_confidence",
         "document_origin_process",
+        "host_process",
+        "mentioned_processes",
+        "affinity_reason_code",
         "document_origin_source",
         "current_process_explicit",
         "current_process_in_metadata",
@@ -2701,6 +2814,7 @@ def export_normalized_csv(output_dir: Path, logger: Any = None) -> Dict[str, Any
     csv_writer.write_csv(affinity_rows, affinity_path, columns=affinity_columns)
 
     normalized_columns = [
+        "canonical_candidate_id",
         "numero_acordo",
         "processo",
         "data_assinatura",
@@ -2736,7 +2850,7 @@ def export_normalized_csv(output_dir: Path, logger: Any = None) -> Dict[str, Any
                     payloads_by_record[id(record)],
                     source_path=Path(str(record.get("candidate_json_path", ""))).relative_to(output_dir).as_posix(),
                 )
-                for record in canonical_records
+                for record in audit_records
             ],
         }
         v2_path = write_v2_sidecar(v2_sidecar_path(csv_path), envelope, family="ACT")
