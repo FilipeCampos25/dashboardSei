@@ -11,6 +11,7 @@ from urllib.parse import parse_qs, urlparse
 
 from app.config import get_settings
 from app.output import csv_writer
+from app.services.act_field_consolidation import consolidate_act_fields
 from app.services.canonical_selection import CanonicalCandidate, select_canonical
 from app.services.contract_adapters import (
     V2_SCHEMA_VERSION,
@@ -2415,6 +2416,10 @@ def build_normalized_record(payload: Dict[str, Any], json_path: Path) -> Dict[st
         gestor_titular, gestor_substituto, gestor_source = _extract_gestores(snapshot)
         unidade_responsavel, unidade_source = _extract_unidade_responsavel(snapshot)
         field_source_gestao = gestor_source or unidade_source
+    elif analysis.get("doc_class") in {DOC_CLASS_EXTRATO, DOC_CLASS_PUBLICACAO}:
+        publicacao_info = _extract_data_publicacao_info(snapshot)
+        data_publicacao = publicacao_info["data_publicacao"]
+        data_publicacao_warning = publicacao_info["warning"]
 
     validation_warning = _collect_validation_warnings(payload, analysis, vigencia_warning)
     if data_publicacao_warning:
@@ -2565,7 +2570,62 @@ def _build_field_diagnostics(records: List[Dict[str, Any]]) -> List[Dict[str, st
     return diagnostics
 
 
-def export_normalized_csv(output_dir: Path, logger: Any = None) -> Dict[str, Any]:
+def _tracking_path_key(value: Any) -> str:
+    path_text = str(value or "").strip()
+    if not path_text:
+        return ""
+    try:
+        return str(Path(path_text).resolve()).casefold()
+    except OSError:
+        return str(Path(path_text)).casefold()
+
+
+def _synchronize_act_tracking_records(
+    tracking_records: List[Dict[str, Any]],
+    audit_records: List[Dict[str, Any]],
+) -> None:
+    """Project the already-computed canonical decision onto operational status rows."""
+    audit_by_path = {
+        _tracking_path_key(record.get("candidate_json_path")): record
+        for record in audit_records
+        if _tracking_path_key(record.get("candidate_json_path"))
+    }
+    audit_by_identity = {
+        (
+            _clean_spaces(str(record.get("processo", "") or "")),
+            _clean_spaces(str(record.get("canonical_candidate_id", "") or "")),
+        ): record
+        for record in audit_records
+        if record.get("canonical_candidate_id")
+    }
+    synchronized_fields = (
+        "publication_status",
+        "normalization_status",
+        "discard_reason",
+        "canon_rejection_reason",
+        "canonical_state",
+        "canonical_reason",
+        "canonical_selection_reason",
+    )
+    for tracking_record in tracking_records:
+        audit_record = audit_by_path.get(_tracking_path_key(tracking_record.get("json_path")))
+        if audit_record is None:
+            identity = (
+                _clean_spaces(str(tracking_record.get("processo", "") or "")),
+                _clean_spaces(str(tracking_record.get("candidate_id", "") or "")),
+            )
+            audit_record = audit_by_identity.get(identity)
+        if audit_record is None:
+            continue
+        for field in synchronized_fields:
+            tracking_record[field] = audit_record.get(field, "")
+
+
+def export_normalized_csv(
+    output_dir: Path,
+    logger: Any = None,
+    tracking_records: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
     csv_writer.ensure_output_dir(output_dir)
     settings = get_settings()
     threshold = getattr(settings, "act_canonical_minimum_score", ACT_CANONICAL_MINIMUM_SCORE)
@@ -2697,6 +2757,9 @@ def export_normalized_csv(output_dir: Path, logger: Any = None) -> Dict[str, Any
                     )
                 _refresh_contract(record)
         _log(logger, "info", "Normalizador ACT: processo %s canonico=%s.", processo, canonical.get("json_path", ""))
+
+    if tracking_records is not None:
+        _synchronize_act_tracking_records(tracking_records, audit_records)
 
     audit_columns = [
         "requested_type",
@@ -2844,14 +2907,14 @@ def export_normalized_csv(output_dir: Path, logger: Any = None) -> Dict[str, Any
         envelope = {
             "schema_version": V2_SCHEMA_VERSION,
             "legacy_artifact": csv_path.name,
-            "records": [
+            "records": consolidate_act_fields([
                 build_act_v2_record(
                     record,
                     payloads_by_record[id(record)],
                     source_path=Path(str(record.get("candidate_json_path", ""))).relative_to(output_dir).as_posix(),
                 )
                 for record in audit_records
-            ],
+            ]),
         }
         v2_path = write_v2_sidecar(v2_sidecar_path(csv_path), envelope, family="ACT")
     diagnostic_columns = [

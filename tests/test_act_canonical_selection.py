@@ -87,11 +87,69 @@ class ACTCanonicalSelectionTests(unittest.TestCase):
         )
         self.assertTrue(all(row["publication_status"] == "retained_silver" for row in rows))
 
-    def _run(self, scores: dict[str, int], *, threshold: float, margin: float):
-        payloads = {candidate_id: self._payload(candidate_id) for candidate_id in scores}
-        return self._run_payloads(payloads, scores, threshold=threshold, margin=margin)
+    def test_final_decision_synchronizes_winner_and_losers_to_tracking(self) -> None:
+        tracking = self._tracking_records("A", "B", "C")
+        rows, normalized = self._run(
+            {"A": 90, "B": 70, "C": 60},
+            threshold=50,
+            margin=5,
+            tracking_records=tracking,
+        )
 
-    def _run_payloads(self, payloads, scores, *, threshold: float, margin: float):
+        self.assertEqual(["A"], [row["canonical_candidate_id"] for row in normalized])
+        self.assertEqual(1, len([row for row in tracking if row["publication_status"] == "published_gold"]))
+        by_id = {row["candidate_id"]: row for row in tracking}
+        self.assertEqual("published_gold", by_id["A"]["publication_status"])
+        for candidate_id in ("B", "C"):
+            self.assertEqual("retained_silver", by_id[candidate_id]["publication_status"])
+            self.assertEqual("act_final_nao_canonico", by_id[candidate_id]["canon_rejection_reason"])
+        self.assertEqual(
+            [row["publication_status"] for row in rows],
+            [by_id[row["canonical_candidate_id"]]["publication_status"] for row in rows],
+        )
+
+    def test_final_decision_synchronizes_zero_winner_to_tracking(self) -> None:
+        cases = (
+            ({"A": 40, "B": 30}, 50, 5, "canonical.unresolved.below_threshold"),
+            ({"A": 80, "B": 78}, 50, 5, "canonical.unresolved.insufficient_margin"),
+            ({"A": 80, "B": 80}, 50, 5, "canonical.unresolved.tie"),
+        )
+        for scores, threshold, margin, reason in cases:
+            with self.subTest(reason=reason):
+                tracking = self._tracking_records(*scores)
+                rows, normalized = self._run(
+                    scores,
+                    threshold=threshold,
+                    margin=margin,
+                    tracking_records=tracking,
+                )
+
+                self.assertEqual([], normalized)
+                self.assertTrue(all(row["publication_status"] == "retained_silver" for row in tracking))
+                self.assertTrue(all(row["canon_rejection_reason"] == reason for row in tracking))
+                self.assertEqual(
+                    [row["publication_status"] for row in rows],
+                    [row["publication_status"] for row in tracking],
+                )
+
+    def _run(
+        self,
+        scores: dict[str, int],
+        *,
+        threshold: float,
+        margin: float,
+        tracking_records=None,
+    ):
+        payloads = {candidate_id: self._payload(candidate_id) for candidate_id in scores}
+        return self._run_payloads(
+            payloads,
+            scores,
+            threshold=threshold,
+            margin=margin,
+            tracking_records=tracking_records,
+        )
+
+    def _run_payloads(self, payloads, scores, *, threshold: float, margin: float, tracking_records=None):
         shutil.rmtree(self.output_dir, ignore_errors=True)
         self.output_dir.mkdir(parents=True)
         for candidate_id, payload in payloads.items():
@@ -109,13 +167,26 @@ class ACTCanonicalSelectionTests(unittest.TestCase):
         with patch("app.services.act_normalizer._canonical_score", side_effect=score), patch(
             "app.services.act_normalizer.get_settings", return_value=settings
         ):
-            export_normalized_csv(self.output_dir)
+            export_normalized_csv(self.output_dir, tracking_records=tracking_records)
         with (self.output_dir / "act_classificacao_latest.csv").open(encoding="utf-8-sig", newline="") as stream:
             rows = list(csv.DictReader(stream))
         normalized_path = self.output_dir / "act_normalizado_latest.csv"
         with normalized_path.open(encoding="utf-8-sig", newline="") as stream:
             normalized = list(csv.DictReader(stream))
         return rows, normalized
+
+    def _tracking_records(self, *candidate_ids: str):
+        return [
+            {
+                "processo": self.process_id,
+                "candidate_id": candidate_id,
+                "json_path": str(self.output_dir / f"acordo_cooperacao_tecnica_{candidate_id}.json"),
+                "publication_status": "published_gold",
+                "normalization_status": "publicado_canonico",
+                "discard_reason": "",
+            }
+            for candidate_id in candidate_ids
+        ]
 
     def _payload(self, candidate_id: str, *, document_process: str | None = None, report: bool = False):
         process = document_process or self.process_id

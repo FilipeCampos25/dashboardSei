@@ -121,6 +121,63 @@ class ActProvenanceTests(unittest.TestCase):
             fields = {item["field_name"]: item for item in sidecar["records"][0]["fields"]}
             self.assertEqual("document", fields["objeto"]["evidences"][0]["source_kind"])
 
+    def test_related_extract_contributes_publication_date_without_becoming_gold(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp:
+            output_dir = Path(temp)
+            primary = self._payload()
+            primary["snapshot"]["text"] = (
+                f"PROCESSO No {primary['processo']}.\n" + primary["snapshot"]["text"]
+            )
+            related = {
+                "processo": primary["processo"],
+                "snapshot": {
+                    "title": "Extrato do Acordo de Cooperacao Tecnica 1/2021",
+                    "text": "EXTRATO DO ACORDO DE COOPERACAO TECNICA 1/2021 publicado no DOU em 04/03/2022.",
+                },
+                "collection": {
+                    "document_id": "5550001",
+                    "candidate_id": "related-extract",
+                    "source_url": "https://sei.example/controlador.php?acao=documento&id_documento=5550001",
+                },
+            }
+            (output_dir / "acordo_cooperacao_tecnica_primary.json").write_text(
+                json.dumps(primary), encoding="utf-8"
+            )
+            (output_dir / "acordo_cooperacao_tecnica_extract.json").write_text(
+                json.dumps(related), encoding="utf-8"
+            )
+            settings = SimpleNamespace(
+                v2_dual_write=True,
+                provenance_enforcement_mode="off",
+                act_canonical_minimum_score=0,
+                act_canonical_minimum_margin=1,
+            )
+
+            with patch("app.services.act_normalizer.get_settings", return_value=settings), patch(
+                "app.services.contract_adapters.get_settings", return_value=settings
+            ):
+                result = export_normalized_csv(output_dir)
+
+            sidecar = json.loads(result["v2_path"].read_text(encoding="utf-8"))
+            winner = next(
+                record for record in sidecar["records"]
+                if record["semantic_state"]["canonical"] == "SELECTED"
+            )
+            extract = next(
+                record for record in sidecar["records"]
+                if record["semantic_state"]["resolved_function"] == "act.extract"
+            )
+            publication = next(
+                field for field in winner["fields"] if field["field_name"] == "data_publicacao"
+            )
+
+            self.assertEqual("PRESENT", publication["state"])
+            self.assertEqual("2022-03-04", publication["value"])
+            self.assertEqual("related_document", publication["evidences"][0]["source_kind"])
+            self.assertEqual("5550001", publication["evidences"][0]["source_document"]["document_id"])
+            self.assertEqual("INELIGIBLE", extract["semantic_state"]["canonical"])
+            self.assertNotEqual("PUBLISHED", extract["semantic_state"]["publication"])
+
     @staticmethod
     def _fields(v2: dict[str, object]) -> dict[str, FieldResult]:
         return {

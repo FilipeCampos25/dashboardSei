@@ -209,6 +209,12 @@ class ACTHandlerTests(unittest.TestCase):
             json_paths = {row["json_path"] for row in status_rows}
             self.assertEqual(len(json_paths), 3)
             self.assertTrue(all("\\candidates\\" in path or "/candidates/" in path for path in json_paths))
+            self.assertEqual(1, len([row for row in status_rows if row["publication_status"] == "published_gold"]))
+            self.assertEqual(
+                2,
+                len([row for row in status_rows if row["publication_status"] == "retained_silver"]),
+            )
+            self.assertTrue(all(row["canonical_selection_reason"] for row in status_rows))
         finally:
             shutil.rmtree(output_dir, ignore_errors=True)
 

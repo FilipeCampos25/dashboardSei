@@ -329,6 +329,16 @@ class CooperationDocumentHandler:
             return
 
         csv_writer.ensure_output_dir(output_dir)
+        export_result: Dict[str, Any] = {}
+        if self._export_act_normalized:
+            try:
+                export_result = export_normalized_csv(
+                    output_dir,
+                    logger=logger,
+                    tracking_records=self._tracking_records,
+                )
+            except Exception as exc:
+                logger.warning("Falha ao gerar CSV %s normalizado (%s).", spec.log_label, exc)
         # `*_status_execucao_latest.csv` e uma trilha operacional da coleta, nao a base final da dashboard.
         columns = [
             "captured_at",
@@ -365,7 +375,11 @@ class CooperationDocumentHandler:
             "publication_status",
             "normalization_status",
             "discard_reason",
+            "canon_rejection_reason",
             "classification_reason",
+            "canonical_state",
+            "canonical_reason",
+            "canonical_selection_reason",
             "json_path",
         ]
         status_path = output_dir / self._status_filename
@@ -425,18 +439,14 @@ class CooperationDocumentHandler:
             except Exception as exc:
                 logger.warning("Falha ao gerar CSV dashboard_ready_latest.csv (%s).", exc)
             return
-        try:
-            export_result = export_normalized_csv(output_dir, logger=logger)
-            if export_result.get("latest_path"):
-                logger.info(
-                    "Relatorio %s normalizado gerado: registros=%d latest=%s auditoria=%s",
-                    spec.log_label,
-                    int(export_result.get("records", 0) or 0),
-                    export_result["latest_path"],
-                    export_result.get("audit_path", ""),
-                )
-        except Exception as exc:
-            logger.warning("Falha ao gerar CSV %s normalizado (%s).", spec.log_label, exc)
+        if export_result.get("latest_path"):
+            logger.info(
+                "Relatorio %s normalizado gerado: registros=%d latest=%s auditoria=%s",
+                spec.log_label,
+                int(export_result.get("records", 0) or 0),
+                export_result["latest_path"],
+                export_result.get("audit_path", ""),
+            )
         try:
             from app.services.act_shadow_scoring import export_shadow_report
 
