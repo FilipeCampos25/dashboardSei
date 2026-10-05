@@ -295,25 +295,6 @@ REPORT_MARKERS = (
     "relatorio das atividades",
 )
 
-FINALIZATION_MARKERS = (
-    "apos o encerramento",
-    "apos o termino",
-    "ao termino da vigencia",
-    "ao final da vigencia",
-    "por ocasiao do encerramento",
-    "encerramento da parceria",
-    "encerramento do ajuste",
-)
-
-PERIODIC_REPORT_MARKERS = (
-    "mensal",
-    "bimestral",
-    "trimestral",
-    "quadrimestral",
-    "semestral",
-    "anual",
-)
-
 INTERNAL_ACT_MARKERS = (
     "censipam",
     "ministerio da defesa",
@@ -1902,15 +1883,75 @@ def _extract_unidade_responsavel(snapshot: Dict[str, Any]) -> Tuple[str, str]:
     return (value, "rotulo_unidade_responsavel" if value else "")
 
 
-def _extract_relatorio_encerramento(snapshot: Dict[str, Any]) -> bool:
-    normalized = _normalize_text(str(snapshot.get("text", "") or ""))
-    if any(marker in normalized for marker in FINAL_REPORT_MARKERS):
-        return True
-    if any(marker in normalized for marker in REPORT_MARKERS) and any(
-        marker in normalized for marker in FINALIZATION_MARKERS
-    ):
-        return not any(marker in normalized for marker in PERIODIC_REPORT_MARKERS)
-    return False
+def _extract_relatorio_encerramento(
+    snapshot: Dict[str, Any], *, resolved_function: str | None = None,
+) -> Dict[str, Any]:
+    """Distinguish completed closure evidence from clauses about future duties."""
+
+    prepared = _prepare_text(str(snapshot.get("text", "") or ""))
+    sentences = [
+        _clean_spaces(part)
+        for part in re.split(r"(?<=[.!?;])\s+|[\r\n]+", prepared)
+        if _clean_spaces(part)
+    ]
+    report_markers = FINAL_REPORT_MARKERS + REPORT_MARKERS
+    closure_markers = (
+        "act foi encerrado", "acordo foi encerrado", "ajuste foi encerrado",
+        "parceria foi encerrada", "encerramento ocorrido", "act foi concluido",
+        "acordo foi concluido", "ajuste foi concluido", "parceria foi concluida",
+        "act foi finalizado", "acordo foi finalizado", "ajuste foi finalizado",
+    )
+    future_markers = (
+        "devera apresentar", "devera ser apresentado", "devera ser elaborado",
+        "sera apresentado", "sera elaborado", "deverao apresentar", "deverao elaborar",
+        "apresentara", "apresentarao", "elaborara", "elaborarao", "mediante a elaboracao",
+    )
+    negative_markers = (
+        "nao foi apresentado", "nao foi emitido", "nao foi elaborado",
+        "nao existe relatorio", "sem relatorio de encerramento",
+    )
+    effective_report_patterns = (
+        r"\b(?:foi|foram)\s+(?:apresentad[oa]s?|emitid[oa]s?|elaborad[oa]s?|concluid[oa]s?|aprovad[oa]s?)\b.{0,100}\brelatorio\b",
+        r"\brelatorio\b.{0,100}\b(?:foi|foram)\s+(?:apresentad[oa]s?|emitid[oa]s?|elaborad[oa]s?|concluid[oa]s?|aprovad[oa]s?)\b",
+        r"\brelatorio (?:final|de encerramento|conclusivo)\b.{0,80}\b(?:apresentado|emitido|elaborado|concluido|aprovado)\b",
+    )
+    relevant = [
+        (sentence, _normalize_text(sentence))
+        for sentence in sentences
+        if any(marker in _normalize_text(sentence) for marker in report_markers + closure_markers)
+    ]
+    for sentence, normalized in relevant:
+        if any(marker in normalized for marker in negative_markers):
+            return {"confirmed": False, "state": FieldState.ABSENT,
+                    "reason": "act.relatorio_encerramento.explicit_absence", "evidence": sentence}
+    for sentence, normalized in relevant:
+        if any(marker in normalized for marker in future_markers):
+            return {"confirmed": False, "state": FieldState.EXPECTED_ELSEWHERE,
+                    "reason": "act.relatorio_encerramento.future_obligation", "evidence": sentence}
+    for sentence, normalized in relevant:
+        if any(marker in normalized for marker in closure_markers):
+            return {"confirmed": True, "state": FieldState.PRESENT,
+                    "reason": "act.relatorio_encerramento.effective_event", "evidence": sentence}
+        if any(re.search(pattern, normalized) for pattern in effective_report_patterns):
+            return {"confirmed": True, "state": FieldState.PRESENT,
+                    "reason": "act.relatorio_encerramento.effective_report", "evidence": sentence}
+    if resolved_function == "act.report" and relevant:
+        normalized_body = _normalize_text(prepared)
+        functional_markers = ("apresenta os resultados", "descreve os resultados", "resultados finais")
+        if any(marker in normalized_body for marker in functional_markers):
+            evidence = next(
+                (sentence for sentence in sentences if any(
+                    marker in _normalize_text(sentence) for marker in functional_markers
+                )),
+                relevant[0][0],
+            )
+            return {"confirmed": True, "state": FieldState.PRESENT,
+                    "reason": "act.relatorio_encerramento.functional_report", "evidence": evidence}
+    if relevant:
+        return {"confirmed": False, "state": FieldState.UNRESOLVED,
+                "reason": "act.relatorio_encerramento.nominal_mention", "evidence": relevant[0][0]}
+    return {"confirmed": False, "state": FieldState.NOT_EVALUATED,
+            "reason": "act.relatorio_encerramento.no_evidence", "evidence": ""}
 
 
 def _collect_validation_warnings(
@@ -2035,6 +2076,17 @@ def _build_contract_fields(record: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
         )
     numero_field["evidence"] = str(record.get("numero_acordo_evidence", "") or "")
     numero_field["evidences"] = record.get("numero_acordo_evidences", []) or []
+    report_result = record.get("_relatorio_encerramento_result", {})
+    report_state = report_result.get("state", FieldState.NOT_EVALUATED)
+    report_field = make_field(
+        value=True if report_state is FieldState.PRESENT else "",
+        raw_value=report_result.get("evidence", ""),
+        source_type=SOURCE_DOCUMENT_TEXT if report_result.get("evidence") else SOURCE_MISSING,
+        confidence=CONFIDENCE_HIGH if report_state is FieldState.PRESENT else CONFIDENCE_LOW,
+        rule_id=str(report_result.get("reason", "") or "act.relatorio_encerramento.no_evidence"),
+    )
+    report_field["field_state"] = report_state.value
+    report_field["evidence"] = str(report_result.get("evidence", "") or "")
     return {
         "numero_acordo": numero_field,
         "data_assinatura": _field_or_missing(
@@ -2136,6 +2188,7 @@ def _build_contract_fields(record: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
             confidence=CONFIDENCE_MEDIUM,
             rule_id=str(record.get("field_source_gestao", "") or "act.unidade_responsavel.missing"),
         ),
+        "relatorio_encerramento": report_field,
     }
 
 
@@ -2237,9 +2290,13 @@ def build_act_v2_record(
         if not isinstance(field, dict):
             continue
         value = field.get("value")
-        present = value is not None and (not isinstance(value, str) or bool(value.strip()))
+        explicit_state = field.get("field_state")
+        state = FieldState(explicit_state) if explicit_state else None
+        present = state is FieldState.PRESENT if state is not None else (
+            value is not None and (not isinstance(value, str) or bool(value.strip()))
+        )
         evidences = ()
-        if present:
+        if present or (state is not None and field.get("evidence")):
             legacy_evidences = record.get("numero_acordo_evidences", []) if field_name == "numero_acordo" else ()
             evidences = _act_field_evidences(
                 field_name,
@@ -2251,7 +2308,7 @@ def build_act_v2_record(
         field_results.append(
             FieldResult(
                 field_name=field_name,
-                state=FieldState.PRESENT if present else FieldState.NOT_EVALUATED,
+                state=state or (FieldState.PRESENT if present else FieldState.NOT_EVALUATED),
                 value=value if present else None,
                 evidences=evidences,
             )
@@ -2372,6 +2429,9 @@ def build_normalized_record(payload: Dict[str, Any], json_path: Path) -> Dict[st
         "warning": "",
         "source_scope": "snapshot_act_canonico",
     }
+    relatorio_encerramento_result = _extract_relatorio_encerramento(
+        snapshot, resolved_function=analysis.get("resolved_function")
+    )
 
     if analysis.get("doc_class") == DOC_CLASS_ACT_FINAL:
         numero_result = _extract_numero_acordo(snapshot, collection)
@@ -2453,9 +2513,8 @@ def build_normalized_record(payload: Dict[str, Any], json_path: Path) -> Dict[st
         "gestor_substituto": gestor_substituto,
         "unidade_responsavel": unidade_responsavel,
         "classificacao": DOC_CLASS_ACT_FINAL if analysis.get("doc_class") == DOC_CLASS_ACT_FINAL else "",
-        "relatorio_encerramento": bool(_extract_relatorio_encerramento(snapshot))
-        if analysis.get("doc_class") == DOC_CLASS_ACT_FINAL
-        else False,
+        "relatorio_encerramento": bool(relatorio_encerramento_result["confirmed"]),
+        "_relatorio_encerramento_result": relatorio_encerramento_result,
         "doc_class": analysis.get("doc_class", ""),
         "resolved_document_type": analysis.get("resolved_document_type", ""),
         "is_canonical_candidate": bool(analysis.get("is_canonical_candidate")),
@@ -2541,6 +2600,7 @@ def build_normalized_record(payload: Dict[str, Any], json_path: Path) -> Dict[st
             record.get("canon_rejection_reason", ""),
         ],
     )
+    record.pop("_relatorio_encerramento_result", None)
     return record
 
 

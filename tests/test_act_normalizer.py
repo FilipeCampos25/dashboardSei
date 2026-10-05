@@ -28,6 +28,7 @@ from app.services.act_normalizer import (
     export_normalized_csv,
     resolve_act_vigencia,
 )
+from app.services.field_states import FieldResult, FieldState
 from tests.fixture_loader import load_fixture
 
 
@@ -421,7 +422,10 @@ class ACTNormalizerTests(unittest.TestCase):
         self.assertEqual(record["gestor_substituto"], "")
         self.assertEqual(record["unidade_responsavel"], "")
         self.assertEqual(record["classificacao"], DOC_CLASS_ACT_FINAL)
-        self.assertTrue(record["relatorio_encerramento"])
+        self.assertFalse(record["relatorio_encerramento"])
+        field = record["normalization_contract"]["fields"]["relatorio_encerramento"]
+        self.assertEqual("EXPECTED_ELSEWHERE", field["field_state"])
+        self.assertEqual("act.relatorio_encerramento.future_obligation", field["rule_id"])
         self.assertEqual(record["field_source_numero_acordo"], "act.numero.header.adjacent")
         self.assertEqual(record["field_source_objeto"], "clausula_objeto")
         self.assertEqual(record["field_source_vigencia"], "clausula_vigencia_ultima_assinatura")
@@ -888,6 +892,107 @@ class ACTNormalizerTests(unittest.TestCase):
 
         record = build_normalized_record(payload, Path("acordo_cooperacao_tecnica_60090.001000_2026-01.json"))
         self.assertFalse(record["relatorio_encerramento"])
+
+    def test_relatorio_encerramento_distingue_contexto_temporal_e_negacao(self) -> None:
+        cases = (
+            (
+                "Apos o termino da vigencia, devera ser apresentado relatorio de encerramento.",
+                False,
+                "EXPECTED_ELSEWHERE",
+                "act.relatorio_encerramento.future_obligation",
+            ),
+            (
+                "Foi apresentado o relatorio de encerramento em 10/03/2026.",
+                True,
+                "PRESENT",
+                "act.relatorio_encerramento.effective_report",
+            ),
+            (
+                "O ACT foi encerrado em 10/03/2026.",
+                True,
+                "PRESENT",
+                "act.relatorio_encerramento.effective_event",
+            ),
+            (
+                "Relatorio de encerramento.",
+                False,
+                "UNRESOLVED",
+                "act.relatorio_encerramento.nominal_mention",
+            ),
+            (
+                "Nao foi apresentado relatorio de encerramento.",
+                False,
+                "ABSENT",
+                "act.relatorio_encerramento.explicit_absence",
+            ),
+        )
+        for index, (statement, expected, state, reason) in enumerate(cases, start=1):
+            with self.subTest(statement=statement):
+                payload = {
+                    "processo": f"60090.00100{index}/2026-01",
+                    "snapshot": {
+                        "title": "SEI - Acordo de Cooperacao Tecnica",
+                        "extraction_mode": "html_dom",
+                        "text": f"""
+                            ACORDO DE COOPERACAO TECNICA No {index}/2026 QUE ENTRE SI CELEBRAM A UNIAO E A VISIONA.
+                            CLAUSULA PRIMEIRA - DO OBJETO
+                            O objeto do presente Acordo e a cooperacao institucional.
+                            {statement}
+                        """,
+                    },
+                    "collection": {"chosen_documento": f"Acordo de Cooperacao Tecnica {index}/2026"},
+                }
+                record = build_normalized_record(payload, Path(f"act_relatorio_{index}.json"))
+                field = record["normalization_contract"]["fields"]["relatorio_encerramento"]
+                self.assertIs(expected, record["relatorio_encerramento"])
+                self.assertEqual(state, field["field_state"])
+                self.assertEqual(reason, field["rule_id"])
+
+    def test_relatorio_encerramento_titulo_isolado_nao_confirma(self) -> None:
+        payload = {
+            "processo": "60090.001010/2026-01",
+            "snapshot": {
+                "title": "Relatorio de encerramento",
+                "extraction_mode": "html_dom",
+                "text": "ACORDO DE COOPERACAO TECNICA que entre si celebram as partes.",
+            },
+            "collection": {"chosen_documento": "Relatorio de encerramento"},
+        }
+        record = build_normalized_record(payload, Path("act_titulo_relatorio.json"))
+        self.assertFalse(record["relatorio_encerramento"])
+        field = record["normalization_contract"]["fields"]["relatorio_encerramento"]
+        self.assertEqual("NOT_EVALUATED", field["field_state"])
+
+    def test_documento_relatorio_com_conteudo_funcional_confirma_e_preserva_proveniencia(self) -> None:
+        payload = {
+            "processo": "60090.001011/2026-01",
+            "snapshot": {
+                "title": "Relatorio 48 - Encerramento de ACT",
+                "extraction_mode": "html_dom",
+                "text": (
+                    "RELATORIO DE ENCERRAMENTO DO ACORDO DE COOPERACAO TECNICA. "
+                    "Este relatorio apresenta os resultados finais da parceria encerrada em 10/03/2026."
+                ),
+            },
+            "collection": {
+                "chosen_documento": "Relatorio 48 - Encerramento de ACT (7000048)",
+                "document_id": "7000048",
+                "candidate_id": "closing-report-48",
+            },
+        }
+        source_path = Path("candidates/closing-report-48.json")
+        record = build_normalized_record(payload, source_path)
+        self.assertEqual("act.report", record["resolved_function"])
+        self.assertTrue(record["relatorio_encerramento"])
+        fields = {
+            item["field_name"]: FieldResult.from_dict(item)
+            for item in build_act_v2_record(record, payload, source_path=source_path)["fields"]
+        }
+        field = fields["relatorio_encerramento"]
+        self.assertIs(FieldState.PRESENT, field.state)
+        self.assertIs(True, field.value)
+        self.assertEqual("7000048", field.evidences[0].source_document.document_id)
+        self.assertIn("resultados finais", field.evidences[0].raw_evidence.lower())
 
     def test_export_normalized_csv_keeps_only_act_final(self) -> None:
         output_dir = Path.cwd() / "tests" / "_tmp_act_normalizer"
