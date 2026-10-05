@@ -8,6 +8,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 
 from app.services.act_field_consolidation import consolidate_act_fields
+from app.services.act_normalizer import resolve_act_vigencia
 
 
 class ActFieldConsolidationTests(unittest.TestCase):
@@ -75,6 +76,115 @@ class ActFieldConsolidationTests(unittest.TestCase):
         field = self.field(consolidate_act_fields([primary, related])[0], "data_publicacao")
 
         self.assertEqual("NOT_EVALUATED", field["state"])
+
+    def test_publication_vigencia_uses_authorized_related_evidence(self) -> None:
+        primary, related = self.publication_vigencia_records("2021-04-10")
+
+        result = consolidate_act_fields(
+            [primary, related], vigencia_resolver=resolve_act_vigencia
+        )
+        start = self.field(result[0], "vigencia_inicio")
+        end = self.field(result[0], "vigencia_fim")
+
+        self.assertEqual(("PRESENT", "2021-04-10"), (start["state"], start["value"]))
+        self.assertEqual(("PRESENT", "2026-04-09"), (end["state"], end["value"]))
+        related_evidence = next(
+            item for item in start["evidences"] if item["source_kind"] == "related_document"
+        )
+        self.assertEqual("D-E", related_evidence["source_document"]["document_id"])
+        self.assertEqual(
+            "resolved_from_related_publication",
+            result[0]["act_vigencia_resolution"]["reason"],
+        )
+
+    def test_publication_vigencia_without_publication_stays_unresolved(self) -> None:
+        primary, related = self.publication_vigencia_records(None)
+
+        result = consolidate_act_fields(
+            [primary, related], vigencia_resolver=resolve_act_vigencia
+        )
+
+        self.assertEqual("UNRESOLVED", self.field(result[0], "vigencia_inicio")["state"])
+        self.assertEqual(
+            "publication_missing",
+            result[0]["act_vigencia_resolution"]["reason"],
+        )
+
+    def test_conflicting_publications_leave_vigencia_unresolved(self) -> None:
+        primary, first = self.publication_vigencia_records("2021-04-10")
+        second = self.record(
+            "E2", "act.extract", "INELIGIBLE", "data_publicacao", "2021-04-11"
+        )
+
+        result = consolidate_act_fields(
+            [primary, first, second], vigencia_resolver=resolve_act_vigencia
+        )
+
+        self.assertEqual("CONFLICT", self.field(result[0], "data_publicacao")["state"])
+        self.assertEqual("UNRESOLVED", self.field(result[0], "vigencia_fim")["state"])
+        self.assertEqual(
+            "publication_conflict",
+            result[0]["act_vigencia_resolution"]["reason"],
+        )
+
+    def test_signature_vigencia_is_not_changed_by_related_publication(self) -> None:
+        primary, related = self.publication_vigencia_records("2021-04-10")
+        clause = self.field(primary, "vigencia_raw")
+        clause["value"] = "5 anos a partir da ultima assinatura"
+        primary["fields"].append(
+            self.present_field("data_assinatura", "2021-04-01", primary["identity"])
+        )
+        original = self.field(primary, "vigencia_inicio")
+        original.update(self.present_field("vigencia_inicio", "2021-04-01", primary["identity"]))
+
+        result = consolidate_act_fields(
+            [primary, related], vigencia_resolver=resolve_act_vigencia
+        )
+
+        self.assertEqual("2021-04-01", self.field(result[0], "vigencia_inicio")["value"])
+        self.assertNotIn("act_vigencia_resolution", result[0])
+
+    @classmethod
+    def publication_vigencia_records(cls, publication: str | None) -> tuple[dict, dict]:
+        primary = cls.record("I", "act.instrument", "SELECTED", "data_publicacao", None)
+        primary["fields"].append(
+            cls.present_field(
+                "vigencia_raw",
+                "vigencia de 5 anos a partir da publicacao no DOU",
+                primary["identity"],
+            )
+        )
+        primary["fields"].extend(
+            {"field_name": name, "state": "NOT_EVALUATED", "value": None, "evidences": []}
+            for name in (
+                "vigencia_inicio",
+                "vigencia_fim",
+                "data_inicio_vigencia",
+                "data_fim_vigencia",
+            )
+        )
+        related = cls.record("E", "act.extract", "INELIGIBLE", "data_publicacao", publication)
+        return primary, related
+
+    @staticmethod
+    def present_field(name: str, value: str, identity: dict) -> dict:
+        return {
+            "field_name": name,
+            "state": "PRESENT",
+            "value": value,
+            "evidences": [
+                {
+                    "field_name": name,
+                    "source_kind": "document",
+                    "source_document": copy.deepcopy(identity),
+                    "relation": None,
+                    "rule_id": f"act.{name}",
+                    "location": None,
+                    "raw_evidence": value,
+                    "external_reference": None,
+                }
+            ],
+        }
 
     @staticmethod
     def field(record: dict, name: str) -> dict:

@@ -5,7 +5,7 @@ from __future__ import annotations
 import copy
 import json
 from dataclasses import replace
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from app.services.act_field_policy import may_complement_act
 from app.services.field_states import FieldResult, FieldState
@@ -16,6 +16,13 @@ from app.services.semantic_states import CanonicalState, SemanticState
 
 CONSOLIDATION_RULE = "act.field_consolidation.authorized_complement"
 RELATION_PREFIX = "act.same_process_complement"
+VIGENCIA_RELATED_PUBLICATION_RULE = "act.vigencia.related_publication"
+VIGENCIA_FIELDS = (
+    "vigencia_inicio",
+    "vigencia_fim",
+    "data_inicio_vigencia",
+    "data_fim_vigencia",
+)
 
 
 def _identity_key(identity: DocumentIdentity) -> tuple[str, str, str, str]:
@@ -60,7 +67,90 @@ def _field_map(record: Mapping[str, Any]) -> dict[str, FieldResult]:
     }
 
 
-def consolidate_act_fields(records: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+def _vigencia_evidences(
+    field_name: str,
+    clause: FieldResult,
+    publication: FieldResult,
+) -> tuple[FieldEvidence, ...]:
+    clause_evidence = tuple(
+        replace(
+            item,
+            field_name=field_name,
+            source_kind=SourceKind.DERIVED,
+            rule_id=VIGENCIA_RELATED_PUBLICATION_RULE,
+        )
+        for item in clause.evidences
+    )
+    publication_evidence = tuple(replace(item, field_name=field_name) for item in publication.evidences)
+    return _sorted_evidence(clause_evidence + publication_evidence)
+
+
+def _resolve_publication_vigencia(
+    primary: dict[str, Any],
+    resolved: dict[str, FieldResult],
+    resolver: Callable[..., Mapping[str, str]],
+) -> None:
+    clause = resolved.get("vigencia_raw")
+    publication = resolved.get("data_publicacao")
+    if clause is None or clause.state is not FieldState.PRESENT or publication is None:
+        return
+
+    signature = resolved.get("data_assinatura")
+    signature_value = str(signature.value) if signature and signature.state is FieldState.PRESENT else ""
+    publication_value = str(publication.value) if publication.state is FieldState.PRESENT else ""
+    temporal = resolver(
+        str(clause.value),
+        data_assinatura=signature_value,
+        data_publicacao=publication_value,
+    )
+    if temporal.get("anchor") != "publicacao":
+        return
+
+    if publication.state is FieldState.PRESENT and temporal.get("vigencia_inicio"):
+        state = FieldState.PRESENT
+        reason = "resolved_from_related_publication" if any(
+            item.source_kind is SourceKind.RELATED_DOCUMENT for item in publication.evidences
+        ) else "resolved_from_publication"
+    else:
+        state = FieldState.UNRESOLVED
+        if publication.state is FieldState.CONFLICT:
+            reason = "publication_conflict"
+        elif publication.state is FieldState.PRESENT:
+            reason = "publication_invalid_for_clause"
+        else:
+            reason = "publication_missing"
+
+    values = {
+        "vigencia_inicio": temporal.get("vigencia_inicio"),
+        "vigencia_fim": temporal.get("vigencia_fim"),
+        "data_inicio_vigencia": temporal.get("vigencia_inicio"),
+        "data_fim_vigencia": temporal.get("vigencia_fim"),
+    }
+    for field_name in VIGENCIA_FIELDS:
+        value = values[field_name]
+        field_state = state if state is FieldState.UNRESOLVED or value else FieldState.UNRESOLVED
+        resolved[field_name] = FieldResult(
+            field_name=field_name,
+            state=field_state,
+            value=value if field_state is FieldState.PRESENT else None,
+            evidences=_vigencia_evidences(field_name, clause, publication),
+        )
+    primary["act_vigencia_resolution"] = {
+        "rule_id": VIGENCIA_RELATED_PUBLICATION_RULE,
+        "anchor": "publicacao",
+        "state": state.value,
+        "reason": reason,
+        "amount": temporal.get("amount", ""),
+        "unit": temporal.get("unit", ""),
+        "warning": temporal.get("warning", ""),
+    }
+
+
+def consolidate_act_fields(
+    records: Sequence[Mapping[str, Any]],
+    *,
+    vigencia_resolver: Callable[..., Mapping[str, str]] | None = None,
+) -> list[dict[str, Any]]:
     """Add authorized related evidence without selecting or promoting documents."""
 
     consolidated = [copy.deepcopy(dict(record)) for record in records]
@@ -140,6 +230,8 @@ def consolidate_act_fields(records: Sequence[Mapping[str, Any]]) -> list[dict[st
             }
 
         if audit:
-            primary["fields"] = [resolved[name].to_dict() for name in sorted(resolved)]
             primary["act_field_consolidation"] = audit
+        if vigencia_resolver is not None:
+            _resolve_publication_vigencia(primary, resolved, vigencia_resolver)
+        primary["fields"] = [resolved[name].to_dict() for name in sorted(resolved)]
     return consolidated

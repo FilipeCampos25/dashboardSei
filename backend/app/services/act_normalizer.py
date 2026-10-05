@@ -2914,7 +2914,7 @@ def export_normalized_csv(
                     source_path=Path(str(record.get("candidate_json_path", ""))).relative_to(output_dir).as_posix(),
                 )
                 for record in audit_records
-            ]),
+            ], vigencia_resolver=resolve_act_vigencia),
         }
         v2_path = write_v2_sidecar(v2_sidecar_path(csv_path), envelope, family="ACT")
     diagnostic_columns = [

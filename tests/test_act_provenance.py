@@ -127,6 +127,9 @@ class ActProvenanceTests(unittest.TestCase):
             primary = self._payload()
             primary["snapshot"]["text"] = (
                 f"PROCESSO No {primary['processo']}.\n" + primary["snapshot"]["text"]
+            ).replace(
+                "5 anos a partir da data da ultima assinatura",
+                "5 anos a partir da publicacao no DOU",
             )
             related = {
                 "processo": primary["processo"],
@@ -170,11 +173,22 @@ class ActProvenanceTests(unittest.TestCase):
             publication = next(
                 field for field in winner["fields"] if field["field_name"] == "data_publicacao"
             )
+            fields = self._fields(winner)
 
             self.assertEqual("PRESENT", publication["state"])
             self.assertEqual("2022-03-04", publication["value"])
             self.assertEqual("related_document", publication["evidences"][0]["source_kind"])
             self.assertEqual("5550001", publication["evidences"][0]["source_document"]["document_id"])
+            self.assertEqual("2022-03-04", fields["vigencia_inicio"].value)
+            self.assertEqual("2027-03-03", fields["vigencia_fim"].value)
+            self.assertTrue(
+                any(
+                    item.source_kind is SourceKind.RELATED_DOCUMENT
+                    and item.source_document.document_id == "5550001"
+                    for item in fields["vigencia_inicio"].evidences
+                )
+            )
+            self.assertTrue(validate_field_provenance(fields["vigencia_inicio"]).is_valid)
             self.assertEqual("INELIGIBLE", extract["semantic_state"]["canonical"])
             self.assertNotEqual("PUBLISHED", extract["semantic_state"]["publication"])
 
