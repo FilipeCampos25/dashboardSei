@@ -33,6 +33,81 @@ from tests.fixture_loader import load_fixture
 
 
 class ACTNormalizerTests(unittest.TestCase):
+    def _gestao_record(self, labeled_text: str):
+        payload = {
+            "processo": "60090.000001/2026-00",
+            "snapshot": {
+                "title": "Acordo de Cooperacao Tecnica 1/2026",
+                "text": (
+                    "ACORDO DE COOPERACAO TECNICA No 1/2026 QUE ENTRE SI CELEBRAM O CENSIPAM E O PARCEIRO.\n"
+                    "CLAUSULA PRIMEIRA - DO OBJETO: cooperacao institucional.\n"
+                    f"{labeled_text}"
+                ),
+            },
+            "collection": {"document_id": "doc-1", "candidate_id": "candidate-1"},
+        }
+        record = build_normalized_record(payload, Path("act-gestao.json"))
+        fields = {
+            item.field_name: item
+            for item in (
+                FieldResult.from_dict(field)
+                for field in build_act_v2_record(record, payload, source_path="act-gestao.json")["fields"]
+            )
+        }
+        return record, fields
+
+    def test_gestao_single_candidates_are_resolved_without_labels(self) -> None:
+        record, fields = self._gestao_record(
+            "Gestor: Joao da Silva\nUnidade responsavel: COGEST"
+        )
+
+        self.assertEqual("Joao da Silva", record["gestor_titular"])
+        self.assertEqual("COGEST", record["unidade_responsavel"])
+        self.assertIs(FieldState.PRESENT, fields["gestor_titular"].state)
+        self.assertIs(FieldState.PRESENT, fields["unidade_responsavel"].state)
+        self.assertEqual("Joao da Silva", fields["gestor_titular"].evidences[0].raw_evidence)
+
+    def test_gestao_multiple_candidates_are_conflicts_not_concatenated_values(self) -> None:
+        record, fields = self._gestao_record(
+            "Gestores: Joao da Silva; Maria Souza\nUnidade responsavel: COGEST / Diretoria X"
+        )
+
+        self.assertEqual("", record["gestor_titular"])
+        self.assertEqual("", record["unidade_responsavel"])
+        self.assertIs(FieldState.CONFLICT, fields["gestor_titular"].state)
+        self.assertIs(FieldState.CONFLICT, fields["unidade_responsavel"].state)
+        self.assertEqual(
+            "act.gestor_titular.explicit_label.multiple_candidates",
+            record["normalization_contract"]["fields"]["gestor_titular"]["rule_id"],
+        )
+        self.assertEqual(
+            {"Joao da Silva", "Maria Souza"},
+            set(record["normalization_contract"]["fields"]["gestor_titular"]["candidates"]),
+        )
+        self.assertEqual(2, len(fields["gestor_titular"].evidences))
+        self.assertEqual(2, len(fields["unidade_responsavel"].evidences))
+
+    def test_gestao_adjacent_labels_do_not_cross_contaminate_fields(self) -> None:
+        record, fields = self._gestao_record(
+            "Gestor responsavel: Joao da Silva Unidade: COGEST"
+        )
+
+        self.assertEqual("Joao da Silva", record["gestor_titular"])
+        self.assertEqual("COGEST", record["unidade_responsavel"])
+        self.assertNotIn("Unidade", record["gestor_titular"])
+        self.assertIs(FieldState.PRESENT, fields["unidade_responsavel"].state)
+        self.assertEqual(DOC_CLASS_ACT_FINAL, record["doc_class"])
+        self.assertIn("cooperacao institucional", record["objeto"])
+
+    def test_gestao_without_candidates_is_explicitly_absent(self) -> None:
+        record, fields = self._gestao_record("Sem designacao de gestao neste instrumento.")
+
+        self.assertEqual("", record["gestor_titular"])
+        self.assertEqual("", record["unidade_responsavel"])
+        self.assertIs(FieldState.ABSENT, fields["gestor_titular"].state)
+        self.assertIs(FieldState.ABSENT, fields["unidade_responsavel"].state)
+        self.assertEqual((), fields["gestor_titular"].evidences)
+
     def test_closing_report_with_copied_contract_language_is_not_act_final(self) -> None:
         fixture = load_fixture("act_related.json")
         result = classify_cooperation_snapshot(

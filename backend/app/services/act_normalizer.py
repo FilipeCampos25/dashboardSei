@@ -1841,46 +1841,91 @@ def _extract_objeto(snapshot: Dict[str, Any]) -> Tuple[str, str]:
     return ("", "")
 
 
-def _extract_explicit_named_value(text: str, labels: Tuple[str, ...]) -> str:
+_GESTAO_NEXT_LABEL = (
+    r"(?:Gestor(?:es)?(?:\s+(?:Titular(?:es)?|Substituto(?:s)?|Respons[a\u00e1]vel(?:is)?))?"
+    r"|Representante(?:s)?(?:\s+(?:Titular(?:es)?|Substituto(?:s)?))?"
+    r"|Fiscal(?:is)?(?:\s+(?:Titular(?:es)?|Substituto(?:s)?))?"
+    r"|Titular(?:es)?|Substituto(?:s)?|Suplente(?:s)?"
+    r"|Unidade(?:\s+Respons[a\u00e1]vel|\s+Demandante)?|[AÁ]rea\s+Respons[a\u00e1]vel)"
+)
+
+
+def _extract_labeled_candidates(text: str, labels: Tuple[str, ...]) -> List[Dict[str, str]]:
     prepared = _prepare_text(text)
-    for label in labels:
-        pattern = rf"{label}\s*(?:-|–|—|:)\s*([A-Z\u00c0-\u00dd][^\n\r:]+)"
-        match = re.search(pattern, prepared, flags=re.IGNORECASE)
-        if not match:
-            continue
-        value = _clean_spaces(match.group(1))
-        value = re.split(
-            r"\b(?:Substituto|Titular|CPF|RG|Matr[i\u00ed]cula|Suplente|Unidade Respons[a\u00e1]vel)\b",
-            value,
-            maxsplit=1,
-            flags=re.IGNORECASE,
-        )[0].strip()
-        if _has_content(value, min_alpha=4):
-            return value
-    return ""
+    label_pattern = "|".join(f"(?:{label})" for label in labels)
+    pattern = re.compile(
+        rf"(?P<label>{label_pattern})\s*(?:-|–|—|:)\s*(?P<value>.+?)"
+        rf"(?=(?:\s+{_GESTAO_NEXT_LABEL}\s*(?:-|–|—|:))|[\r\n]|$)",
+        flags=re.IGNORECASE,
+    )
+    candidates: List[Dict[str, str]] = []
+    for match in pattern.finditer(prepared):
+        raw_value = _clean_spaces(match.group("value"))
+        for part in re.split(r"\s*(?:;|\||\s/\s)\s*", raw_value):
+            value = _clean_spaces(part).strip(" -–—:;,|")
+            if not _has_content(value, min_alpha=2):
+                continue
+            candidate = {
+                "value": value,
+                "evidence": value,
+                "source_excerpt": _clean_spaces(match.group(0)),
+                "label": _clean_spaces(match.group("label")),
+            }
+            known = {item["value"].casefold() for item in candidates}
+            if candidate["value"].casefold() not in known:
+                candidates.append(candidate)
+    return candidates
 
 
-def _extract_gestores(snapshot: Dict[str, Any]) -> Tuple[str, str, str]:
+def _resolve_gestao_candidates(
+    field_name: str, candidates: List[Dict[str, str]], *, rule_prefix: str,
+) -> Dict[str, Any]:
+    if not candidates:
+        return {"value": "", "state": FieldState.ABSENT, "reason": f"{rule_prefix}.absent", "candidates": []}
+    state = FieldState.PRESENT if len(candidates) == 1 else FieldState.CONFLICT
+    return {
+        "value": candidates[0]["value"] if state is FieldState.PRESENT else "",
+        "state": state,
+        "reason": f"{rule_prefix}.single" if state is FieldState.PRESENT else f"{rule_prefix}.multiple_candidates",
+        "candidates": [
+            {**candidate, "field_name": field_name, "source_type": SOURCE_DOCUMENT_TEXT,
+             "rule_id": f"{rule_prefix}.candidate"}
+            for candidate in candidates
+        ],
+    }
+
+
+def _extract_gestores(snapshot: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     text = str(snapshot.get("text", "") or "")
-    titular = _extract_explicit_named_value(
+    titular = _extract_labeled_candidates(
         text,
-        ("Gestor Titular", "Representante Titular", "Fiscal Titular", "Titular", "Gestor"),
+        (r"Gestor(?:es)?\s+Titular(?:es)?", r"Representante(?:s)?\s+Titular(?:es)?",
+         r"Fiscal(?:is)?\s+Titular(?:es)?", r"Titular(?:es)?",
+         r"Gestor(?:es)?(?:\s+Respons[a\u00e1]vel(?:is)?)?"),
     )
-    substituto = _extract_explicit_named_value(
+    substituto = _extract_labeled_candidates(
         text,
-        ("Gestor Substituto", "Representante Substituto", "Fiscal Substituto", "Substituto", "Suplente"),
+        (r"Gestor(?:es)?\s+Substituto(?:s)?", r"Representante(?:s)?\s+Substituto(?:s)?",
+         r"Fiscal(?:is)?\s+Substituto(?:s)?", r"Substituto(?:s)?", r"Suplente(?:s)?"),
     )
-    source = "rotulos_explicitos" if titular or substituto else ""
-    return (titular, substituto, source)
+    return {
+        "gestor_titular": _resolve_gestao_candidates(
+            "gestor_titular", titular, rule_prefix="act.gestor_titular.explicit_label"
+        ),
+        "gestor_substituto": _resolve_gestao_candidates(
+            "gestor_substituto", substituto, rule_prefix="act.gestor_substituto.explicit_label"
+        ),
+    }
 
 
-def _extract_unidade_responsavel(snapshot: Dict[str, Any]) -> Tuple[str, str]:
-    text = str(snapshot.get("text", "") or "")
-    value = _extract_explicit_named_value(
-        text,
-        (r"Unidade Respons[a\u00e1]vel", r"[AÁ]rea Respons[a\u00e1]vel", r"Unidade Demandante"),
+def _extract_unidade_responsavel(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    candidates = _extract_labeled_candidates(
+        str(snapshot.get("text", "") or ""),
+        (r"Unidade\s+Respons[a\u00e1]vel", r"[AÁ]rea\s+Respons[a\u00e1]vel", r"Unidade\s+Demandante", r"Unidade"),
     )
-    return (value, "rotulo_unidade_responsavel" if value else "")
+    return _resolve_gestao_candidates(
+        "unidade_responsavel", candidates, rule_prefix="act.unidade_responsavel.explicit_label"
+    )
 
 
 def _extract_relatorio_encerramento(
@@ -2061,6 +2106,25 @@ def _vigencia_source_type(field_source_vigencia: str) -> str:
     return SOURCE_MISSING
 
 
+def _gestao_contract_field(record: Dict[str, Any], field_name: str) -> Dict[str, Any]:
+    result = (record.get("_gestao_results", {}) or {}).get(field_name, {})
+    state = result.get("state", FieldState.ABSENT)
+    candidates = list(result.get("candidates", []) or [])
+    field = make_field(
+        value=result.get("value", ""),
+        raw_value=candidates[0].get("evidence", "") if len(candidates) == 1 else "",
+        source_type=SOURCE_DOCUMENT_TEXT if candidates else SOURCE_MISSING,
+        confidence=CONFIDENCE_MEDIUM if state is FieldState.PRESENT else CONFIDENCE_LOW,
+        rule_id=str(result.get("reason", "") or f"act.{field_name}.absent"),
+        warning="multiple_candidates" if state is FieldState.CONFLICT else "",
+    )
+    field["field_state"] = state.value
+    field["evidence"] = candidates[0].get("evidence", "") if len(candidates) == 1 else ""
+    field["evidences"] = candidates
+    field["candidates"] = [candidate["value"] for candidate in candidates]
+    return field
+
+
 def _build_contract_fields(record: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     vigencia_source = _clean_spaces(str(record.get("field_source_vigencia", "") or ""))
     vigencia_source_type = _vigencia_source_type(vigencia_source)
@@ -2170,24 +2234,9 @@ def _build_contract_fields(record: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
             confidence=CONFIDENCE_HIGH if record.get("field_source_objeto") else CONFIDENCE_LOW,
             rule_id=str(record.get("field_source_objeto", "") or "act.objeto.missing"),
         ),
-        "gestor_titular": _field_or_missing(
-            value=str(record.get("gestor_titular", "") or ""),
-            source_type=SOURCE_DOCUMENT_TEXT,
-            confidence=CONFIDENCE_MEDIUM,
-            rule_id=str(record.get("field_source_gestao", "") or "act.gestor_titular.missing"),
-        ),
-        "gestor_substituto": _field_or_missing(
-            value=str(record.get("gestor_substituto", "") or ""),
-            source_type=SOURCE_DOCUMENT_TEXT,
-            confidence=CONFIDENCE_MEDIUM,
-            rule_id=str(record.get("field_source_gestao", "") or "act.gestor_substituto.missing"),
-        ),
-        "unidade_responsavel": _field_or_missing(
-            value=str(record.get("unidade_responsavel", "") or ""),
-            source_type=SOURCE_DOCUMENT_TEXT,
-            confidence=CONFIDENCE_MEDIUM,
-            rule_id=str(record.get("field_source_gestao", "") or "act.unidade_responsavel.missing"),
-        ),
+        "gestor_titular": _gestao_contract_field(record, "gestor_titular"),
+        "gestor_substituto": _gestao_contract_field(record, "gestor_substituto"),
+        "unidade_responsavel": _gestao_contract_field(record, "unidade_responsavel"),
         "relatorio_encerramento": report_field,
     }
 
@@ -2296,8 +2345,10 @@ def build_act_v2_record(
             value is not None and (not isinstance(value, str) or bool(value.strip()))
         )
         evidences = ()
-        if present or (state is not None and field.get("evidence")):
-            legacy_evidences = record.get("numero_acordo_evidences", []) if field_name == "numero_acordo" else ()
+        if present or (state is not None and (field.get("evidence") or field.get("evidences"))):
+            legacy_evidences = field.get("evidences", ())
+            if field_name == "numero_acordo":
+                legacy_evidences = record.get("numero_acordo_evidences", [])
             evidences = _act_field_evidences(
                 field_name,
                 field,
@@ -2414,6 +2465,10 @@ def build_normalized_record(payload: Dict[str, Any], json_path: Path) -> Dict[st
     field_source_objeto = ""
     field_source_vigencia = ""
     field_source_gestao = ""
+    gestao_results: Dict[str, Dict[str, Any]] = {
+        name: {"value": "", "state": FieldState.ABSENT, "reason": f"act.{name}.absent", "candidates": []}
+        for name in ("gestor_titular", "gestor_substituto", "unidade_responsavel")
+    }
     vigencia_warning = ""
     vigencia_rule = {"amount": "", "unit": "", "anchor": ""}
     numero_warning = ""
@@ -2473,9 +2528,15 @@ def build_normalized_record(payload: Dict[str, Any], json_path: Path) -> Dict[st
         orgao_convenente_sigla = orgao_parts.get("orgao_convenente_sigla", "")
         orgao_intermediario = orgao_parts.get("orgao_intermediario", "") or _extract_orgao_intermediario(snapshot)
         objeto, field_source_objeto = _extract_objeto(snapshot)
-        gestor_titular, gestor_substituto, gestor_source = _extract_gestores(snapshot)
-        unidade_responsavel, unidade_source = _extract_unidade_responsavel(snapshot)
-        field_source_gestao = gestor_source or unidade_source
+        gestao_results.update(_extract_gestores(snapshot))
+        gestao_results["unidade_responsavel"] = _extract_unidade_responsavel(snapshot)
+        gestor_titular = str(gestao_results["gestor_titular"].get("value", "") or "")
+        gestor_substituto = str(gestao_results["gestor_substituto"].get("value", "") or "")
+        unidade_responsavel = str(gestao_results["unidade_responsavel"].get("value", "") or "")
+        field_source_gestao = next(
+            (str(result.get("reason", "") or "") for result in gestao_results.values() if result.get("candidates")),
+            "",
+        )
     elif analysis.get("doc_class") in {DOC_CLASS_EXTRATO, DOC_CLASS_PUBLICACAO}:
         publicacao_info = _extract_data_publicacao_info(snapshot)
         data_publicacao = publicacao_info["data_publicacao"]
@@ -2512,6 +2573,7 @@ def build_normalized_record(payload: Dict[str, Any], json_path: Path) -> Dict[st
         "gestor_titular": gestor_titular,
         "gestor_substituto": gestor_substituto,
         "unidade_responsavel": unidade_responsavel,
+        "_gestao_results": gestao_results,
         "classificacao": DOC_CLASS_ACT_FINAL if analysis.get("doc_class") == DOC_CLASS_ACT_FINAL else "",
         "relatorio_encerramento": bool(relatorio_encerramento_result["confirmed"]),
         "_relatorio_encerramento_result": relatorio_encerramento_result,
