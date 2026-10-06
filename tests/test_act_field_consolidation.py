@@ -58,9 +58,10 @@ class ActFieldConsolidationTests(unittest.TestCase):
                 self.assertEqual("NOT_EVALUATED", field["state"])
                 self.assertIsNone(field["value"])
 
-    def test_absent_evidence_remains_unresolved(self) -> None:
+    def test_title_only_extract_without_publication_evidence_remains_unresolved(self) -> None:
         primary = self.record("I", "act.instrument", "SELECTED", "data_publicacao", None)
         related = self.record("E", "act.extract", "INELIGIBLE", "data_publicacao", None)
+        related["title"] = "Extrato de publicacao"
 
         field = self.field(consolidate_act_fields([primary, related])[0], "data_publicacao")
 
@@ -79,6 +80,13 @@ class ActFieldConsolidationTests(unittest.TestCase):
 
     def test_publication_vigencia_uses_authorized_related_evidence(self) -> None:
         primary, related = self.publication_vigencia_records("2021-04-10")
+        primary["fields"].append(
+            self.present_field("objeto", "cooperacao tecnica", primary["identity"])
+        )
+        primary_semantic = copy.deepcopy(primary["semantic_state"])
+        primary_decision = copy.deepcopy(primary["document_gold_decision"])
+        related_semantic = copy.deepcopy(related["semantic_state"])
+        related_decision = copy.deepcopy(related["document_gold_decision"])
 
         result = consolidate_act_fields(
             [primary, related], vigencia_resolver=resolve_act_vigencia
@@ -96,6 +104,11 @@ class ActFieldConsolidationTests(unittest.TestCase):
             "resolved_from_related_publication",
             result[0]["act_vigencia_resolution"]["reason"],
         )
+        self.assertEqual("cooperacao tecnica", self.field(result[0], "objeto")["value"])
+        self.assertEqual(primary_semantic, result[0]["semantic_state"])
+        self.assertEqual(primary_decision, result[0]["document_gold_decision"])
+        self.assertEqual(related_semantic, result[1]["semantic_state"])
+        self.assertEqual(related_decision, result[1]["document_gold_decision"])
 
     def test_publication_vigencia_without_publication_stays_unresolved(self) -> None:
         primary, related = self.publication_vigencia_records(None)
