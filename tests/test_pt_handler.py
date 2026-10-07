@@ -122,7 +122,7 @@ class PTHandlerTests(unittest.TestCase):
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0]["validation_status"], "valid_for_requested_type")
             self.assertEqual(rows[0]["publication_status"], "retained_silver")
-            self.assertEqual(rows[0]["normalization_status"], "parcial_padronizado")
+            self.assertEqual(rows[0]["normalization_status"], "extraido_sem_padrao")
             self.assertEqual(rows[0]["found"], "True")
 
             diagnostics_path = output_dir / "pt_period_diagnostics_latest.csv"

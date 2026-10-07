@@ -17,30 +17,100 @@ from app.services.pt_normalizer import build_normalized_record, build_pt_v2_reco
 
 
 class PTProvenanceTests(unittest.TestCase):
-    def test_preview_precedence_and_document_fallback_preserve_legacy_values(self) -> None:
+    def test_document_partner_wins_over_divergent_preview(self) -> None:
         payload = self._payload()
-        preview = {
-            "parceiro": "Parceiro da preview",
-            "objeto": "Objeto resolvido pela preview",
-            "vigencia": "60 meses",
-        }
+        preview = {"parceiro": "Parceiro da preview"}
+        legacy = build_normalized_record(payload, preview, Path("plano_trabalho_fixture.json"))
+        fields = self._fields(build_pt_v2_record(legacy, payload, preview))
+
+        self.assertEqual("Orgao documental", legacy["parceiro"])
+        self.assertIs(fields["parceiro"].evidences[0].source_kind, SourceKind.DOCUMENT)
+        self.assertIs(fields["parceiro"].evidences[1].source_kind, SourceKind.PREVIEW)
+        self.assertEqual("Parceiro da preview", fields["parceiro"].evidences[1].raw_evidence)
+
+    def test_document_object_wins_over_divergent_preview(self) -> None:
+        payload = self._payload()
+        preview = {"objeto": "Objeto resolvido pela preview"}
+        legacy = build_normalized_record(payload, preview, Path("plano_trabalho_fixture.json"))
+        fields = self._fields(build_pt_v2_record(legacy, payload, preview))
+
+        self.assertEqual("objeto obtido do documento.", legacy["objeto"])
+        self.assertIs(fields["objeto"].evidences[0].source_kind, SourceKind.DOCUMENT)
+        self.assertIs(fields["objeto"].evidences[1].source_kind, SourceKind.PREVIEW)
+        self.assertEqual("Objeto resolvido pela preview", fields["objeto"].evidences[1].raw_evidence)
+
+    def test_preview_only_partner_remains_enrichment_but_not_document_complete(self) -> None:
+        payload = self._payload()
+        payload["snapshot"]["text"] = payload["snapshot"]["text"].replace(
+            "Participe 2: Orgao documental CNPJ 00.000.000/0001-00.",
+            "",
+        )
+        preview = {"parceiro": "Parceiro da preview"}
         legacy = build_normalized_record(payload, preview, Path("plano_trabalho_fixture.json"))
         fields = self._fields(build_pt_v2_record(legacy, payload, preview))
 
         self.assertEqual("Parceiro da preview", legacy["parceiro"])
-        self.assertEqual(legacy["parceiro"], fields["parceiro"].value)
         self.assertIs(fields["parceiro"].evidences[0].source_kind, SourceKind.PREVIEW)
-        self.assertIsNone(fields["parceiro"].evidences[0].source_document)
-        self.assertEqual(legacy["objeto"], fields["objeto"].value)
-        self.assertIs(fields["objeto"].evidences[0].source_kind, SourceKind.PREVIEW)
-        self.assertEqual(legacy["vigencia_raw"], fields["vigencia_raw"].value)
-        self.assertIs(fields["vigencia_raw"].evidences[0].source_kind, SourceKind.PREVIEW)
+        self.assertNotEqual("completo_padronizado", legacy["normalization_status"])
+        self.assertEqual("retained_silver", legacy["publication_status"])
 
-        without_preview = build_normalized_record(payload, {}, Path("plano_trabalho_fixture.json"))
-        fallback_fields = self._fields(build_pt_v2_record(without_preview, payload, {}))
-        self.assertEqual("Orgao documental", without_preview["parceiro"])
-        self.assertIs(fallback_fields["parceiro"].evidences[0].source_kind, SourceKind.DOCUMENT)
-        self.assertIs(fallback_fields["objeto"].evidences[0].source_kind, SourceKind.DOCUMENT)
+    def test_preview_only_object_remains_enrichment_but_not_document_complete(self) -> None:
+        payload = self._payload()
+        payload["snapshot"]["text"] = payload["snapshot"]["text"].replace(
+            "IDENTIFICACAO DO OBJETO Objeto obtido do documento.",
+            "",
+        )
+        preview = {"objeto": "Objeto resolvido pela preview"}
+        legacy = build_normalized_record(payload, preview, Path("plano_trabalho_fixture.json"))
+        fields = self._fields(build_pt_v2_record(legacy, payload, preview))
+
+        self.assertEqual("Objeto resolvido pela preview", legacy["objeto"])
+        self.assertIs(fields["objeto"].evidences[0].source_kind, SourceKind.PREVIEW)
+        self.assertNotEqual("completo_padronizado", legacy["normalization_status"])
+        self.assertEqual("retained_silver", legacy["publication_status"])
+
+    def test_document_fields_without_preview_remain_complete(self) -> None:
+        payload = self._payload()
+        legacy = build_normalized_record(payload, {}, Path("plano_trabalho_fixture.json"))
+        fields = self._fields(build_pt_v2_record(legacy, payload, {}))
+
+        self.assertIs(fields["parceiro"].evidences[0].source_kind, SourceKind.DOCUMENT)
+        self.assertIs(fields["objeto"].evidences[0].source_kind, SourceKind.DOCUMENT)
+        self.assertEqual("completo_padronizado", legacy["normalization_status"])
+
+    def test_equal_document_and_preview_values_keep_document_origin(self) -> None:
+        payload = self._payload()
+        preview = {
+            "parceiro": "Orgao documental",
+            "objeto": "objeto obtido do documento.",
+        }
+        legacy = build_normalized_record(payload, preview, Path("plano_trabalho_fixture.json"))
+        fields = self._fields(build_pt_v2_record(legacy, payload, preview))
+
+        self.assertIs(fields["parceiro"].evidences[0].source_kind, SourceKind.DOCUMENT)
+        self.assertIs(fields["objeto"].evidences[0].source_kind, SourceKind.DOCUMENT)
+
+    def test_preview_only_cannot_promote_incomplete_document_to_complete(self) -> None:
+        payload = self._payload()
+        payload["snapshot"]["text"] = payload["snapshot"]["text"].replace(
+            "IDENTIFICACAO DO OBJETO Objeto obtido do documento.",
+            "",
+        )
+        legacy = build_normalized_record(
+            payload,
+            {"objeto": "Objeto resolvido pela preview"},
+            Path("plano_trabalho_fixture.json"),
+        )
+
+        self.assertNotEqual("completo_padronizado", legacy["normalization_status"])
+        self.assertEqual("retained_silver", legacy["publication_status"])
+
+    def test_documentally_complete_pt_is_not_downgraded_by_preview_policy(self) -> None:
+        payload = self._payload()
+        legacy = build_normalized_record(payload, {}, Path("plano_trabalho_fixture.json"))
+
+        self.assertEqual("completo_padronizado", legacy["normalization_status"])
+        self.assertEqual("published_gold", legacy["publication_status"])
 
     def test_document_and_derived_fields_are_auditable_without_fabricated_identity(self) -> None:
         payload = self._payload()
@@ -83,7 +153,7 @@ class PTProvenanceTests(unittest.TestCase):
         report = validate_field_provenance(FieldResult("objeto", FieldState.PRESENT, "valor"))
         self.assertEqual((ProvenanceViolationCode.MISSING_EVIDENCE,), report.codes)
 
-    def test_dual_write_is_opt_in_and_legacy_csv_is_identical(self) -> None:
+    def test_dual_write_is_opt_in_and_csv_is_stable_between_modes(self) -> None:
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp:
             root = Path(temp)
             fixture = json.dumps(self._payload(), ensure_ascii=False)
@@ -104,8 +174,8 @@ class PTProvenanceTests(unittest.TestCase):
             self.assertIsNone(off_result["v2_path"])
             sidecar = json.loads(on_result["v2_path"].read_text(encoding="utf-8"))
             fields = {item["field_name"]: item for item in sidecar["records"][0]["fields"]}
-            self.assertEqual("preview", fields["parceiro"]["evidences"][0]["source_kind"])
-            self.assertEqual("preview", fields["objeto"]["evidences"][0]["source_kind"])
+            self.assertEqual("document", fields["parceiro"]["evidences"][0]["source_kind"])
+            self.assertEqual("document", fields["objeto"]["evidences"][0]["source_kind"])
 
     @staticmethod
     def _fields(v2: dict[str, object]) -> dict[str, FieldResult]:

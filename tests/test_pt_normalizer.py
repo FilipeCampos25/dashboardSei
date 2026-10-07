@@ -63,6 +63,7 @@ class PTNormalizerTests(unittest.TestCase):
         payload = _payload(
             "60090.001292/2025-24",
             """
+            Participe 2: MB-EMA CNPJ 00.000.000/0001-00.
             2.2. Periodo de Execucao 5 de novembro de 2025 a 5 de novembro de 2030.
             2.3. Identificacao do Objeto O objeto do presente Plano de Trabalho e a execucao colaborativa de atividades.
             5. METODOLOGIA E INTERVENCAO
@@ -88,6 +89,8 @@ class PTNormalizerTests(unittest.TestCase):
             "60090.000692/2021-99",
             """
             PLANO DE TRABALHO ENTRE CENSIPAM E IFB.
+            Participe 2: IFB Instituto Federal de Brasilia CNPJ 00.000.000/0001-00.
+            OBJETO: concessao de estagio obrigatorio.
             4. ETAPAS, EXECUCAO E CRONOGRAMA:
             Meta 1 - Realizacao do estagio curricular obrigatorio.
             Acao: apresentacao do Plano de Atividades semestral.
@@ -121,6 +124,8 @@ class PTNormalizerTests(unittest.TestCase):
             "60090.000692/2021-99",
             """
             PLANO DE TRABALHO ENTRE CENSIPAM E IFB.
+            Participe 2: IFB Instituto Federal de Brasilia CNPJ 00.000.000/0001-00.
+            OBJETO: concessao de estagio obrigatorio.
             8. PREVISAO DE INICIO E TERMINO:
             O presente plano de trabalho vigorara pelo prazo de 60 (sessenta) meses,
             a partir da data de sua assinatura.
@@ -147,6 +152,8 @@ class PTNormalizerTests(unittest.TestCase):
             "60092.000220/2021-16",
             """
             PLANO DE TRABALHO ENTRE CENSIPAM E IFPA.
+            Participe 2: IFPA INSTITUTO FEDERAL DE EDUCACAO, CIENCIA E TECNOLOGIA DO PARA CNPJ 00.000.000/0001-00.
+            OBJETO: oportunidade de vivencia interdisciplinar.
             4. ETAPAS E EXECUCAO E CRONOGRAMA:
             Meta 1 - Realizacao do estagio curricular supervisionado obrigatorio.
             Acao: apresentacao do Plano de Atividades.
@@ -180,6 +187,7 @@ class PTNormalizerTests(unittest.TestCase):
             "61074.007095/2020-75",
             """
             b. Outros Participes - Executor Orgao / Entidade Estado-Maior da Armada - EMA CNPJ 00.394.502/0074-08.
+            IDENTIFICACAO DO OBJETO Construcao de agenda de capacitacao nos temas objeto deste Plano de Trabalho.
             2. DESCRICAO DO PROJETO.
             Periodo de Execucao OUT2020 a OUT2025.
             """,
@@ -209,6 +217,8 @@ class PTNormalizerTests(unittest.TestCase):
             "60090.000445/2023-54",
             """
             PLANO DE TRABALHO - PT.
+            Participe 2: Visiona Tecnologia Espacial S/A CNPJ 00.000.000/0001-00.
+            OBJETO: execucao da cooperacao tecnica e operacional entre as participes.
             Periodo de Execucao AGO/2023 a AGO/2026.
             """,
             tables=[
@@ -241,6 +251,8 @@ class PTNormalizerTests(unittest.TestCase):
             "60093.000183/2021-36",
             """
             PLANO DE TRABALHO.
+            Participe 2: CPRM CNPJ 00.000.000/0001-00.
+            OBJETO: intercambio de informacoes para monitoramento hidrometeorologico.
             Periodo de Execucao MAR/2023 a MAR/2028.
             """,
             tables=[
@@ -299,6 +311,8 @@ class PTNormalizerTests(unittest.TestCase):
         payload = _payload(
             "60090.000702/2025-10",
             """
+            Participe 2: INSTITUTO NACIONAL DE PESQUISAS ESPACIAIS (INPE) CNPJ 00.000.000/0001-00.
+            OBJETO: execucao de atividades entre o INPE e CENSIPAM.
             Fase A: Assinatura do Acordo de Parceria. Meta1: Assinatura do Acordo.
             Atividade A.1. Definir as missoes que serao rastreadas.
             Fase B: Definicao da Interface - Meta 2: Documento de interface INPE-CENSIPAM.
@@ -325,6 +339,7 @@ class PTNormalizerTests(unittest.TestCase):
     def test_pdf_native_inicio_termino_inline_ignora_cabecalho_de_impressao(self) -> None:
         text = """
             PLANO DE TRABALHO
+            Participe 2: INSTITUTO NACIONAL DE PESQUISAS ESPACIAIS (INPE) CNPJ 00.000.000/0001-00.
             2. IDENTIFICACAO DO OBJETO
             INICIO(MES/ANO) JUNHO/2025
             TERMINO(MES/ANO) JUNHO/2030
@@ -461,6 +476,7 @@ class PTNormalizerTests(unittest.TestCase):
         processo = "60090.000100/2026-00"
         base_text = """
             PLANO DE TRABALHO
+            Participe 2: UNIVERSIDADE FEDERAL DE TESTE CNPJ 00.000.000/0001-00.
             OBJETO: cooperacao tecnica para pesquisa aplicada.
             Periodo de Execucao 1 de janeiro de 2026 a 31 de dezembro de 2026.
             Meta 1 - Implantar rotina de acompanhamento.

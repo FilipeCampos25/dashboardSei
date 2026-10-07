@@ -938,10 +938,7 @@ def _extract_execution_section(text: str) -> str:
     return tail[: stop.start() + 1].strip() if stop else tail.strip()
 
 
-def _extract_objeto(snapshot: Dict[str, Any], preview: Dict[str, str]) -> str:
-    preview_obj = _clean_spaces(str(preview.get("objeto", "") or ""))
-    if _has_content(preview_obj):
-        return preview_obj
+def _extract_document_objeto(snapshot: Dict[str, Any]) -> str:
     text = _prepare_text(str(snapshot.get("text", "") or ""))
     match = re.search(
         r"identificacao\s+do\s+objeto\s+(.*?)(?=\b(?:diagnostico|objetivo|metodologia|meta\s*\d+|previsao\s+de\s+inicio|unidade\s+responsavel)\b|$)",
@@ -959,10 +956,15 @@ def _extract_objeto(snapshot: Dict[str, Any], preview: Dict[str, str]) -> str:
     return ""
 
 
-def _extract_partner(snapshot: Dict[str, Any], preview: Dict[str, str]) -> str:
-    preview_partner = _clean_spaces(str(preview.get("parceiro", "") or ""))
-    if _has_content(preview_partner, min_alpha=4):
-        return preview_partner
+def _extract_objeto(snapshot: Dict[str, Any], preview: Dict[str, str]) -> str:
+    document_objeto = _extract_document_objeto(snapshot)
+    if document_objeto:
+        return document_objeto
+    preview_objeto = _clean_spaces(str(preview.get("objeto", "") or ""))
+    return preview_objeto if _has_content(preview_objeto) else ""
+
+
+def _extract_document_partner(snapshot: Dict[str, Any]) -> str:
     text = _prepare_text(str(snapshot.get("text", "") or ""))
     for pattern in (
         r"part[ií]cipe\s*2\s*:\s*(.+?)(?=\s+CNPJ\b|\s+DDD/Telefone\b|\s+Respons[aá]vel\b|$)",
@@ -976,6 +978,14 @@ def _extract_partner(snapshot: Dict[str, Any], preview: Dict[str, str]) -> str:
                 return candidate
     match = re.search(r"estado-maior\s+da\s+armada\s*-\s*ema", text, flags=re.IGNORECASE)
     return _clean_spaces(match.group(0)) if match else ""
+
+
+def _extract_partner(snapshot: Dict[str, Any], preview: Dict[str, str]) -> str:
+    document_partner = _extract_document_partner(snapshot)
+    if document_partner:
+        return document_partner
+    preview_partner = _clean_spaces(str(preview.get("parceiro", "") or ""))
+    return preview_partner if _has_content(preview_partner, min_alpha=4) else ""
 
 
 def _extract_atribuicoes(snapshot: Dict[str, Any]) -> str:
@@ -1023,9 +1033,20 @@ def _extract_acoes(snapshot: Dict[str, Any]) -> str:
     return " || ".join(fragments) if fragments else _clean_spaces(_extract_execution_section(base))
 
 
-def _classify_record(record: Dict[str, str]) -> Tuple[str, int]:
-    has_partner = _has_content(record.get("parceiro", ""), min_alpha=4)
-    has_objeto = _has_content(record.get("objeto", ""))
+def _classify_record(
+    record: Dict[str, str],
+    contract_fields: Dict[str, Dict[str, Any]],
+) -> Tuple[str, int]:
+    partner_field = contract_fields.get("parceiro", {})
+    objeto_field = contract_fields.get("objeto", {})
+    has_partner = (
+        partner_field.get("source_type") == SOURCE_DOCUMENT_TEXT
+        and _has_content(record.get("parceiro", ""), min_alpha=4)
+    )
+    has_objeto = (
+        objeto_field.get("source_type") == SOURCE_DOCUMENT_TEXT
+        and _has_content(record.get("objeto", ""))
+    )
     has_metas = _has_content(record.get("metas_raw", ""))
     has_acoes = _has_content(record.get("acoes_raw", ""))
     has_period = bool(record.get("prazo_inicio") and record.get("prazo_fim") and record["prazo_fim"] >= record["prazo_inicio"])
@@ -1172,6 +1193,8 @@ def _build_contract_fields(
 ) -> Dict[str, Dict[str, Any]]:
     preview_partner = _clean_spaces(str(preview.get("parceiro", "") or ""))
     preview_objeto = _clean_spaces(str(preview.get("objeto", "") or ""))
+    document_partner = _extract_document_partner(snapshot)
+    document_objeto = _extract_document_objeto(snapshot)
     preview_vigencia = _clean_spaces(str(preview.get("vigencia", "") or ""))
     tables = snapshot.get("tables", []) or []
     metas_source = SOURCE_TABLE if tables and _clean_spaces(record.get("metas_raw", "")) else SOURCE_DOCUMENT_TEXT
@@ -1184,11 +1207,11 @@ def _build_contract_fields(
     return {
         "parceiro": _field_or_missing(
             value=record.get("parceiro", ""),
-            raw_value=preview_partner if preview_partner and record.get("parceiro", "") == preview_partner else record.get("parceiro", ""),
-            source_type=SOURCE_PREVIEW if preview_partner and record.get("parceiro", "") == preview_partner else SOURCE_DOCUMENT_TEXT,
-            confidence=CONFIDENCE_MEDIUM if preview_partner and record.get("parceiro", "") == preview_partner else CONFIDENCE_HIGH,
+            raw_value=document_partner or preview_partner,
+            source_type=SOURCE_DOCUMENT_TEXT if document_partner else SOURCE_PREVIEW,
+            confidence=CONFIDENCE_HIGH if document_partner else CONFIDENCE_MEDIUM,
             rule_id="pt.parceiro.preview_or_document_text",
-            warning="preview_fallback" if preview_partner and record.get("parceiro", "") == preview_partner else "",
+            warning="" if document_partner else "preview_fallback",
         ),
         "vigencia_inicio": _field_or_missing(
             value=record.get("vigencia_inicio", ""),
@@ -1230,11 +1253,11 @@ def _build_contract_fields(
         ),
         "objeto": _field_or_missing(
             value=record.get("objeto", ""),
-            raw_value=preview_objeto if preview_objeto and record.get("objeto", "") == preview_objeto else record.get("objeto", ""),
-            source_type=SOURCE_PREVIEW if preview_objeto and record.get("objeto", "") == preview_objeto else SOURCE_DOCUMENT_TEXT,
-            confidence=CONFIDENCE_MEDIUM if preview_objeto and record.get("objeto", "") == preview_objeto else CONFIDENCE_HIGH,
+            raw_value=document_objeto or preview_objeto,
+            source_type=SOURCE_DOCUMENT_TEXT if document_objeto else SOURCE_PREVIEW,
+            confidence=CONFIDENCE_HIGH if document_objeto else CONFIDENCE_MEDIUM,
             rule_id="pt.objeto.preview_or_document_text",
-            warning="preview_fallback" if preview_objeto and record.get("objeto", "") == preview_objeto else "",
+            warning="" if document_objeto else "preview_fallback",
         ),
         "metas_raw": _field_or_missing(
             value=record.get("metas_raw", ""),
@@ -1313,7 +1336,7 @@ def build_pt_v2_record(
         if present:
             source_kind = _pt_source_kind(str(field.get("source_type", "") or ""))
             if source_kind is not None:
-                evidences = (
+                evidence_items = [
                     FieldEvidence(
                         field_name=field_name,
                         source_kind=source_kind,
@@ -1324,7 +1347,22 @@ def build_pt_v2_record(
                             str(field.get("evidence", "") or field.get("raw_value", "") or "")
                         ) or None,
                     ),
+                ]
+                preview_value = _clean_spaces(str(preview.get(field_name, "") or ""))
+                preview_has_content = _has_content(
+                    preview_value,
+                    min_alpha=4 if field_name == "parceiro" else 8,
                 )
+                if source_kind is SourceKind.DOCUMENT and field_name in {"parceiro", "objeto"} and preview_has_content:
+                    evidence_items.append(
+                        FieldEvidence(
+                            field_name=field_name,
+                            source_kind=SourceKind.PREVIEW,
+                            rule_id=f"pt.{field_name}.preview_enrichment",
+                            raw_evidence=preview_value,
+                        )
+                    )
+                evidences = tuple(evidence_items)
         field_results.append(
             FieldResult(
                 field_name=field_name,
@@ -1402,7 +1440,8 @@ def build_normalized_record(payload: Dict[str, Any], preview: Dict[str, str], js
         "preview_numero_act": _clean_spaces(str(preview.get("numero_act", "") or "")),
         "json_path": str(json_path),
     }
-    status, captured = _classify_record(record)
+    contract_fields = _build_contract_fields(record=record, preview=preview, snapshot=snapshot)
+    status, captured = _classify_record(record, contract_fields)
     record["normalization_status"] = status
     record["captured_focus_fields"] = str(captured)
     record["publication_status"] = (
@@ -1411,7 +1450,6 @@ def build_normalized_record(payload: Dict[str, Any], preview: Dict[str, str], js
         else PUBLICATION_STATUS_SILVER
     )
     record["canonical_score"] = str(_pt_canonical_score(payload, record))
-    contract_fields = _build_contract_fields(record=record, preview=preview, snapshot=snapshot)
     record["normalization_contract"] = build_document_contract(
         processo=record["processo"],
         requested_type=record["requested_type"],
