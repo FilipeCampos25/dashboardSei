@@ -4350,6 +4350,48 @@ class SEIScraper:
         snapshot: Dict[str, Any],
         collection_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
+        context = collection_context or {}
+        has_acquisition_evidence = isinstance(context.get("acquisition_state"), dict) or isinstance(
+            snapshot.get("acquisition_observation"),
+            dict,
+        )
+        if has_acquisition_evidence:
+            acquisition_state = acquisition_state_payload(context, snapshot)
+            opening_state = acquisition_state["opening"]
+            access_state = acquisition_state["access"]
+            extraction_state = acquisition_state["extraction"]
+            semantic_evaluation_eligible = (
+                opening_state == "OPENED"
+                and access_state == "ACCESSIBLE"
+                and extraction_state in {"EXTRACTED", "CONTENT_PARTIAL"}
+            )
+            if not semantic_evaluation_eligible:
+                diagnostic = acquisition_diagnostic_payload(context, snapshot)
+                technical_reason = diagnostic["code"]
+                if not technical_reason:
+                    if opening_state in {"OPEN_FAILED", "TIMEOUT"}:
+                        technical_reason = opening_state
+                    elif access_state in {"IFRAME_UNAVAILABLE", "ACCESS_RESTRICTED"}:
+                        technical_reason = access_state
+                    elif extraction_state == "EXTRACTION_FAILED":
+                        technical_reason = extraction_state
+                    elif extraction_state == "EMPTY_CONTENT":
+                        technical_reason = extraction_state
+                    else:
+                        technical_reason = "ACQUISITION_NOT_EVALUABLE"
+                return {
+                    "doc_class": "",
+                    "requested_type": REQUESTED_TYPE_PT,
+                    "resolved_document_type": RESOLVED_TYPE_PT,
+                    "is_canonical_candidate": False,
+                    "validation_status": "technical_failure",
+                    "publication_status": "retained_silver",
+                    "discard_reason": "",
+                    "classification_reason": technical_reason,
+                    "semantic_evaluation_eligible": False,
+                    "acquisition_state": acquisition_state,
+                }
+
         chosen_documento = self._normalize_text(str((collection_context or {}).get("chosen_documento", "") or ""))
         title_blob = self._normalize_text(str(snapshot.get("title", "") or ""))
         text_head = self._normalize_text(str(snapshot.get("text", "") or "")[:1600])
@@ -4375,6 +4417,7 @@ class SEIScraper:
                 "publication_status": "retained_silver",
                 "discard_reason": "minuta_documentacao",
                 "classification_reason": CLASSIFICATION_REASON_MINUTA_DOCUMENTACAO,
+                "semantic_evaluation_eligible": True,
                 **content_quality,
             }
 
@@ -4390,6 +4433,7 @@ class SEIScraper:
                 "publication_status": "retained_silver",
                 "discard_reason": "conteudo_interno_insuficiente",
                 "classification_reason": "pt_conteudo_interno_insuficiente",
+                "semantic_evaluation_eligible": True,
                 **content_quality,
             }
 
@@ -4402,6 +4446,7 @@ class SEIScraper:
             "publication_status": "",
             "discard_reason": "",
             "classification_reason": "",
+            "semantic_evaluation_eligible": True,
             **content_quality,
         }
 

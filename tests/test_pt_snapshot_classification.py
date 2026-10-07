@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import sys
 import unittest
@@ -33,6 +34,26 @@ def _snapshot(text: str, *, title: str = "SEI/MD - PLANO DE TRABALHO - PT", tabl
         "url": "https://sei.exemplo/documento",
         "tables": tables or [],
         "extraction_mode": "html_dom",
+    }
+
+
+def _acquisition_context(*, opening: str, access: str, extraction: str, diagnostic: str = "") -> dict:
+    stage = {
+        "TIMEOUT": "opening",
+        "OPEN_FAILED": "opening",
+        "IFRAME_UNAVAILABLE": "access",
+        "ACCESS_RESTRICTED": "access",
+        "EXTRACTION_FAILED": "extraction",
+    }.get(diagnostic, "")
+    return {
+        "acquisition_state": {
+            "discovery": "FOUND",
+            "opening": opening,
+            "access": access,
+            "extraction": extraction,
+        },
+        "acquisition_diagnostic_code": diagnostic,
+        "acquisition_diagnostic_stage": stage,
     }
 
 
@@ -108,13 +129,30 @@ class PTSnapshotClassificationTests(unittest.TestCase):
                 "Meta 1: executar atividades conjuntas.\n"
                 "Documento assinado eletronicamente por Representante Um.\n"
                 "Documento assinado eletronicamente por Representante Dois."
-            )
+            ),
+            _acquisition_context(opening="OPENED", access="ACCESSIBLE", extraction="EXTRACTED"),
         )
 
         self.assertEqual(analysis["doc_class"], "plano_trabalho")
         self.assertEqual(analysis["validation_status"], "valid_for_requested_type")
         self.assertTrue(analysis["is_canonical_candidate"])
         self.assertEqual(analysis["publication_status"], "")
+
+    def test_fixture_iframe_indisponivel_preserva_causa_tecnica(self) -> None:
+        fixture_path = Path(__file__).parent / "fixtures" / "documents" / "pt_iframe_unavailable.json"
+        fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+        technical = fixture["payload"]["technical"]
+        context = _acquisition_context(
+            opening="OPENED",
+            access=technical["access_state"],
+            extraction=technical["extraction_state"],
+            diagnostic=fixture["metadata"]["technical_state"],
+        )
+
+        analysis = _classifier(internal_score=0)._classify_pt_snapshot(fixture["payload"]["snapshot"], context)
+
+        self.assertEqual(analysis["classification_reason"], "IFRAME_UNAVAILABLE")
+        self.assertFalse(analysis["semantic_evaluation_eligible"])
 
     def test_referencia_historica_fora_do_cabecalho_nao_rebaixa_pt_final(self) -> None:
         header = (
@@ -129,6 +167,49 @@ class PTSnapshotClassificationTests(unittest.TestCase):
 
         self.assertEqual(analysis["doc_class"], "plano_trabalho")
         self.assertEqual(analysis["validation_status"], "valid_for_requested_type")
+
+    def test_falhas_tecnicas_nao_viram_conteudo_interno_insuficiente(self) -> None:
+        cases = (
+            ("IFRAME_UNAVAILABLE", "OPENED", "IFRAME_UNAVAILABLE", "NOT_ATTEMPTED"),
+            ("TIMEOUT", "TIMEOUT", "UNKNOWN", "NOT_ATTEMPTED"),
+            ("ACCESS_RESTRICTED", "OPENED", "ACCESS_RESTRICTED", "NOT_ATTEMPTED"),
+            ("EXTRACTION_FAILED", "OPENED", "ACCESSIBLE", "EXTRACTION_FAILED"),
+            ("OPEN_FAILED", "OPEN_FAILED", "UNKNOWN", "NOT_ATTEMPTED"),
+        )
+        for reason, opening, access, extraction in cases:
+            with self.subTest(reason=reason):
+                analysis = _classifier(internal_score=0)._classify_pt_snapshot(
+                    _snapshot(""),
+                    _acquisition_context(
+                        opening=opening,
+                        access=access,
+                        extraction=extraction,
+                        diagnostic=reason if reason != "OPEN_FAILED" else "",
+                    ),
+                )
+
+                self.assertEqual(analysis["classification_reason"], reason)
+                self.assertNotEqual(analysis["doc_class"], "pt_conteudo_interno_insuficiente")
+                self.assertFalse(analysis["semantic_evaluation_eligible"])
+
+    def test_vazio_real_preserva_estado_sem_decisao_semantica(self) -> None:
+        analysis = _classifier(internal_score=0)._classify_pt_snapshot(
+            _snapshot(""),
+            _acquisition_context(opening="OPENED", access="ACCESSIBLE", extraction="EMPTY_CONTENT"),
+        )
+
+        self.assertEqual(analysis["classification_reason"], "EMPTY_CONTENT")
+        self.assertNotEqual(analysis["doc_class"], "pt_conteudo_interno_insuficiente")
+        self.assertFalse(analysis["semantic_evaluation_eligible"])
+
+    def test_conteudo_acessivel_mas_insuficiente_permanece_semantico(self) -> None:
+        analysis = _classifier(internal_score=1)._classify_pt_snapshot(
+            _snapshot("PLANO DE TRABALHO sem estrutura interna verificavel."),
+            _acquisition_context(opening="OPENED", access="ACCESSIBLE", extraction="EXTRACTED"),
+        )
+
+        self.assertEqual(analysis["doc_class"], "pt_conteudo_interno_insuficiente")
+        self.assertTrue(analysis["semantic_evaluation_eligible"])
 
 
 if __name__ == "__main__":
