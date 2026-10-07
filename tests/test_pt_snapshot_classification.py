@@ -11,6 +11,7 @@ os.environ["DEBUG"] = "false"
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 
 from app.rpa.scraping import SEIScraper
+from app.services.pt_classifier import classify_pt_snapshot, pt_internal_content_score
 
 
 def _classifier(*, internal_score: int = 6, penalties: str = "") -> SEIScraper:
@@ -210,6 +211,57 @@ class PTSnapshotClassificationTests(unittest.TestCase):
 
         self.assertEqual(analysis["doc_class"], "pt_conteudo_interno_insuficiente")
         self.assertTrue(analysis["semantic_evaluation_eligible"])
+
+
+class PurePTClassifierTests(unittest.TestCase):
+    def test_score_limite_combina_texto_e_tabela_sem_mudar_pesos(self) -> None:
+        score = pt_internal_content_score(
+            _snapshot("Objeto: apoio. Meta 1.", title="Documento", tables=[["acao"]])
+        )
+
+        self.assertEqual(score["internal_content_score"], 3)
+        self.assertEqual(score["internal_content_signals"], "objeto|metas|tabelas")
+        self.assertEqual(score["internal_content_penalties"], "")
+
+    def test_titulo_forte_sem_conteudo_suficiente_permanece_rejeitado(self) -> None:
+        analysis = classify_pt_snapshot(_snapshot("", title="PLANO DE TRABALHO"))
+
+        self.assertEqual(analysis["internal_content_score"], 1)
+        self.assertEqual(analysis["doc_class"], "pt_conteudo_interno_insuficiente")
+        self.assertEqual(analysis["classification_reason"], "pt_conteudo_interno_insuficiente")
+
+    def test_penalidades_existentes_rejeitam_mesmo_com_score_base_suficiente(self) -> None:
+        text = (
+            "PLANO DE TRABALHO\nObjeto: cooperacao.\nMeta 1.\n"
+            "Atividades e cronograma.\nPeriodo de execucao.\nXX/20XX"
+        )
+        analysis = classify_pt_snapshot(_snapshot(text, tables=[["meta"]]))
+
+        self.assertEqual(analysis["doc_class"], "pt_conteudo_interno_insuficiente")
+        self.assertEqual(analysis["internal_content_penalties"], "placeholder")
+
+    def test_wrapper_legado_e_funcao_pura_sao_equivalentes(self) -> None:
+        cases = (
+            (_snapshot("PLANO DE TRABALHO\nObjeto: X\nMeta 1\nAtividade\nInicio: 01/01/2026"), None),
+            (_snapshot("PLANO DE TRABALHO"), None),
+            (_snapshot("MINUTA DE PLANO DE TRABALHO\nObjeto: X\nMeta 1"), None),
+            (
+                _snapshot(""),
+                _acquisition_context(
+                    opening="OPENED",
+                    access="IFRAME_UNAVAILABLE",
+                    extraction="NOT_ATTEMPTED",
+                    diagnostic="IFRAME_UNAVAILABLE",
+                ),
+            ),
+        )
+        scraper = object.__new__(SEIScraper)
+        for snapshot, context in cases:
+            with self.subTest(text=snapshot["text"], context=context):
+                self.assertEqual(
+                    scraper._classify_pt_snapshot(snapshot, context),
+                    classify_pt_snapshot(snapshot, context),
+                )
 
 
 if __name__ == "__main__":

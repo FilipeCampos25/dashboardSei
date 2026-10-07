@@ -46,6 +46,44 @@ assert not any(name == 'selenium' or name.startswith('selenium.') for name in sy
         )
         self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
 
+    def test_pt_classifier_imports_without_rpa_selenium_or_network(self) -> None:
+        script = """
+import builtins
+import socket
+import sys
+
+real_import = builtins.__import__
+def guarded_import(name, *args, **kwargs):
+    if name == 'selenium' or name.startswith('selenium.') or name == 'app.rpa.scraping':
+        raise AssertionError(f'PT classifier attempted RPA/Selenium import: {name}')
+    return real_import(name, *args, **kwargs)
+
+builtins.__import__ = guarded_import
+socket.create_connection = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError('network attempted'))
+from app.services.pt_classifier import classify_pt_snapshot
+result = classify_pt_snapshot({'title': 'PLANO DE TRABALHO', 'text': '', 'tables': []})
+assert result['doc_class'] == 'pt_conteudo_interno_insuficiente'
+assert 'app.rpa.scraping' not in sys.modules
+assert not any(name == 'selenium' or name.startswith('selenium.') for name in sys.modules)
+"""
+        environment = os.environ.copy()
+        environment.update({"OFFLINE_ONLY": "true", "DEBUG": "false"})
+        python_path = [str(REPO_ROOT / "backend"), str(REPO_ROOT)]
+        if environment.get("PYTHONPATH"):
+            python_path.append(environment["PYTHONPATH"])
+        environment["PYTHONPATH"] = os.pathsep.join(python_path)
+
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=REPO_ROOT / "tests" / "fixtures",
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
