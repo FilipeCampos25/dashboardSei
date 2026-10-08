@@ -114,6 +114,8 @@ class PTNormalizerTests(unittest.TestCase):
         self.assertEqual(record["vigencia_inicio"], "2022-02-05")
         self.assertEqual(record["vigencia_fim"], "2027-02-05")
         self.assertEqual(record["period_source"], PERIOD_SOURCE_SIGNATURE)
+        self.assertEqual(record["data_assinatura"], "2022-02-05")
+        self.assertEqual(record["rule_anchor"], "assinatura")
         self.assertTrue(record["metas_raw"])
         self.assertTrue(record["acoes_raw"])
         self.assertEqual(record["normalization_status"], "completo_padronizado")
@@ -464,13 +466,77 @@ class PTNormalizerTests(unittest.TestCase):
         record = build_normalized_record(payload, preview, Path("plano_trabalho_60090.000269_2020-16.json"))
         self.assertEqual(record["data_assinatura"], "2021-12-20")
         self.assertEqual(record["datas_assinatura"], "2021-12-14 | 2021-12-20")
-        self.assertEqual(record["prazo_inicio"], "2021-12-14")
-        self.assertEqual(record["prazo_fim"], "2026-12-14")
+        self.assertEqual(record["prazo_inicio"], "2021-12-20")
+        self.assertEqual(record["prazo_fim"], "2026-12-20")
         self.assertEqual(record["period_source"], PERIOD_SOURCE_SIGNATURE)
         self.assertEqual(record["period_class"], PERIOD_CLASS_RELATIVE_SIGNATURE)
         self.assertEqual(record["rule_amount"], "5")
         self.assertEqual(record["rule_unit"], "anos")
         self.assertEqual(record["rule_anchor"], "assinatura")
+
+    def test_assinaturas_duplicadas_nao_criam_ambiguidade_artificial(self) -> None:
+        payload = _payload(
+            "60090.000269/2020-16",
+            """
+            Inicio: imediatamente apos a assinatura.
+            Termino: cinco anos apos a assinatura.
+            Documento assinado eletronicamente por Pessoa Um, em 14/12/2021.
+            Documento assinado eletronicamente por Pessoa Dois, em 14/12/2021.
+            """,
+            prazos={
+                "inicio_raw": "imediatamente apos a assinatura",
+                "termino_raw": "cinco anos apos a assinatura",
+            },
+        )
+
+        record = build_normalized_record(payload, {}, Path("pt.json"))
+
+        self.assertEqual(record["datas_assinatura"], "2021-12-14")
+        self.assertEqual(record["data_assinatura"], "2021-12-14")
+        self.assertEqual(record["vigencia_inicio"], "2021-12-14")
+
+    def test_data_nao_relacionada_nao_vira_ancora_de_assinatura(self) -> None:
+        payload = _payload(
+            "60090.000269/2020-16",
+            """
+            Cronograma historico: 14/12/2021.
+            Inicio: imediatamente apos a assinatura.
+            Termino: cinco anos apos a assinatura.
+            Documento assinado eletronicamente por Pessoa Um, em 20/12/2021.
+            """,
+            prazos={
+                "inicio_raw": "imediatamente apos a assinatura",
+                "termino_raw": "cinco anos apos a assinatura",
+            },
+        )
+
+        record = build_normalized_record(payload, {}, Path("pt.json"))
+
+        self.assertEqual(record["datas_assinatura"], "2021-12-20")
+        self.assertEqual(record["data_assinatura"], "2021-12-20")
+        self.assertEqual(record["vigencia_inicio"], "2021-12-20")
+
+    def test_regra_relativa_sem_assinatura_observavel_permanece_nao_resolvida(self) -> None:
+        payload = _payload(
+            "60090.000269/2020-16",
+            """
+            Inicio: imediatamente apos a assinatura.
+            Termino: doze meses apos a assinatura.
+            """,
+            prazos={
+                "inicio_raw": "imediatamente apos a assinatura",
+                "termino_raw": "doze meses apos a assinatura",
+                "inicio_data": "2021-12-14",
+            },
+        )
+
+        record = build_normalized_record(payload, {}, Path("pt.json"))
+
+        self.assertEqual(record["data_assinatura"], "")
+        self.assertEqual(record["vigencia_inicio"], "")
+        self.assertEqual(record["vigencia_fim"], "")
+        self.assertEqual(record["rule_anchor"], "assinatura")
+        self.assertEqual(record["missing_base_date"], "true")
 
     def test_export_normalized_csv_publica_apenas_melhor_pt_por_processo(self) -> None:
         processo = "60090.000100/2026-00"

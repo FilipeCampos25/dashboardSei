@@ -419,6 +419,7 @@ def _signature_dates_value(dates: List[str]) -> str:
 
 
 def _signature_date_value(dates: List[str]) -> str:
+    """Adjudicate the effective signature using the established latest-date rule."""
     return max(dates) if dates else ""
 
 
@@ -628,7 +629,11 @@ def normalize_pt_period(raw_inicio: str, raw_fim: str, context: Dict[str, Any]) 
     )
 
 
-def _extract_period_from_snapshot(snapshot: Dict[str, Any], prazos: Dict[str, Any]) -> Dict[str, str]:
+def _extract_period_from_snapshot(
+    snapshot: Dict[str, Any],
+    prazos: Dict[str, Any],
+    adjudicated_signature: str = "",
+) -> Dict[str, str]:
     text = _prepare_text(str(snapshot.get("text", "") or ""))
     normalized = _normalize_text(text)
     empty = _empty_period().to_record()
@@ -654,8 +659,7 @@ def _extract_period_from_snapshot(snapshot: Dict[str, Any], prazos: Dict[str, An
         if period.prazo_inicio and period.prazo_fim:
             return period.to_record()
 
-    signature_dates = _signature_dates(text)
-    signature_iso = signature_dates[0] if signature_dates else _clean_spaces(str(prazos.get("inicio_data", "") or ""))
+    signature_iso = _clean_spaces(adjudicated_signature)
     duration = re.search(
         r"prazo\s+de\s+(\d+|um|uma|dois|duas|tres|quatro|cinco|seis|sete|oito|nove|dez|sessenta)"
         r"(?:\s*\([^)]+\))?\s+(mes(?:es)?|anos?)"
@@ -1389,7 +1393,13 @@ def build_normalized_record(payload: Dict[str, Any], preview: Dict[str, str], js
     snapshot = payload.get("snapshot", {}) or {}
     collection = payload.get("collection", {}) or {}
     analysis = payload.get("analysis", {}) or {}
-    period = _extract_period_from_snapshot(snapshot, payload.get("prazos", {}) or {})
+    signature_dates = _signature_dates(str(snapshot.get("text", "") or ""))
+    adjudicated_signature = _signature_date_value(signature_dates)
+    period = _extract_period_from_snapshot(
+        snapshot,
+        payload.get("prazos", {}) or {},
+        adjudicated_signature,
+    )
     vigencia_raw = _clean_spaces(str(preview.get("vigencia", "") or ""))
     if not _has_content(vigencia_raw, min_alpha=2):
         vigencia_raw = " a ".join(part for part in (period["prazo_inicio_raw"], period["prazo_fim_raw"]) if _clean_spaces(part))
@@ -1405,7 +1415,6 @@ def build_normalized_record(payload: Dict[str, Any], preview: Dict[str, str], js
     atribuicoes = _extract_atribuicoes(snapshot)
     metas = _extract_metas(snapshot)
     acoes = _extract_acoes(snapshot)
-    signature_dates = _signature_dates(str(snapshot.get("text", "") or ""))
     record = {
         "captured_at": _clean_spaces(str(payload.get("captured_at", "") or "")),
         "requested_type": _clean_spaces(str(payload.get("requested_type", "") or "")) or REQUESTED_TYPE_PT,
@@ -1413,7 +1422,7 @@ def build_normalized_record(payload: Dict[str, Any], preview: Dict[str, str], js
         "processo": _clean_spaces(str(payload.get("processo", "") or "")),
         "documento": _clean_spaces(str(payload.get("documento", "") or "")),
         "parceiro": parceiro,
-        "data_assinatura": _signature_date_value(signature_dates),
+        "data_assinatura": adjudicated_signature,
         "datas_assinatura": _signature_dates_value(signature_dates),
         "vigencia_raw": vigencia_raw,
         "vigencia_inicio": period["prazo_inicio"],
