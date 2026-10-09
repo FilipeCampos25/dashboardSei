@@ -17,6 +17,34 @@ from app.services.pt_normalizer import build_normalized_record, build_pt_v2_reco
 
 
 class PTProvenanceTests(unittest.TestCase):
+    def test_unresolved_relative_rule_uses_common_state_and_preview_provenance(self) -> None:
+        payload = self._payload()
+        payload["snapshot"]["text"] = "PLANO DE TRABALHO sem vigencia ou assinatura documental."
+        payload["prazos"] = {}
+        preview = {"vigencia": "12 meses a partir da assinatura"}
+        legacy = build_normalized_record(payload, preview, Path("pt.json"))
+        fields = self._fields(build_pt_v2_record(legacy, payload, preview))
+
+        self.assertIs(fields["vigencia_raw"].evidences[0].source_kind, SourceKind.PREVIEW)
+        self.assertIs(fields["vigencia_inicio"].state, FieldState.UNRESOLVED)
+        self.assertIs(fields["vigencia_fim"].state, FieldState.UNRESOLVED)
+        self.assertEqual(fields["vigencia_rule_amount"].value, "12")
+        self.assertEqual(
+            [item.source_kind for item in fields["vigencia_rule_amount"].evidences],
+            [SourceKind.DERIVED, SourceKind.PREVIEW],
+        )
+
+    def test_document_rule_and_divergent_preview_remain_separate_evidence(self) -> None:
+        payload = self._payload()
+        preview = {"vigencia": "12 meses a partir da publicacao"}
+        legacy = build_normalized_record(payload, preview, Path("pt.json"))
+        fields = self._fields(build_pt_v2_record(legacy, payload, preview))
+
+        raw = fields["vigencia_raw"]
+        self.assertEqual(raw.value, "imediatamente apos a assinatura a cinco anos apos a assinatura")
+        self.assertEqual([item.source_kind for item in raw.evidences], [SourceKind.DOCUMENT, SourceKind.PREVIEW])
+        self.assertEqual(raw.evidences[1].raw_evidence, "12 meses a partir da publicacao")
+
     def test_document_partner_wins_over_divergent_preview(self) -> None:
         payload = self._payload()
         preview = {"parceiro": "Parceiro da preview"}
@@ -128,7 +156,10 @@ class PTProvenanceTests(unittest.TestCase):
 
         fim = fields["vigencia_fim"]
         self.assertEqual(legacy["vigencia_fim"], fim.value)
-        self.assertIs(fim.evidences[0].source_kind, SourceKind.DERIVED)
+        self.assertEqual(
+            [item.source_kind for item in fim.evidences],
+            [SourceKind.DERIVED, SourceKind.DOCUMENT],
+        )
         self.assertEqual("pt.vigencia.derived_from_signature", fim.evidences[0].rule_id)
         self.assertTrue(all(validate_field_provenance(field).is_valid for field in fields.values()))
 

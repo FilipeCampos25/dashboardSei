@@ -59,6 +59,91 @@ def _payload(
 
 
 class PTNormalizerTests(unittest.TestCase):
+    def test_vigencia_relativa_em_anos_usa_termino_inclusivo(self) -> None:
+        period = normalize_pt_period(
+            "a partir da assinatura",
+            "2 anos a partir da assinatura",
+            {"signature_date": "2024-02-29"},
+        )
+        self.assertEqual(period.prazo_inicio, "2024-02-29")
+        self.assertEqual(period.prazo_fim, "2026-02-27")
+        self.assertEqual((period.rule_amount, period.rule_unit, period.rule_anchor), ("2", "anos", "assinatura"))
+
+    def test_vigencia_relativa_em_meses_respeita_calendario_e_termino_inclusivo(self) -> None:
+        period = normalize_pt_period(
+            "a partir da assinatura",
+            "18 meses a partir da assinatura",
+            {"signature_date": "2024-08-31"},
+        )
+        self.assertEqual(period.prazo_inicio, "2024-08-31")
+        self.assertEqual(period.prazo_fim, "2026-02-27")
+
+    def test_periodo_explicito_prevalece_sobre_regra_relativa_e_assinatura(self) -> None:
+        payload = _payload(
+            "60090.000001/2025-00",
+            """
+            Vigencia de 01/01/2025 a 31/12/2025.
+            Prazo de 12 meses a partir da assinatura.
+            Documento assinado eletronicamente por Pessoa Um, em 10/06/2024.
+            """,
+        )
+        record = build_normalized_record(payload, {}, Path("pt.json"))
+        self.assertEqual(record["vigencia_inicio"], "2025-01-01")
+        self.assertEqual(record["vigencia_fim"], "2025-12-31")
+        self.assertEqual(record["period_source"], PERIOD_SOURCE_DIRECT)
+
+    def test_vigencia_raw_documental_prevalece_sobre_preview_divergente(self) -> None:
+        payload = _payload(
+            "60090.000001/2025-00",
+            """
+            Inicio: imediatamente apos a assinatura.
+            Termino: 18 meses apos a assinatura.
+            Documento assinado eletronicamente por Pessoa Um, em 31/08/2024.
+            """,
+            prazos={
+                "inicio_raw": "imediatamente apos a assinatura",
+                "termino_raw": "18 meses apos a assinatura",
+            },
+        )
+        record = build_normalized_record(payload, {"vigencia": "12 meses"}, Path("pt.json"))
+        self.assertEqual(record["vigencia_raw"], "imediatamente apos a assinatura a 18 meses apos a assinatura")
+        self.assertEqual(record["vigencia_raw_source"], "document_text")
+        self.assertEqual(record["vigencia_preview_raw"], "12 meses")
+
+    def test_fragmentos_de_prazos_nao_apagam_regra_documental_completa(self) -> None:
+        payload = _payload(
+            "60090.000001/2025-00",
+            """
+            O presente plano de trabalho vigorara pelo prazo de 60 meses,
+            a partir da data de sua assinatura.
+            Documento assinado eletronicamente por Pessoa Um, em 20/12/2021.
+            """,
+            prazos={
+                "inicio_raw": "imediatamente apos a",
+                "termino_raw": "cinco anos apos a",
+            },
+        )
+
+        record = build_normalized_record(payload, {}, Path("pt.json"))
+
+        self.assertEqual(record["rule_anchor"], "assinatura")
+        self.assertEqual(record["vigencia_inicio"], "2021-12-20")
+        self.assertEqual(record["vigencia_fim"], "2026-12-19")
+        self.assertIn("60 meses", record["vigencia_raw"])
+
+    def test_regra_da_preview_sem_regra_documental_fica_estruturada_e_nao_resolvida(self) -> None:
+        payload = _payload("60090.000001/2025-00", "PLANO DE TRABALHO sem periodo observado.")
+        record = build_normalized_record(
+            payload,
+            {"vigencia": "12 meses a partir da assinatura"},
+            Path("pt.json"),
+        )
+        self.assertEqual(record["vigencia_raw"], "12 meses a partir da assinatura")
+        self.assertEqual(record["vigencia_raw_source"], "preview")
+        self.assertEqual((record["rule_amount"], record["rule_unit"], record["rule_anchor"]), ("12", "meses", "assinatura"))
+        self.assertEqual(record["vigencia_inicio"], "")
+        self.assertEqual(record["vigencia_fim"], "")
+
     def test_pdf_native_periodo_explicito_e_metas(self) -> None:
         payload = _payload(
             "60090.001292/2025-24",
@@ -112,7 +197,7 @@ class PTNormalizerTests(unittest.TestCase):
         }
         record = build_normalized_record(payload, preview, Path("plano_trabalho_60090.000692_2021-99.json"))
         self.assertEqual(record["vigencia_inicio"], "2022-02-05")
-        self.assertEqual(record["vigencia_fim"], "2027-02-05")
+        self.assertEqual(record["vigencia_fim"], "2027-02-04")
         self.assertEqual(record["period_source"], PERIOD_SOURCE_SIGNATURE)
         self.assertEqual(record["data_assinatura"], "2022-02-05")
         self.assertEqual(record["rule_anchor"], "assinatura")
@@ -145,7 +230,7 @@ class PTNormalizerTests(unittest.TestCase):
         }
         record = build_normalized_record(payload, preview, Path("plano_trabalho_60090.000692_2021-99.json"))
         self.assertEqual(record["vigencia_inicio"], "2022-02-25")
-        self.assertEqual(record["vigencia_fim"], "2027-02-25")
+        self.assertEqual(record["vigencia_fim"], "2027-02-24")
         self.assertEqual(record["period_source"], PERIOD_SOURCE_SIGNATURE)
         self.assertEqual(record["publication_status"], PUBLICATION_STATUS_GOLD)
 
@@ -178,7 +263,7 @@ class PTNormalizerTests(unittest.TestCase):
         self.assertEqual(record["data_assinatura"], "2022-08-04")
         self.assertEqual(record["datas_assinatura"], "2022-08-04")
         self.assertEqual(record["vigencia_inicio"], "2022-08-04")
-        self.assertEqual(record["vigencia_fim"], "2027-08-04")
+        self.assertEqual(record["vigencia_fim"], "2027-08-03")
         self.assertEqual(record["period_source"], PERIOD_SOURCE_SIGNATURE)
         self.assertTrue(record["metas_raw"])
         self.assertTrue(record["acoes_raw"])
@@ -467,7 +552,7 @@ class PTNormalizerTests(unittest.TestCase):
         self.assertEqual(record["data_assinatura"], "2021-12-20")
         self.assertEqual(record["datas_assinatura"], "2021-12-14 | 2021-12-20")
         self.assertEqual(record["prazo_inicio"], "2021-12-20")
-        self.assertEqual(record["prazo_fim"], "2026-12-20")
+        self.assertEqual(record["prazo_fim"], "2026-12-19")
         self.assertEqual(record["period_source"], PERIOD_SOURCE_SIGNATURE)
         self.assertEqual(record["period_class"], PERIOD_CLASS_RELATIVE_SIGNATURE)
         self.assertEqual(record["rule_amount"], "5")
@@ -639,7 +724,7 @@ class PTNormalizerTests(unittest.TestCase):
         )
         self.assertEqual(period.period_class, PERIOD_CLASS_RELATIVE_SIGNATURE)
         self.assertEqual(period.prazo_inicio, "2021-12-14")
-        self.assertEqual(period.prazo_fim, "2026-12-14")
+        self.assertEqual(period.prazo_fim, "2026-12-13")
         self.assertEqual(period.rule_amount, "5")
         self.assertEqual(period.rule_anchor, "assinatura")
 

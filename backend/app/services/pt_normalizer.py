@@ -35,6 +35,7 @@ from app.services.normalization_contract import (
     make_field,
     make_missing_field,
 )
+from app.services.temporal_duration import add_inclusive_duration
 
 ATTRIBUICOES_COLUMN = "atribuições_raw"
 REQUESTED_TYPE_PT = "pt"
@@ -332,12 +333,6 @@ def _coerce_numeric_token(value: str, *, max_len: Optional[int] = None) -> str:
     return token
 
 
-def _add_months(base_date: datetime, months: int) -> datetime:
-    year = base_date.year + (base_date.month - 1 + months) // 12
-    month = (base_date.month - 1 + months) % 12 + 1
-    return datetime(year, month, min(base_date.day, _last_day(year, month)))
-
-
 def _normalize_date_token(token: str, end_of_month: bool = False) -> str:
     normalized = _normalize_text(token)
     if not normalized:
@@ -500,13 +495,7 @@ def _duration_match(value: str) -> Optional[re.Match[str]]:
 
 
 def _add_rule_duration(base_iso: str, amount: int, unit: str) -> str:
-    try:
-        base = datetime.fromisoformat(base_iso)
-        if "ano" in unit:
-            return base.replace(year=base.year + amount).date().isoformat()
-        return _add_months(base, amount).date().isoformat()
-    except Exception:
-        return ""
+    return add_inclusive_duration(base_iso, amount, unit)
 
 
 def _period_value_is_noise(value: str) -> bool:
@@ -648,6 +637,7 @@ def _extract_period_from_snapshot(
     )
     for pattern in (
         rf"(?:periodo\s+de\s+execucao|previsao\s+de\s+inicio\s+e\s+termino)[^a-z0-9]+({DATE_TOKEN})\s+(?:a|ate|até|-)\s+({DATE_TOKEN})",
+        rf"vigencia\s+de\s+({DATE_TOKEN})\s+(?:a|ate|-)\s+({DATE_TOKEN})",
         inline_label_pattern,
     ):
         match = re.search(pattern, normalized, flags=re.IGNORECASE)
@@ -668,9 +658,17 @@ def _extract_period_from_snapshot(
         flags=re.IGNORECASE | re.DOTALL,
     )
     if duration and signature_iso:
+        candidate_start = _clean_spaces(str(prazos.get("inicio_raw", "") or ""))
+        candidate_end = _clean_spaces(str(prazos.get("termino_raw", "") or ""))
+        if _looks_like_relative_signature_reference(f"{candidate_start} {candidate_end}"):
+            observed_start = candidate_start
+            observed_end = candidate_end
+        else:
+            observed_start = "a partir da assinatura"
+            observed_end = duration.group(0)
         period = normalize_pt_period(
-            "a partir da assinatura",
-            duration.group(0),
+            observed_start,
+            observed_end,
             {"signature_date": signature_iso},
         )
         if period.prazo_inicio and period.prazo_fim:
@@ -690,13 +688,19 @@ def _extract_period_from_snapshot(
             raw_amount, unit = relative.groups()
             amount = int(raw_amount) if raw_amount.isdigit() else NUMBER_WORDS.get(raw_amount.replace(" ", "_"), 0)
             if amount > 0:
-                base = datetime.fromisoformat(signature_iso)
-                end_dt = base.replace(year=base.year + amount) if "ano" in unit else _add_months(base, amount)
-                end_iso = end_dt.date().isoformat()
+                end_iso = _add_rule_duration(signature_iso, amount, unit)
         if start_iso and end_iso and end_iso >= start_iso:
+            candidate_start = _clean_spaces(str(prazos.get("inicio_raw", "") or ""))
+            candidate_end = _clean_spaces(str(prazos.get("termino_raw", "") or ""))
+            if _looks_like_relative_signature_reference(f"{candidate_start} {candidate_end}"):
+                observed_start = candidate_start
+                observed_end = candidate_end
+            else:
+                observed_start = "a partir da assinatura"
+                observed_end = relative.group(0) if relative else ""
             period = normalize_pt_period(
-                "a partir da assinatura",
-                relative.group(0) if relative else "",
+                observed_start,
+                observed_end,
                 {"signature_date": signature_iso},
             )
             if period.prazo_inicio and period.prazo_fim:
@@ -1199,7 +1203,7 @@ def _build_contract_fields(
     preview_objeto = _clean_spaces(str(preview.get("objeto", "") or ""))
     document_partner = _extract_document_partner(snapshot)
     document_objeto = _extract_document_objeto(snapshot)
-    preview_vigencia = _clean_spaces(str(preview.get("vigencia", "") or ""))
+    vigencia_raw_source = _clean_spaces(record.get("vigencia_raw_source", ""))
     tables = snapshot.get("tables", []) or []
     metas_source = SOURCE_TABLE if tables and _clean_spaces(record.get("metas_raw", "")) else SOURCE_DOCUMENT_TEXT
     acoes_source = SOURCE_TABLE if tables and _clean_spaces(record.get("acoes_raw", "")) else SOURCE_DOCUMENT_TEXT
@@ -1235,18 +1239,34 @@ def _build_contract_fields(
         ),
         "vigencia_raw": _field_or_missing(
             value=record.get("vigencia_raw", ""),
-            source_type=(
-                SOURCE_PREVIEW
-                if preview_vigencia and record.get("vigencia_raw", "") == preview_vigencia
-                else SOURCE_DOCUMENT_TEXT
-            ),
+            source_type=vigencia_raw_source or SOURCE_MISSING,
             confidence=CONFIDENCE_MEDIUM,
             rule_id="pt.vigencia_raw.preview_or_document_text",
-            warning=(
-                "preview_fallback"
-                if preview_vigencia and record.get("vigencia_raw", "") == preview_vigencia
-                else ""
-            ),
+            warning="preview_fallback" if vigencia_raw_source == SOURCE_PREVIEW else "",
+        ),
+        "vigencia_rule_amount": _field_or_missing(
+            value=record.get("rule_amount", ""),
+            raw_value=record.get("vigencia_raw", ""),
+            source_type=SOURCE_DERIVED,
+            confidence=CONFIDENCE_MEDIUM,
+            rule_id="pt.vigencia.rule.duration",
+            warning=record.get("period_warning", ""),
+        ),
+        "vigencia_rule_unit": _field_or_missing(
+            value=record.get("rule_unit", ""),
+            raw_value=record.get("vigencia_raw", ""),
+            source_type=SOURCE_DERIVED,
+            confidence=CONFIDENCE_MEDIUM,
+            rule_id="pt.vigencia.rule.duration",
+            warning=record.get("period_warning", ""),
+        ),
+        "vigencia_rule_anchor": _field_or_missing(
+            value=record.get("rule_anchor", ""),
+            raw_value=record.get("vigencia_raw", ""),
+            source_type=SOURCE_DERIVED,
+            confidence=CONFIDENCE_MEDIUM,
+            rule_id="pt.vigencia.rule.anchor",
+            warning=record.get("period_warning", ""),
         ),
         "data_assinatura": _field_or_missing(
             value=data_assinatura,
@@ -1336,9 +1356,16 @@ def build_pt_v2_record(
             continue
         value = field.get("value")
         present = value is not None and (not isinstance(value, str) or bool(value.strip()))
+        unresolved_period = (
+            field_name in {"vigencia_inicio", "vigencia_fim"}
+            and record.get("period_source") == PERIOD_SOURCE_RELATIVE
+            and bool(record.get("missing_base_date"))
+        )
         evidences: Tuple[FieldEvidence, ...] = ()
-        if present:
+        if present or unresolved_period:
             source_kind = _pt_source_kind(str(field.get("source_type", "") or ""))
+            if unresolved_period:
+                source_kind = _pt_source_kind(str(record.get("vigencia_raw_source", "") or ""))
             if source_kind is not None:
                 evidence_items = [
                     FieldEvidence(
@@ -1348,16 +1375,46 @@ def build_pt_v2_record(
                         rule_id=_clean_spaces(str(field.get("rule_id", "") or "")) or None,
                         location=location if source_kind is not SourceKind.PREVIEW else None,
                         raw_evidence=_clean_spaces(
-                            str(field.get("evidence", "") or field.get("raw_value", "") or "")
+                            str(
+                                field.get("evidence", "")
+                                or field.get("raw_value", "")
+                                or (record.get("vigencia_raw", "") if unresolved_period else "")
+                            )
                         ) or None,
                     ),
                 ]
-                preview_value = _clean_spaces(str(preview.get(field_name, "") or ""))
+                temporal_derivation = field_name in {
+                    "vigencia_inicio",
+                    "vigencia_fim",
+                    "vigencia_rule_amount",
+                    "vigencia_rule_unit",
+                    "vigencia_rule_anchor",
+                }
+                raw_source_kind = _pt_source_kind(
+                    str(record.get("vigencia_raw_source", "") or "")
+                )
+                if (
+                    source_kind is SourceKind.DERIVED
+                    and temporal_derivation
+                    and raw_source_kind in {SourceKind.DOCUMENT, SourceKind.PREVIEW}
+                ):
+                    evidence_items.append(
+                        FieldEvidence(
+                            field_name=field_name,
+                            source_kind=raw_source_kind,
+                            source_document=identity if raw_source_kind is SourceKind.DOCUMENT else None,
+                            rule_id="pt.vigencia.observed_rule_input",
+                            location=location if raw_source_kind is SourceKind.DOCUMENT else None,
+                            raw_evidence=_clean_spaces(str(record.get("vigencia_raw", "") or "")) or None,
+                        )
+                    )
+                preview_key = "vigencia" if field_name == "vigencia_raw" else field_name
+                preview_value = _clean_spaces(str(preview.get(preview_key, "") or ""))
                 preview_has_content = _has_content(
                     preview_value,
                     min_alpha=4 if field_name == "parceiro" else 8,
                 )
-                if source_kind is SourceKind.DOCUMENT and field_name in {"parceiro", "objeto"} and preview_has_content:
+                if source_kind is SourceKind.DOCUMENT and field_name in {"parceiro", "objeto", "vigencia_raw"} and preview_has_content:
                     evidence_items.append(
                         FieldEvidence(
                             field_name=field_name,
@@ -1370,7 +1427,13 @@ def build_pt_v2_record(
         field_results.append(
             FieldResult(
                 field_name=field_name,
-                state=FieldState.PRESENT if present else FieldState.NOT_EVALUATED,
+                state=(
+                    FieldState.PRESENT
+                    if present
+                    else FieldState.UNRESOLVED
+                    if unresolved_period
+                    else FieldState.NOT_EVALUATED
+                ),
                 value=value if present else None,
                 evidences=evidences,
             )
@@ -1400,9 +1463,22 @@ def build_normalized_record(payload: Dict[str, Any], preview: Dict[str, str], js
         payload.get("prazos", {}) or {},
         adjudicated_signature,
     )
-    vigencia_raw = _clean_spaces(str(preview.get("vigencia", "") or ""))
-    if not _has_content(vigencia_raw, min_alpha=2):
-        vigencia_raw = " a ".join(part for part in (period["prazo_inicio_raw"], period["prazo_fim_raw"]) if _clean_spaces(part))
+    document_vigencia_raw = " a ".join(
+        part for part in (period["prazo_inicio_raw"], period["prazo_fim_raw"]) if _clean_spaces(part)
+    )
+    preview_vigencia_raw = _clean_spaces(str(preview.get("vigencia", "") or ""))
+    if document_vigencia_raw:
+        vigencia_raw = document_vigencia_raw
+        vigencia_raw_source = SOURCE_DOCUMENT_TEXT
+    else:
+        vigencia_raw = preview_vigencia_raw
+        vigencia_raw_source = SOURCE_PREVIEW if _has_content(preview_vigencia_raw, min_alpha=2) else SOURCE_MISSING
+        if vigencia_raw_source == SOURCE_PREVIEW:
+            period = normalize_pt_period(
+                preview_vigencia_raw,
+                "",
+                {"signature_date": adjudicated_signature},
+            ).to_record()
     validation_status = _clean_spaces(str(analysis.get("validation_status", "") or "")) or VALIDATION_STATUS_VALID
     is_canonical_candidate = bool(analysis.get("is_canonical_candidate", validation_status == VALIDATION_STATUS_VALID))
     classification_reason = (
@@ -1425,6 +1501,8 @@ def build_normalized_record(payload: Dict[str, Any], preview: Dict[str, str], js
         "data_assinatura": adjudicated_signature,
         "datas_assinatura": _signature_dates_value(signature_dates),
         "vigencia_raw": vigencia_raw,
+        "vigencia_raw_source": vigencia_raw_source,
+        "vigencia_preview_raw": preview_vigencia_raw,
         "vigencia_inicio": period["prazo_inicio"],
         "vigencia_fim": period["prazo_fim"],
         "objeto": objeto,
