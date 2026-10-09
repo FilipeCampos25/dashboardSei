@@ -160,6 +160,10 @@ class PTDocumentHandler:
             "validation_status",
             "publication_status",
             "normalization_status",
+            "canonical_candidate_id",
+            "canonical_state",
+            "canonical_reason",
+            "canonical_selection_reason",
             "json_path",
         ]
         _, sem_path, sem_records = self._write_status_exports(
@@ -469,7 +473,16 @@ class PTDocumentHandler:
             audit_row = audit_by_json_path.get(json_path)
             if not audit_row:
                 continue
-            for field in ("classification_reason", "validation_status", "publication_status", "normalization_status"):
+            for field in (
+                "classification_reason",
+                "validation_status",
+                "publication_status",
+                "normalization_status",
+                "canonical_candidate_id",
+                "canonical_state",
+                "canonical_reason",
+                "canonical_selection_reason",
+            ):
                 value = str(audit_row.get(field, "") or "").strip()
                 if value:
                     record[field] = value

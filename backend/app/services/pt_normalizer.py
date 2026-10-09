@@ -14,6 +14,7 @@ import pandas as pd
 
 from app.config import get_settings
 from app.output import csv_writer
+from app.services.canonical_selection import CanonicalCandidate, select_canonical
 from app.services.contract_adapters import (
     V2_SCHEMA_VERSION,
     adapt_legacy_record,
@@ -35,6 +36,7 @@ from app.services.normalization_contract import (
     make_field,
     make_missing_field,
 )
+from app.services.semantic_states import CanonicalState
 from app.services.temporal_duration import add_inclusive_duration
 
 ATTRIBUICOES_COLUMN = "atribuições_raw"
@@ -58,6 +60,8 @@ PERIOD_CLASS_CONTAMINATED_TEXT = "texto_contaminado"
 PERIOD_CLASS_MISSING = "ausente"
 CLASSIFICATION_REASON_PT = "plano_trabalho_validado_por_conteudo"
 CLASSIFICATION_REASON_MINUTA_DOCUMENTACAO = "pt_minuta_documentacao"
+PT_CANONICAL_MINIMUM_SCORE = 0.0
+PT_CANONICAL_MINIMUM_MARGIN = 1.0
 
 MONTHS = {
     "jan": 1,
@@ -1134,34 +1138,75 @@ def _pt_canonical_score(payload: Dict[str, Any], record: Dict[str, str]) -> int:
     return score
 
 
-def _select_published_pt_rows(records: List[Dict[str, str]]) -> List[Dict[str, str]]:
+def apply_pt_canonical_selection(
+    records: List[Dict[str, Any]],
+    payloads_by_record: Dict[int, Dict[str, Any]],
+    *,
+    threshold: float = PT_CANONICAL_MINIMUM_SCORE,
+    min_margin: float = PT_CANONICAL_MINIMUM_MARGIN,
+) -> List[Dict[str, Any]]:
+    """Synchronize PT audit/publication state with the common canonical decision."""
+
     grouped: Dict[str, List[Dict[str, str]]] = {}
     for record in records:
         grouped.setdefault(record.get("processo", ""), []).append(record)
 
-    published_rows: List[Dict[str, str]] = []
     for processo_records in grouped.values():
-        gold_candidates = [
+        eligible_records = [
             record
             for record in processo_records
             if record.get("publication_status") == PUBLICATION_STATUS_GOLD
             and record.get("validation_status") == VALIDATION_STATUS_VALID
+            and _pt_document_identity(record, payloads_by_record[id(record)]).process_id
+            and _pt_document_identity(record, payloads_by_record[id(record)]).candidate_id
         ]
-        if not gold_candidates:
-            continue
-        published_rows.append(
-            max(
-                gold_candidates,
-                key=lambda record: (
-                    _safe_int(record.get("canonical_score", "")),
-                    _safe_int(record.get("captured_focus_fields", "")),
-                    len(record.get("metas_raw", "")),
-                    len(record.get("acoes_raw", "")),
-                    len(record.get("objeto", "")),
-                ),
-            )
+        decision = select_canonical(
+            (
+                CanonicalCandidate(
+                    identity=_pt_document_identity(record, payloads_by_record[id(record)]),
+                    score=_safe_int(record.get("canonical_score", "")),
+                )
+                for record in eligible_records
+            ),
+            threshold=threshold,
+            min_margin=min_margin,
         )
-    return published_rows
+        winner_id = decision.winner_candidate_id
+        for record in processo_records:
+            identity = _pt_document_identity(record, payloads_by_record[id(record)])
+            eligible = record in eligible_records
+            selected = eligible and decision.canonical_state is CanonicalState.SELECTED and identity.candidate_id == winner_id
+            record["canonical_candidate_id"] = identity.candidate_id or ""
+            record["canonical_state"] = (
+                CanonicalState.SELECTED.value
+                if selected
+                else CanonicalState.UNRESOLVED.value
+                if eligible and decision.canonical_state is CanonicalState.SELECTED
+                else decision.canonical_state.value
+                if eligible
+                else CanonicalState.INELIGIBLE.value
+            )
+            record["canonical_reason"] = (
+                decision.reason.value
+                if eligible
+                else str(record.get("classification_reason", "") or CanonicalState.INELIGIBLE.value)
+            )
+            record["canonical_selection_reason"] = decision.reason.value
+            record["canonical_threshold"] = str(decision.threshold)
+            record["canonical_min_margin"] = str(decision.min_margin)
+            record["canonical_runner_up_score"] = "" if decision.runner_up_score is None else str(decision.runner_up_score)
+            record["canonical_observed_margin"] = "" if decision.observed_margin is None else str(decision.observed_margin)
+            record["publication_status"] = PUBLICATION_STATUS_GOLD if selected else PUBLICATION_STATUS_SILVER
+    return records
+
+
+def _select_published_pt_rows(records: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    return [
+        record
+        for record in records
+        if record.get("canonical_state") == CanonicalState.SELECTED.value
+        and record.get("publication_status") == PUBLICATION_STATUS_GOLD
+    ]
 
 
 def _field_or_missing(
@@ -1555,6 +1600,7 @@ def build_normalized_record(payload: Dict[str, Any], preview: Dict[str, str], js
 
 def export_normalized_csv(output_dir: Path, logger: Any = None) -> Dict[str, Any]:
     csv_writer.ensure_output_dir(output_dir)
+    settings = get_settings()
     preview_map = _load_preview_map(output_dir, logger=logger)
     json_paths = sorted(output_dir.glob("plano_trabalho_*.json"))
     if not json_paths:
@@ -1612,9 +1658,23 @@ def export_normalized_csv(output_dir: Path, logger: Any = None) -> Dict[str, Any
         "normalization_status",
         "captured_focus_fields",
         "canonical_score",
+        "canonical_candidate_id",
+        "canonical_state",
+        "canonical_reason",
+        "canonical_selection_reason",
+        "canonical_threshold",
+        "canonical_min_margin",
+        "canonical_runner_up_score",
+        "canonical_observed_margin",
         "json_path",
     ]
 
+    apply_pt_canonical_selection(
+        records,
+        payloads_by_record,
+        threshold=getattr(settings, "pt_canonical_minimum_score", PT_CANONICAL_MINIMUM_SCORE),
+        min_margin=getattr(settings, "pt_canonical_minimum_margin", PT_CANONICAL_MINIMUM_MARGIN),
+    )
     audit_path = output_dir / "pt_auditoria_latest.csv"
     csv_writer.write_csv(records, audit_path, columns=columns)
 
@@ -1647,7 +1707,7 @@ def export_normalized_csv(output_dir: Path, logger: Any = None) -> Dict[str, Any
     csv_writer.write_csv(published_rows, csv_path, columns=columns)
     csv_writer.write_csv(published_rows, complete_path, columns=columns)
     v2_path = None
-    if get_settings().v2_dual_write:
+    if settings.v2_dual_write:
         envelope = {
             "schema_version": V2_SCHEMA_VERSION,
             "legacy_artifact": csv_path.name,

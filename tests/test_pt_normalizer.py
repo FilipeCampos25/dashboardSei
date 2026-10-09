@@ -24,6 +24,7 @@ from app.services.pt_normalizer import (
     PUBLICATION_STATUS_SILVER,
     VALIDATION_STATUS_VALID,
     VALIDATION_STATUS_NON_CANONICAL,
+    apply_pt_canonical_selection,
     build_normalized_record,
     export_normalized_csv,
     normalize_pt_period,
@@ -59,6 +60,72 @@ def _payload(
 
 
 class PTNormalizerTests(unittest.TestCase):
+    @staticmethod
+    def _canonical_record(processo: str, candidate_id: str, score: int, *, eligible: bool = True) -> tuple[dict, dict]:
+        record = {
+            "processo": processo,
+            "documento": candidate_id,
+            "canonical_score": str(score),
+            "validation_status": VALIDATION_STATUS_VALID if eligible else VALIDATION_STATUS_NON_CANONICAL,
+            "publication_status": PUBLICATION_STATUS_GOLD if eligible else PUBLICATION_STATUS_SILVER,
+            "classification_reason": "candidate" if eligible else "ineligible",
+        }
+        payload = {
+            "collection": {"candidate_id": candidate_id, "document_id": f"DOC-{candidate_id}"},
+            "snapshot": {},
+        }
+        return record, payload
+
+    def test_pt_canonical_selection_covers_winner_abstention_and_process_cardinality(self) -> None:
+        cases = (
+            ("clear", [("A", 9, True), ("B", 6, True)], 5, 2, "SELECTED", "A", "canonical.selected"),
+            ("below", [("A", 4, True), ("B", 3, True)], 5, 1, "UNRESOLVED", None, "canonical.unresolved.below_threshold"),
+            ("margin", [("A", 9, True), ("B", 8, True)], 5, 2, "UNRESOLVED", None, "canonical.unresolved.insufficient_margin"),
+            ("tie", [("A", 9, True), ("B", 9, True)], 5, 1, "TIE", None, "canonical.unresolved.tie"),
+            ("ineligible", [("A", 9, False)], 5, 1, "INELIGIBLE", None, "canonical.unresolved.no_candidate"),
+            ("single", [("A", 9, True)], 5, 2, "SELECTED", "A", "canonical.selected"),
+        )
+        for name, candidates, threshold, margin, expected_state, winner, reason in cases:
+            with self.subTest(name=name):
+                pairs = [self._canonical_record("P1", candidate[0], candidate[1], eligible=candidate[2]) for candidate in candidates]
+                records = [pair[0] for pair in pairs]
+                payloads = {id(pair[0]): pair[1] for pair in pairs}
+                apply_pt_canonical_selection(records, payloads, threshold=threshold, min_margin=margin)
+                gold = [record for record in records if record["publication_status"] == PUBLICATION_STATUS_GOLD]
+                self.assertLessEqual(len(gold), 1)
+                self.assertEqual([record["documento"] for record in gold], [winner] if winner else [])
+                self.assertEqual(records[0]["canonical_state"], expected_state)
+                self.assertTrue(all(record["canonical_selection_reason"] == reason for record in records))
+
+    def test_pt_canonical_selection_downgrades_residual_gold_and_is_process_local_and_deterministic(self) -> None:
+        specs = [("P1", "A", 9), ("P1", "B", 6), ("P2", "C", 4), ("P2", "D", 3), ("P3", "E", 10)]
+        pairs = [self._canonical_record(*spec) for spec in specs]
+        records = [pair[0] for pair in pairs]
+        payloads = {id(pair[0]): pair[1] for pair in pairs}
+        apply_pt_canonical_selection(records, payloads, threshold=5, min_margin=2)
+
+        by_process = {
+            process_id: [record for record in records if record["processo"] == process_id]
+            for process_id in ("P1", "P2", "P3")
+        }
+        self.assertEqual([[r["documento"] for r in rows if r["publication_status"] == PUBLICATION_STATUS_GOLD] for rows in by_process.values()], [["A"], [], ["E"]])
+        loser = next(record for record in records if record["documento"] == "B")
+        self.assertEqual(loser["publication_status"], PUBLICATION_STATUS_SILVER)
+        self.assertEqual(loser["canonical_state"], "UNRESOLVED")
+        self.assertIn(loser, records)
+
+        reversed_pairs = [self._canonical_record(*spec) for spec in reversed(specs)]
+        reversed_records = [pair[0] for pair in reversed_pairs]
+        apply_pt_canonical_selection(
+            reversed_records,
+            {id(pair[0]): pair[1] for pair in reversed_pairs},
+            threshold=5,
+            min_margin=2,
+        )
+        decisions = sorted((r["processo"], r["documento"], r["canonical_state"], r["publication_status"]) for r in records)
+        reversed_decisions = sorted((r["processo"], r["documento"], r["canonical_state"], r["publication_status"]) for r in reversed_records)
+        self.assertEqual(decisions, reversed_decisions)
+
     def test_vigencia_relativa_em_anos_usa_termino_inclusivo(self) -> None:
         period = normalize_pt_period(
             "a partir da assinatura",
@@ -669,6 +736,7 @@ class PTNormalizerTests(unittest.TestCase):
                     "internal_content_score": 3,
                 },
             )
+            weak_payload["collection"].update({"candidate_id": "PT-FRACO", "document_id": "DOC-FRACO"})
             weak_payload["documento"] = "PT-FRACO"
             strong_payload = _payload(
                 processo,
@@ -679,6 +747,7 @@ class PTNormalizerTests(unittest.TestCase):
                     "internal_content_score": 7,
                 },
             )
+            strong_payload["collection"].update({"candidate_id": "PT-FORTE", "document_id": "DOC-FORTE"})
             strong_payload["documento"] = "PT-FORTE"
 
             (output_dir / "plano_trabalho_60090.000100_2026-00_tree_rank_001.json").write_text(
@@ -703,6 +772,8 @@ class PTNormalizerTests(unittest.TestCase):
         self.assertEqual(len(audit_rows), 2)
         self.assertEqual(len(published_rows), 1)
         self.assertEqual(published_rows[0]["documento"], "PT-FORTE")
+        self.assertEqual(sum(row["publication_status"] == PUBLICATION_STATUS_GOLD for row in audit_rows), 1)
+        self.assertEqual(next(row for row in audit_rows if row["documento"] == "PT-FRACO")["canonical_state"], "UNRESOLVED")
         self.assertGreater(
             int(published_rows[0]["canonical_score"]),
             int(next(row["canonical_score"] for row in audit_rows if row["documento"] == "PT-FRACO")),

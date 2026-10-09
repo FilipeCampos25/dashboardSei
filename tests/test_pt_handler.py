@@ -44,6 +44,51 @@ def _write_preview_csv(output_dir: Path, *, processo: str, parceiro: str, vigenc
 
 
 class PTHandlerTests(unittest.TestCase):
+    def test_tracking_sync_explicitly_downgrades_preexisting_gold_loser(self) -> None:
+        handler = build_pt_document_type().handler
+        handler.reset_run()
+        output_dir = Path.cwd() / "tests" / "_tmp_pt_tracking_sync"
+        if output_dir.exists():
+            shutil.rmtree(output_dir, ignore_errors=True)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        audit_path = output_dir / "pt_auditoria_latest.csv"
+        fieldnames = [
+            "json_path", "classification_reason", "validation_status", "publication_status",
+            "normalization_status", "canonical_candidate_id", "canonical_state",
+            "canonical_reason", "canonical_selection_reason",
+        ]
+        rows = [
+            {
+                "json_path": "winner.json", "validation_status": "valid_for_requested_type",
+                "publication_status": "published_gold", "canonical_candidate_id": "A",
+                "canonical_state": "SELECTED", "canonical_reason": "canonical.selected",
+                "canonical_selection_reason": "canonical.selected",
+            },
+            {
+                "json_path": "loser.json", "validation_status": "valid_for_requested_type",
+                "publication_status": "retained_silver", "canonical_candidate_id": "B",
+                "canonical_state": "UNRESOLVED", "canonical_reason": "canonical.selected",
+                "canonical_selection_reason": "canonical.selected",
+            },
+        ]
+        try:
+            with audit_path.open("w", encoding="utf-8-sig", newline="") as file_obj:
+                writer = csv.DictWriter(file_obj, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(rows)
+            handler._tracking_records = [
+                {"json_path": "winner.json", "publication_status": "published_gold"},
+                {"json_path": "loser.json", "publication_status": "published_gold"},
+            ]
+            handler._sync_tracking_records_with_audit(audit_path)
+            self.assertEqual(handler._tracking_records[0]["publication_status"], "published_gold")
+            self.assertEqual(handler._tracking_records[0]["canonical_state"], "SELECTED")
+            self.assertEqual(handler._tracking_records[1]["publication_status"], "retained_silver")
+            self.assertEqual(handler._tracking_records[1]["canonical_state"], "UNRESOLVED")
+            self.assertEqual(len(handler._tracking_records), 2)
+        finally:
+            shutil.rmtree(output_dir, ignore_errors=True)
+
     def test_pt_handler_sanitizes_snapshot_and_syncs_audit_status(self) -> None:
         spec = build_pt_document_type()
         handler = spec.handler
