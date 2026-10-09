@@ -868,6 +868,108 @@ def _is_execution_footer_row(cells: List[str]) -> bool:
     )
 
 
+def _execution_column_indexes(header_row: Any) -> Dict[str, int]:
+    indexes: Dict[str, int] = {}
+    for index, raw_cell in enumerate(header_row if isinstance(header_row, (list, tuple)) else [header_row]):
+        cell = _normalize_text(str(raw_cell or ""))
+        if not cell:
+            continue
+        if "meta" not in indexes and any(_has_normalized_word(cell, word) for word in ("meta", "metas")):
+            indexes["meta"] = index
+        elif "acao" not in indexes and any(
+            _has_normalized_word(cell, word) for word in ("acao", "acoes", "atividade", "etapa")
+        ):
+            indexes["acao"] = index
+        elif "responsavel" not in indexes and _has_normalized_word(cell, "responsavel"):
+            indexes["responsavel"] = index
+        elif "periodo" not in indexes and any(
+            _has_normalized_word(cell, word) for word in ("periodo", "cronograma")
+        ):
+            indexes["periodo"] = index
+        elif "produto" not in indexes and any(
+            _has_normalized_word(cell, word) for word in ("produto", "entrega", "resultado")
+        ):
+            indexes["produto"] = index
+    return indexes
+
+
+def _execution_entries_from_tables(snapshot: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Preserve execution relationships only where table coordinates are observable."""
+
+    entries: List[Dict[str, Any]] = []
+    for table_index, table in enumerate(snapshot.get("tables", []) or []):
+        rows = table.get("rows", []) if isinstance(table, dict) else table
+        rows = rows or []
+        header_index = _execution_header_index(rows)
+        if header_index is None:
+            continue
+        indexes = _execution_column_indexes(rows[header_index])
+        if "meta" not in indexes or "acao" not in indexes:
+            continue
+        for row_index in range(header_index + 1, len(rows)):
+            raw_row = rows[row_index] if isinstance(rows[row_index], (list, tuple)) else [rows[row_index]]
+            cells = [_clean_spaces(str(cell or "")) for cell in raw_row]
+            if not any(cells):
+                continue
+            if _is_execution_footer_row([cell for cell in cells if cell]):
+                break
+            if _is_execution_table_header(" | ".join(_normalize_text(cell) for cell in cells if cell)):
+                continue
+
+            fields: Dict[str, Any] = {}
+            for field_name, column_index in indexes.items():
+                value = cells[column_index] if column_index < len(cells) else ""
+                fields[field_name] = (
+                    {
+                        "value": value,
+                        "table_index": table_index,
+                        "row_index": row_index,
+                        "column_index": column_index,
+                        "relation": "same_table_row",
+                    }
+                    if value
+                    else None
+                )
+            if not fields.get("meta") and not fields.get("acao"):
+                continue
+            entries.append(
+                {
+                    "table_index": table_index,
+                    "row_index": row_index,
+                    "position": len(entries),
+                    **fields,
+                    "_raw_cells": cells,
+                }
+            )
+    return entries
+
+
+def _legacy_execution_from_entries(entries: List[Dict[str, Any]]) -> Tuple[str, str]:
+    metas: List[str] = []
+    acoes: List[str] = []
+    for entry in entries:
+        cells = [cell for cell in entry.get("_raw_cells", []) if cell]
+        if not cells:
+            continue
+        row_text = " | ".join(cells)
+        first = _normalize_text(cells[0])
+        if re.fullmatch(r"\d+[.)]?", first) and len(cells) >= 2:
+            metas.append(f"{cells[0]} | {cells[1]}")
+            if len(cells) >= 3:
+                acoes.append(" | ".join(cells[1:]))
+        elif re.match(r"\d+\s+\S", first):
+            metas.append(cells[0])
+            if len(cells) > 1:
+                acoes.append(" | ".join(cells[1:]))
+        elif first.startswith(("meta", "fase", "etapa")):
+            metas.append(row_text)
+            if len(cells) > 1:
+                acoes.append(" | ".join(cells[1:]))
+        else:
+            acoes.append(row_text)
+    return " || ".join(dict.fromkeys(metas)), " || ".join(dict.fromkeys(acoes))
+
+
 def _execution_from_shifted_table_headers(snapshot: Dict[str, Any]) -> Tuple[str, str]:
     metas: List[str] = []
     acoes: List[str] = []
@@ -915,6 +1017,9 @@ def _execution_from_shifted_table_headers(snapshot: Dict[str, Any]) -> Tuple[str
 
 
 def _execution_from_tables(snapshot: Dict[str, Any]) -> Tuple[str, str]:
+    entries = _execution_entries_from_tables(snapshot)
+    if entries:
+        return _legacy_execution_from_entries(entries)
     metas, acoes = _execution_from_primary_table_headers(snapshot)
     if _has_content(metas) or _has_content(acoes):
         return metas, acoes
@@ -1382,6 +1487,46 @@ def _pt_document_identity(record: Dict[str, Any], payload: Dict[str, Any]) -> Do
     )
 
 
+def _execution_entries_v2(
+    snapshot: Dict[str, Any],
+    identity: DocumentIdentity,
+    source_path: str | Path | None,
+) -> List[Dict[str, Any]]:
+    serialized: List[Dict[str, Any]] = []
+    for entry in _execution_entries_from_tables(snapshot):
+        item: Dict[str, Any] = {
+            "table_index": entry["table_index"],
+            "row_index": entry["row_index"],
+            "position": entry["position"],
+        }
+        for field_name in ("meta", "acao", "responsavel", "periodo", "produto"):
+            field = entry.get(field_name)
+            if not field:
+                item[field_name] = None
+                continue
+            evidence = FieldEvidence(
+                field_name=f"execution.{field_name}",
+                source_kind=SourceKind.DOCUMENT,
+                source_document=identity,
+                relation=field["relation"],
+                rule_id="pt.execucao.table_row",
+                location=EvidenceLocation(
+                    source_path=str(source_path) if source_path else None,
+                    table_index=field["table_index"],
+                    row_index=field["row_index"],
+                    column_index=field["column_index"],
+                ),
+                raw_evidence=field["value"],
+            )
+            item[field_name] = {
+                "value": field["value"],
+                "relation": field["relation"],
+                "evidence": evidence.to_dict(),
+            }
+        serialized.append(item)
+    return serialized
+
+
 def build_pt_v2_record(
     record: Dict[str, Any],
     payload: Dict[str, Any],
@@ -1494,6 +1639,11 @@ def build_pt_v2_record(
         }
     )
     adapted["fields"] = [field.to_dict() for field in field_results]
+    adapted["execution_entries"] = _execution_entries_v2(
+        payload.get("snapshot", {}) or {},
+        identity,
+        source_path,
+    )
     return adapted
 
 
