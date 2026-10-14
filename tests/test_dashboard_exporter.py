@@ -25,6 +25,37 @@ def _write_json(path: Path, payload: dict[str, object]) -> None:
 
 
 class DashboardExporterTests(unittest.TestCase):
+    def test_pt_field_source_uses_material_preview_provenance(self) -> None:
+        from app.services.dashboard_exporter import _best_object, _best_partner, _best_vigencia
+
+        pt_row = {
+            "parceiro": "Parceiro da prévia",
+            "objeto": "Objeto da prévia",
+            "vigencia_inicio": "2026-01-01",
+            "vigencia_fim": "2026-12-31",
+            "field_source_parceiro": "preview",
+            "field_source_objeto": "preview",
+            "field_source_vigencia": "preview",
+        }
+        self.assertEqual(_best_partner({}, pt_row, {}, act_gold=False, pt_gold=True)["source"], "preview_fallback")
+        self.assertEqual(_best_object({}, pt_row, {}, act_gold=False, pt_gold=True)["confidence"], "low")
+        vigencia = _best_vigencia({}, pt_row, {}, act_gold=False, pt_gold=False)
+        self.assertEqual((vigencia["source"], vigencia["confidence"]), ("preview_fallback", "low"))
+
+        legacy = _best_partner({}, {"parceiro": "Estruturado"}, {}, act_gold=False, pt_gold=False)
+        self.assertEqual((legacy["source"], legacy["confidence"]), ("pt_silver_structured", "medium"))
+
+    def test_act_gold_rejects_explicit_ambiguous_external_or_ineligible_affinity(self) -> None:
+        from app.services.dashboard_exporter import _is_act_gold
+
+        base = {"publication_status": "published_gold", "validation_status": "valid_for_requested_type"}
+        self.assertTrue(_is_act_gold(base))
+        self.assertTrue(_is_act_gold({**base, "affinity_canonical_eligible": "True", "affinity_status": "matched"}))
+        self.assertFalse(_is_act_gold({**base, "affinity_status": "ambiguous"}))
+        self.assertFalse(_is_act_gold({**base, "process_alignment_status": "external_reference"}))
+        self.assertFalse(_is_act_gold({**base, "affinity_canonical_eligible": "False"}))
+        self.assertFalse(_is_act_gold({**base, "validation_status": "related_but_not_requested"}))
+
     def test_best_numero_preserves_act_and_compares_leading_zero_semantically(self) -> None:
         from app.services.dashboard_exporter import _best_numero
 

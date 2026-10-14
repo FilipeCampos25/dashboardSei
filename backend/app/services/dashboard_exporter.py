@@ -274,7 +274,7 @@ def _best_act_row(rows: List[Dict[str, str]]) -> Dict[str, str]:
     return max(
         rows,
         key=lambda row: (
-            row.get("publication_status", "") == ACT_PUBLICATION_STATUS_GOLD,
+            _is_act_gold(row),
             _safe_int(row.get("canonical_score", "")),
             len(row.get("objeto", "")),
         ),
@@ -309,7 +309,7 @@ def _pt_quality(row: Dict[str, str]) -> str:
 def _act_quality(row: Dict[str, str]) -> str:
     if not row:
         return "not_found"
-    if row.get("publication_status", "") != ACT_PUBLICATION_STATUS_GOLD:
+    if not _is_act_gold(row):
         return "silver_only"
     missing = [
         field
@@ -326,7 +326,7 @@ def _act_quality(row: Dict[str, str]) -> str:
 
 
 def _act_missing_fields(row: Dict[str, str]) -> List[str]:
-    if not row or row.get("publication_status", "") != ACT_PUBLICATION_STATUS_GOLD:
+    if not row or not _is_act_gold(row):
         return []
     return [
         field
@@ -376,6 +376,37 @@ def _period_label(row: Dict[str, str]) -> str:
     return ""
 
 
+def _is_act_gold(row: Dict[str, str]) -> bool:
+    if row.get("publication_status", "") != ACT_PUBLICATION_STATUS_GOLD:
+        return False
+    validation_status = _clean_spaces(row.get("validation_status", ""))
+    if validation_status and validation_status != VALIDATION_STATUS_VALID:
+        return False
+    affinity_eligible = _clean_spaces(row.get("affinity_canonical_eligible", "")).casefold()
+    if affinity_eligible and affinity_eligible not in {"true", "1", "yes"}:
+        return False
+    affinity_markers = {
+        _clean_spaces(row.get("affinity_state", "")).casefold(),
+        _clean_spaces(row.get("affinity_status", "")).casefold(),
+        _clean_spaces(row.get("process_alignment_status", "")).casefold(),
+    }
+    rejected_markers = {
+        "ambiguous",
+        "mismatched",
+        "probable_external_document",
+        "external_reference",
+        "material_mismatch",
+    }
+    return not bool(affinity_markers & rejected_markers)
+
+
+def _pt_field_source(row: Dict[str, str], field_name: str, pt_gold: bool) -> str:
+    material_source = _clean_spaces(row.get(f"field_source_{field_name}", "")).casefold()
+    if material_source == "preview":
+        return "preview_fallback"
+    return "pt_gold" if pt_gold else "pt_silver_structured"
+
+
 def _best_numero(preview: Dict[str, str], act_row: Dict[str, str], act_gold: bool) -> Dict[str, str]:
     act_numero = _clean_spaces(act_row.get("numero_acordo", "")) if act_gold else ""
     if _is_valid_numero_acordo(act_numero):
@@ -411,7 +442,7 @@ def _best_partner(
         return _value_source(act_partner, "act_gold")
     pt_partner = _clean_spaces(pt_row.get("parceiro", ""))
     if pt_partner:
-        return _value_source(pt_partner, "pt_gold" if pt_gold else "pt_silver_structured")
+        return _value_source(pt_partner, _pt_field_source(pt_row, "parceiro", pt_gold))
     preview_partner = _clean_spaces(preview.get("parceiro", ""))
     if preview_partner:
         return _value_source(preview_partner, "preview_fallback")
@@ -431,7 +462,7 @@ def _best_object(
         return _value_source(act_objeto, "act_gold")
     pt_objeto = _clean_spaces(pt_row.get("objeto", ""))
     if pt_objeto:
-        return _value_source(pt_objeto, "pt_gold" if pt_gold else "pt_silver_structured")
+        return _value_source(pt_objeto, _pt_field_source(pt_row, "objeto", pt_gold))
     preview_objeto = _clean_spaces(preview.get("objeto", ""))
     if preview_objeto:
         return _value_source(preview_objeto, "preview_fallback")
@@ -447,7 +478,7 @@ def _best_vigencia(preview: Dict[str, str], pt_row: Dict[str, str], act_row: Dic
     pt_start = _clean_spaces(pt_row.get("vigencia_inicio", ""))
     pt_end = _clean_spaces(pt_row.get("vigencia_fim", ""))
     if pt_start and pt_end:
-        source = "pt_gold" if pt_gold else "pt_silver_structured"
+        source = _pt_field_source(pt_row, "vigencia", pt_gold)
         return {"inicio": pt_start, "fim": pt_end, "raw": _period_label(pt_row), "source": source, "confidence": _confidence(source)}
 
     preview_raw = _clean_spaces(preview.get("vigencia", ""))
@@ -562,7 +593,7 @@ def export_dashboard_ready_csv(output_dir: Path, logger: Any = None) -> Dict[str
         act_quality = _act_quality(act_row)
         ted_quality = _ted_quality(ted_row, ted_status_rows)
         pt_gold = pt_row.get("publication_status", "") == PT_PUBLICATION_STATUS_GOLD
-        act_gold = act_row.get("publication_status", "") == ACT_PUBLICATION_STATUS_GOLD
+        act_gold = _is_act_gold(act_row)
         memorando_gold = bool(memorando_row.get("json_path", ""))
         has_process_mismatch = _has_process_mismatch(act_row)
         act_missing = _act_missing_fields(act_row)
