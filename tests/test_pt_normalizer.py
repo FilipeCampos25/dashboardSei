@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import csv
 import json
 import shutil
@@ -26,6 +27,7 @@ from app.services.pt_normalizer import (
     VALIDATION_STATUS_NON_CANONICAL,
     apply_pt_canonical_selection,
     build_normalized_record,
+    build_pt_v2_record,
     export_normalized_csv,
     normalize_pt_period,
 )
@@ -60,6 +62,48 @@ def _payload(
 
 
 class PTNormalizerTests(unittest.TestCase):
+    def test_parse_prazos_tem_uma_definicao_e_preserva_formatos_ativos(self) -> None:
+        source_path = Path(__file__).resolve().parents[1] / "backend" / "app" / "rpa" / "sei" / "document_text_extractor.py"
+        tree = ast.parse(source_path.read_text(encoding="utf-8"))
+        definitions = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "parse_prazos"]
+        self.assertEqual(len(definitions), 1)
+
+        cases = (
+            (
+                "PREVISAO DE INICIO E TERMINO Inicio (mes/ano): JUN/2025 Termino (mes/ano): JUN/2030",
+                ("encontrado", "2025-06-01", "2030-06-30"),
+            ),
+            ("PERIODO DE EXECUCAO 01/01/2025 a 31/12/2025", ("encontrado", "2025-01-01", "2025-12-31")),
+            ("Inicio: 01/2025", ("parcial", "2025-01-01", "")),
+            ("Plano de trabalho sem periodo informado.", ("nao_encontrado", "", "")),
+        )
+        for text, expected in cases:
+            with self.subTest(text=text):
+                result = parse_prazos(text)
+                self.assertEqual((result["status"], result["inicio_data"], result["termino_data"]), expected)
+
+    def test_atribuicoes_expoem_aplicabilidade_sem_adjudicar_vazio(self) -> None:
+        cases = (
+            (
+                "RESPONSABILIDADES DOS PARTICIPES: Compete ao CENSIPAM coordenar as atividades. OBJETO: cooperacao.",
+                "PRESENT",
+            ),
+            ("RESPONSABILIDADES DOS PARTICIPES: Nao se aplica. OBJETO: cooperacao.", "NOT_APPLICABLE"),
+            ("PLANO DE TRABALHO. OBJETO: cooperacao.", "NOT_EVALUATED"),
+        )
+        for text, expected_state in cases:
+            with self.subTest(expected_state=expected_state):
+                payload = _payload("60090.000001/2026-00", text)
+                record = build_normalized_record(payload, {}, Path("pt.json"))
+                fields = {
+                    field["field_name"]: field
+                    for field in build_pt_v2_record(record, payload, {})["fields"]
+                }
+                self.assertEqual(record["atribuicoes_state"], expected_state)
+                self.assertEqual(fields["atribuições_raw"]["state"], expected_state)
+                if expected_state == "NOT_EVALUATED":
+                    self.assertEqual(record["atribuições_raw"], "")
+
     @staticmethod
     def _canonical_record(processo: str, candidate_id: str, score: int, *, eligible: bool = True) -> tuple[dict, dict]:
         record = {

@@ -1427,52 +1427,6 @@ def _extract_period_values(text: str) -> Dict[str, str]:
     return {"inicio_raw": inicio_raw, "termino_raw": termino_raw}
 
 
-def parse_prazos(text: str, logger: Any = None) -> Dict[str, str]:
-    result = {
-        "status": "nao_encontrado",
-        "inicio_data": "",
-        "inicio_raw": "",
-        "termino_data": "",
-        "termino_raw": "",
-    }
-    try:
-        base_text = text or ""
-        _log(logger, "info", "Parse prazos: iniciando com text_chars=%d", len(base_text))
-        inicio_value = _extract_label_value(base_text, r"in(?:i|í|Ã­)cio")
-        termino_value = _extract_label_value(base_text, r"t(?:e|é|Ã©)rmino")
-        _log(
-            logger,
-            "info",
-            "Parse prazos: valores brutos extraidos inicio='%s' termino='%s'",
-            _truncate(inicio_value, 120),
-            _truncate(termino_value, 120),
-        )
-        if not inicio_value and not termino_value:
-            _log(logger, "warning", "Parse prazos: nenhum marcador de inicio/termino encontrado.")
-            return result
-
-        if inicio_value:
-            inicio_iso = _normalize_boundary_date(inicio_value, is_end=False)
-            if inicio_iso:
-                result["inicio_data"] = inicio_iso
-            else:
-                result["inicio_raw"] = inicio_value
-
-        if termino_value:
-            termino_iso = _normalize_boundary_date(termino_value, is_end=True)
-            if termino_iso:
-                result["termino_data"] = termino_iso
-            else:
-                result["termino_raw"] = termino_value
-
-        result["status"] = "encontrado" if (inicio_value and termino_value) else "parcial"
-        _log(logger, "info", "Parse prazos: resultado final=%s", result)
-    except Exception:
-        _log(logger, "exception", "Parse prazos: erro inesperado durante parse.")
-        return result
-    return result
-
-
 def _extract_period_values_v2(text: str) -> Dict[str, str]:
     normalized = _normalize_date_text(text or "")
     if not normalized:

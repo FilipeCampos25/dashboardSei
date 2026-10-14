@@ -1118,6 +1118,15 @@ def _extract_atribuicoes(snapshot: Dict[str, Any]) -> str:
     )
 
 
+def _atribuicoes_state(value: str) -> FieldState:
+    normalized = _normalize_text(value)
+    if not normalized:
+        return FieldState.NOT_EVALUATED
+    if re.search(r"\b(?:nao\s+se\s+aplica|nao\s+aplicavel)\b", normalized):
+        return FieldState.NOT_APPLICABLE
+    return FieldState.PRESENT
+
+
 def _extract_metas(snapshot: Dict[str, Any]) -> str:
     metas_from_tables, _ = _execution_from_tables(snapshot)
     if _has_content(metas_from_tables):
@@ -1619,12 +1628,24 @@ def build_pt_v2_record(
                 field_name=field_name,
                 state=(
                     FieldState.PRESENT
-                    if present
+                    if present and not (
+                        field_name == ATTRIBUICOES_COLUMN
+                        and record.get("atribuicoes_state") == FieldState.NOT_APPLICABLE.value
+                    )
+                    else FieldState(record["atribuicoes_state"])
+                    if field_name == ATTRIBUICOES_COLUMN
                     else FieldState.UNRESOLVED
                     if unresolved_period
                     else FieldState.NOT_EVALUATED
                 ),
-                value=value if present else None,
+                value=(
+                    value
+                    if present and not (
+                        field_name == ATTRIBUICOES_COLUMN
+                        and record.get("atribuicoes_state") == FieldState.NOT_APPLICABLE.value
+                    )
+                    else None
+                ),
                 evidences=evidences,
             )
         )
@@ -1684,6 +1705,7 @@ def build_normalized_record(payload: Dict[str, Any], preview: Dict[str, str], js
     parceiro = _extract_partner(snapshot, preview)
     objeto = _extract_objeto(snapshot, preview)
     atribuicoes = _extract_atribuicoes(snapshot)
+    atribuicoes_state = _atribuicoes_state(atribuicoes)
     metas = _extract_metas(snapshot)
     acoes = _extract_acoes(snapshot)
     record = {
@@ -1702,6 +1724,7 @@ def build_normalized_record(payload: Dict[str, Any], preview: Dict[str, str], js
         "vigencia_fim": period["prazo_fim"],
         "objeto": objeto,
         ATTRIBUICOES_COLUMN: atribuicoes,
+        "atribuicoes_state": atribuicoes_state.value,
         "metas_raw": metas,
         "acoes_raw": acoes,
         "prazo_inicio_raw": period["prazo_inicio_raw"],
