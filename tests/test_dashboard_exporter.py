@@ -70,6 +70,20 @@ class DashboardExporterTests(unittest.TestCase):
             )
             for index in range(1, len(expected) + 1):
                 _write_json(output_dir / f"ted_{index}.json", {"snapshot": {}})
+            (output_dir / "v2").mkdir()
+            _write_json(
+                output_dir / "v2" / "ted_normalizado.v2.json",
+                {
+                    "records": [
+                        {
+                            "identity": {"process_id": processo},
+                            "legacy_json_name": f"ted_{index}.json",
+                            "document_gold_decision": {"semantic_state": {"publication": "BLOCKED"}},
+                        }
+                        for index, processo in enumerate(expected, start=1)
+                    ]
+                },
+            )
 
             result = export_dashboard_ready_csv(output_dir)
             self.assertEqual(result["records"], 6)
@@ -89,6 +103,7 @@ class DashboardExporterTests(unittest.TestCase):
                 self.assertEqual(row["act_numero"], "")
                 self.assertEqual(row["act_numero_acordo"], "")
                 self.assertEqual(row["best_numero_acordo"], "")
+                self.assertEqual(row["quality_status"], "low")
                 self.assertNotIn("numero_missing", row["normalization_issues"])
                 self.assertEqual(divergence[processo]["documento_principal_numero"], f"{numero}/{ano}")
         finally:
@@ -496,6 +511,31 @@ class DashboardExporterTests(unittest.TestCase):
                         "selection_detail": "TED skip: sem numero de instrumento vinculado ao processo",
                     },
                 ],
+            )
+            (output_dir / "v2").mkdir()
+            _write_json(
+                output_dir / "v2" / "documento_administrativo_normalizado.v2.json",
+                {
+                    "records": [
+                        {
+                            "identity": {"process_id": "60090.000003/2026-03"},
+                            "legacy_json_name": "memorando_entendimentos_60090.000003_2026-03.json",
+                            "document_gold_decision": {"semantic_state": {"publication": "PUBLISHED"}},
+                        }
+                    ]
+                },
+            )
+            _write_json(
+                output_dir / "v2" / "ted_normalizado.v2.json",
+                {
+                    "records": [
+                        {
+                            "identity": {"process_id": "60090.000004/2026-04"},
+                            "legacy_json_name": ted_json_path.name,
+                            "document_gold_decision": {"semantic_state": {"publication": "PUBLISHED"}},
+                        }
+                    ]
+                },
             )
 
             result = export_dashboard_ready_csv(output_dir)

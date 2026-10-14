@@ -219,6 +219,45 @@ def _ted_payload(row: Dict[str, str], output_dir: Path, logger: Any = None) -> D
     return api_payload if isinstance(api_payload, dict) else {}
 
 
+def _document_gold_index(path: Path, logger: Any = None) -> Dict[tuple[str, str], bool]:
+    payload = _read_json_payload(path, logger=logger)
+    records = payload.get("records", [])
+    if not isinstance(records, list):
+        return {}
+    decisions: Dict[tuple[str, str], bool] = {}
+    duplicates: set[tuple[str, str]] = set()
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        identity = record.get("identity", {})
+        decision = record.get("document_gold_decision", {})
+        semantic = decision.get("semantic_state", {}) if isinstance(decision, dict) else {}
+        if not isinstance(identity, dict) or not isinstance(semantic, dict):
+            continue
+        process_id = _normalize_processo(str(identity.get("process_id", "") or ""))
+        raw_legacy_json_name = _clean_spaces(str(record.get("legacy_json_name", "") or ""))
+        if not process_id or not raw_legacy_json_name:
+            continue
+        legacy_json_name = Path(raw_legacy_json_name).name
+        key = (process_id, legacy_json_name.casefold())
+        if key in decisions:
+            duplicates.add(key)
+            continue
+        decisions[key] = semantic.get("publication") == "PUBLISHED"
+    for key in duplicates:
+        decisions[key] = False
+    return decisions
+
+
+def _has_document_gold(row: Dict[str, str], decisions: Dict[tuple[str, str], bool]) -> bool:
+    process_id = _normalize_processo(row.get("processo", ""))
+    raw_json_path = _clean_spaces(row.get("json_path", ""))
+    if not process_id or not raw_json_path:
+        return False
+    legacy_json_name = Path(raw_json_path).name
+    return decisions.get((process_id, legacy_json_name.casefold()), False)
+
+
 def _best_pt_row(rows: List[Dict[str, str]]) -> Dict[str, str]:
     return max(
         rows,
@@ -474,13 +513,13 @@ def _overall_quality_status(
     *,
     pt_quality: str,
     act_quality: str,
-    memorando_gold: bool,
-    ted_gold: bool,
+    memorando_document_gold: bool,
+    ted_document_gold: bool,
     has_process_mismatch: bool,
 ) -> str:
     if act_quality == "gold_complete" and not has_process_mismatch:
         return "high"
-    if act_quality.startswith("gold") or pt_quality == "gold" or memorando_gold or ted_gold:
+    if act_quality.startswith("gold") or pt_quality == "gold" or memorando_document_gold or ted_document_gold:
         return "medium"
     return "low"
 
@@ -499,6 +538,11 @@ def export_dashboard_ready_csv(output_dir: Path, logger: Any = None) -> Dict[str
     memorando_grouped = _group_rows(_read_csv_rows(output_dir / "memorando_normalizado_latest.csv", logger=logger))
     ted_grouped = _group_rows(ted_rows)
     ted_status_grouped = _group_rows(_read_csv_rows(output_dir / "ted_status_execucao_latest.csv", logger=logger))
+    memorando_document_gold = _document_gold_index(
+        output_dir / "v2" / "documento_administrativo_normalizado.v2.json",
+        logger=logger,
+    )
+    ted_document_gold = _document_gold_index(output_dir / "v2" / "ted_normalizado.v2.json", logger=logger)
 
     rows: List[Dict[str, Any]] = []
     divergence_rows: List[Dict[str, Any]] = []
@@ -647,8 +691,8 @@ def export_dashboard_ready_csv(output_dir: Path, logger: Any = None) -> Dict[str
                 "quality_status": _overall_quality_status(
                     pt_quality=pt_quality,
                     act_quality=act_quality,
-                    memorando_gold=memorando_gold,
-                    ted_gold=ted_gold,
+                    memorando_document_gold=_has_document_gold(memorando_row, memorando_document_gold),
+                    ted_document_gold=_has_document_gold(ted_row, ted_document_gold),
                     has_process_mismatch=has_process_mismatch,
                 ),
                 "quality_notes": "; ".join(note for note in notes if note),
