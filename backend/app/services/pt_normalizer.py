@@ -1723,6 +1723,25 @@ def build_normalized_record(payload: Dict[str, Any], preview: Dict[str, str], js
         "json_path": str(json_path),
     }
     contract_fields = _build_contract_fields(record=record, preview=preview, snapshot=snapshot)
+    for field_name, audit_name in (
+        ("parceiro", "parceiro"),
+        ("objeto", "objeto"),
+        ("vigencia_raw", "vigencia"),
+    ):
+        field = contract_fields[field_name]
+        record[f"field_source_{audit_name}"] = _clean_spaces(str(field.get("source_type", "") or ""))
+        record[f"field_evidence_{audit_name}"] = _clean_spaces(
+            str(field.get("evidence", "") or field.get("raw_value", "") or "")
+        )
+    record["vigencia_textual_state"] = "PRESENT" if _clean_spaces(record["vigencia_raw"]) else "ABSENT"
+    if record["vigencia_inicio"] and record["vigencia_fim"]:
+        record["vigencia_period_state"] = "RESOLVED"
+    elif record["vigencia_inicio"] or record["vigencia_fim"]:
+        record["vigencia_period_state"] = "PARTIAL"
+    elif record["vigencia_raw"]:
+        record["vigencia_period_state"] = "UNRESOLVED"
+    else:
+        record["vigencia_period_state"] = "ABSENT"
     status, captured = _classify_record(record, contract_fields)
     record["normalization_status"] = status
     record["captured_focus_fields"] = str(captured)
@@ -1825,8 +1844,20 @@ def export_normalized_csv(output_dir: Path, logger: Any = None) -> Dict[str, Any
         threshold=getattr(settings, "pt_canonical_minimum_score", PT_CANONICAL_MINIMUM_SCORE),
         min_margin=getattr(settings, "pt_canonical_minimum_margin", PT_CANONICAL_MINIMUM_MARGIN),
     )
+    audit_columns = [
+        *columns[:-1],
+        "field_source_parceiro",
+        "field_evidence_parceiro",
+        "field_source_objeto",
+        "field_evidence_objeto",
+        "field_source_vigencia",
+        "field_evidence_vigencia",
+        "vigencia_textual_state",
+        "vigencia_period_state",
+        "json_path",
+    ]
     audit_path = output_dir / "pt_auditoria_latest.csv"
-    csv_writer.write_csv(records, audit_path, columns=columns)
+    csv_writer.write_csv(records, audit_path, columns=audit_columns)
 
     diagnostic_columns = [
         "processo",

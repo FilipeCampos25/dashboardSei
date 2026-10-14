@@ -210,6 +210,10 @@ class PTNormalizerTests(unittest.TestCase):
         self.assertEqual((record["rule_amount"], record["rule_unit"], record["rule_anchor"]), ("12", "meses", "assinatura"))
         self.assertEqual(record["vigencia_inicio"], "")
         self.assertEqual(record["vigencia_fim"], "")
+        self.assertEqual(record["field_source_vigencia"], "preview")
+        self.assertEqual(record["field_evidence_vigencia"], "12 meses a partir da assinatura")
+        self.assertEqual(record["vigencia_textual_state"], "PRESENT")
+        self.assertEqual(record["vigencia_period_state"], "UNRESOLVED")
 
     def test_pdf_native_periodo_explicito_e_metas(self) -> None:
         payload = _payload(
@@ -773,6 +777,13 @@ class PTNormalizerTests(unittest.TestCase):
         self.assertEqual(len(published_rows), 1)
         self.assertEqual(published_rows[0]["documento"], "PT-FORTE")
         self.assertEqual(sum(row["publication_status"] == PUBLICATION_STATUS_GOLD for row in audit_rows), 1)
+        strong_audit = next(row for row in audit_rows if row["documento"] == "PT-FORTE")
+        self.assertEqual(strong_audit["field_source_parceiro"], "document_text")
+        self.assertIn("UNIVERSIDADE FEDERAL DE TESTE", strong_audit["field_evidence_parceiro"])
+        self.assertEqual(strong_audit["field_source_objeto"], "document_text")
+        self.assertEqual(strong_audit["vigencia_textual_state"], "PRESENT")
+        self.assertEqual(strong_audit["vigencia_period_state"], "RESOLVED")
+        self.assertNotIn("field_source_parceiro", published_rows[0])
         self.assertEqual(next(row for row in audit_rows if row["documento"] == "PT-FRACO")["canonical_state"], "UNRESOLVED")
         self.assertGreater(
             int(published_rows[0]["canonical_score"]),
