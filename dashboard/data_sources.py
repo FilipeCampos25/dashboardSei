@@ -229,41 +229,15 @@ def _latest_mtime(paths: Iterable[Path]) -> str:
 
 
 def load_dashboard_bundle(root_dir: Path, *, use_v2: bool = False) -> dict[str, Any]:
-    backend_output = root_dir / "backend" / "output"
-    log_entries = read_json_lines_safe(root_dir / "output" / "execution_log_latest.json")
-    source_paths = dashboard_source_paths(root_dir)
+    from backend.app.services.dashboard_data import load_dashboard_bundle as load_canonical_bundle
 
-    pt_normalized = read_csv_safe(backend_output / "pt_normalizado_latest.csv")
-    pt_audit = read_csv_safe(backend_output / "pt_auditoria_latest.csv")
-    memorando = read_csv_safe(backend_output / "memorando_normalizado_latest.csv", ADMIN_COLUMNS)
-    admin = read_csv_safe(backend_output / "documento_administrativo_normalizado_latest.csv", ADMIN_COLUMNS)
-    raw_collection = (
-        _latest_log_timestamp(log_entries)
-        or _latest_captured_at([pt_normalized, pt_audit, memorando, admin])
-        or _latest_mtime(source_paths)
+    canonical = load_canonical_bundle(root_dir, use_v2=use_v2)
+    canonical.update(
+        dashboard_ready=canonical["overview"],
+        history_raw=read_csv_safe(canonical["backend_output_dir"] / "parcerias_descontinuadas_latest.csv", ["processo", "anotacoes"]),
+        history_normalized=canonical["parcerias_descontinuadas"],
     )
-
-    dashboard_path = backend_output / ("dashboard_ready_v2_latest.csv" if use_v2 else "dashboard_ready_latest.csv")
-    dashboard_columns = DASHBOARD_READY_COLUMNS + (DASHBOARD_V2_AUDIT_COLUMNS if use_v2 else [])
-    return {
-        "root_dir": root_dir,
-        "backend_output_dir": backend_output,
-        "parcerias_vigentes": read_csv_safe(backend_output / "parcerias_vigentes_latest.csv", PARCERIAS_VIGENTES_COLUMNS),
-        "dashboard_ready": read_csv_safe(dashboard_path, dashboard_columns),
-        "dashboard_contract": "v2" if use_v2 else "legacy",
-        "pt_normalized": pt_normalized,
-        "pt_audit": pt_audit,
-        "act_normalized": read_csv_safe(backend_output / "act_normalizado_latest.csv"),
-        "memorando_normalized": memorando,
-        "admin_normalized": admin,
-        "ted_normalized": read_csv_safe(backend_output / "ted_normalizado_latest.csv", TED_COLUMNS),
-        "history_raw": read_csv_safe(backend_output / "parcerias_descontinuadas_latest.csv", ["processo", "anotacoes"]),
-        "history_normalized": read_csv_safe(backend_output / "parcerias_descontinuadas_normalizado_latest.csv", HISTORY_COLUMNS),
-        "log_entries": log_entries,
-        "source_paths": source_paths,
-        "collection_meta": {
-            "data_ultima_coleta": raw_collection,
-            "data_ultima_coleta_display": format_datetime_display(raw_collection),
-            "fonte_data_ultima_coleta": "execution_log" if _latest_log_timestamp(log_entries) else "captured_at_or_mtime",
-        },
-    }
+    canonical["collection_meta"]["data_ultima_coleta_display"] = format_datetime_display(
+        canonical["collection_meta"].get("data_ultima_coleta", "")
+    )
+    return canonical

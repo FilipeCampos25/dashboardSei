@@ -11,6 +11,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from backend.app.services.dashboard_data import load_dashboard_bundle, read_csv_safe
+from backend.app.services.dashboard_streamlit_data import load_dashboard_bundle as load_streamlit_bundle
+from dashboard.data_sources import load_dashboard_bundle as load_dashboard_package_bundle
 
 
 class DashboardDataTests(unittest.TestCase):
@@ -50,6 +52,13 @@ class DashboardDataTests(unittest.TestCase):
 
         self.assertEqual(bundle["collection_meta"]["data_ultima_coleta"], "2026-06-16T13:20:39")
         self.assertEqual(bundle["collection_meta"]["fonte_data_ultima_coleta"], "execution_log")
+
+        package_bundle = load_dashboard_package_bundle(self.root_dir)
+        streamlit_bundle = load_streamlit_bundle(self.root_dir)
+        self.assertEqual(package_bundle["dashboard_contract"], bundle["dashboard_contract"])
+        self.assertEqual(streamlit_bundle["dashboard_contract"], bundle["dashboard_contract"])
+        self.assertEqual(package_bundle["dashboard_ready"]["processo"].tolist(), bundle["overview"]["processo"].tolist())
+        self.assertEqual(streamlit_bundle["overview"]["processo"].tolist(), bundle["overview"]["processo"].tolist())
 
 
 if __name__ == "__main__":

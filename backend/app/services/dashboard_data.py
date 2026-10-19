@@ -72,6 +72,12 @@ OVERVIEW_COLUMNS = [
     "best_objeto_source",
     "best_objeto_confidence",
     "normalization_issues",
+    "v2_primary_document_identity",
+    "v2_numero_resolution",
+    "v2_parceiro_resolution",
+    "v2_objeto_resolution",
+    "v2_vigencia_resolution",
+    "v2_data_assinatura_resolution",
 ]
 
 PARCERIAS_VIGENTES_COLUMNS = [
@@ -340,10 +346,11 @@ def _latest_mtime(paths: Iterable[Path]) -> str:
     return pd.Timestamp.fromtimestamp(max(mtimes)).strftime("%Y-%m-%dT%H:%M:%S")
 
 
-def load_dashboard_bundle(root_dir: Path) -> dict[str, Any]:
+def load_dashboard_bundle(root_dir: Path, *, use_v2: bool = False) -> dict[str, Any]:
     backend_output_dir = root_dir / "backend" / "output"
+    dashboard_name = "dashboard_ready_v2_latest.csv" if use_v2 else "dashboard_ready_latest.csv"
     overview_df = _ensure_bool_columns(
-        read_csv_safe(backend_output_dir / "dashboard_ready_latest.csv", OVERVIEW_COLUMNS),
+        read_csv_safe(backend_output_dir / dashboard_name, OVERVIEW_COLUMNS),
         ("pt_gold", "act_gold", "memorando_gold", "ted_gold", "has_process_mismatch"),
     )
     pt_normalized_df = _ensure_pt_aliases(read_csv_safe(backend_output_dir / "pt_normalizado_latest.csv"))
@@ -355,6 +362,7 @@ def load_dashboard_bundle(root_dir: Path) -> dict[str, Any]:
         "root_dir": root_dir,
         "backend_output_dir": backend_output_dir,
         "overview": overview_df,
+        "dashboard_contract": "v2" if use_v2 else "legacy",
         "parcerias_vigentes": read_csv_safe(backend_output_dir / "parcerias_vigentes_latest.csv", PARCERIAS_VIGENTES_COLUMNS),
         "parcerias_descontinuadas": read_csv_safe(
             backend_output_dir / "parcerias_descontinuadas_normalizado_latest.csv",

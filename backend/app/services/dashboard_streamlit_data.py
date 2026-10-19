@@ -395,16 +395,15 @@ def build_file_signature(paths: Iterable[Path]) -> tuple[tuple[str, bool, int, i
 
 
 def load_dashboard_bundle(root_dir: Path, *, use_v2: bool = False) -> Dict[str, Any]:
+    from .dashboard_data import load_dashboard_bundle as load_canonical_bundle
+
+    canonical = load_canonical_bundle(root_dir, use_v2=use_v2)
     backend_output_dir = root_dir / "backend" / "output"
-    dashboard_name = "dashboard_ready_v2_latest.csv" if use_v2 else "dashboard_ready_latest.csv"
-    overview_df = _prepare_overview_df(_read_csv(backend_output_dir / dashboard_name, OVERVIEW_COLUMNS))
-    parcerias_vigentes_df = _read_csv(backend_output_dir / "parcerias_vigentes_latest.csv", PARCERIAS_VIGENTES_COLUMNS)
-    parcerias_descontinuadas_df = _read_csv(
-        backend_output_dir / "parcerias_descontinuadas_normalizado_latest.csv",
-        PARCERIAS_DESCONTINUADAS_COLUMNS,
-    )
-    pt_normalized_df = _ensure_pt_columns(_read_csv(backend_output_dir / "pt_normalizado_latest.csv"))
-    pt_audit_df = _ensure_pt_columns(_read_csv(backend_output_dir / "pt_auditoria_latest.csv"))
+    overview_df = _prepare_overview_df(canonical["overview"])
+    parcerias_vigentes_df = canonical["parcerias_vigentes"]
+    parcerias_descontinuadas_df = canonical["parcerias_descontinuadas"]
+    pt_normalized_df = _ensure_pt_columns(canonical["pt_normalized"])
+    pt_audit_df = _ensure_pt_columns(canonical["pt_audit"])
     pt_status_df = _prepare_status_df(_read_csv(backend_output_dir / "pt_status_execucao_latest.csv"))
     act_normalized_df = _read_csv(backend_output_dir / "act_normalizado_latest.csv")
     act_status_df = _prepare_status_df(_read_csv(backend_output_dir / "act_status_execucao_latest.csv"))
@@ -415,7 +414,7 @@ def load_dashboard_bundle(root_dir: Path, *, use_v2: bool = False) -> Dict[str, 
     performance = _read_json(backend_output_dir / "performance_analysis.json")
     log_entries = _read_json_lines(root_dir / "output" / "execution_log_latest.json")
     return {
-        "dashboard_contract": "v2" if use_v2 else "legacy",
+        "dashboard_contract": canonical["dashboard_contract"],
         "root_dir": root_dir,
         "backend_output_dir": backend_output_dir,
         "overview": overview_df,
