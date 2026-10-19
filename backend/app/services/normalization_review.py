@@ -14,7 +14,22 @@ from app.documents.common import acquisition_recovery_payload
 QUEUE_FILENAME = "normalization_review_queue_latest.csv"
 
 SEVERITY_RANK = {"high": 0, "medium": 1, "low": 2}
-NOT_FOUND_STATUSES = {"not_found", "search_context_stagnation", "filter_error", "extraction_failure"}
+NOT_FOUND_STATUSES = {
+    "not_found", "search_context_stagnation", "filter_error", "extraction_failure",
+    "iframe_unavailable", "timeout", "access_restricted", "empty_content", "unverified",
+}
+
+LEGACY_RECOVERY = {
+    "not_found": ("document_not_found", "legacy_status", False),
+    "search_context_stagnation": ("technical_timeout", "legacy_search_stagnation", True),
+    "filter_error": ("technical_state_unknown", "legacy_filter_error", None),
+    "extraction_failure": ("technical_extraction", "legacy_extraction_failure", True),
+    "iframe_unavailable": ("technical_access", "legacy_iframe_unavailable", True),
+    "timeout": ("technical_timeout", "legacy_timeout", True),
+    "access_restricted": ("technical_access_restricted", "legacy_access_restricted", False),
+    "empty_content": ("empty_content", "legacy_empty_content", True),
+    "unverified": ("technical_state_unknown", "legacy_unverified", None),
+}
 
 REQUIRED_FIELDS: Dict[str, Sequence[str]] = {
     "pt": ("parceiro", "vigencia_inicio", "vigencia_fim", "objeto"),
@@ -313,7 +328,8 @@ def _not_found_issue(document_type: str, row: Dict[str, str], *, administrative:
     if state is None:
         if status not in NOT_FOUND_STATUSES:
             return None
-        recovery = {"issue_code": "document_not_found", "root_cause": "legacy_status", "recoverable": False}
+        issue_code, root_cause, recoverable = LEGACY_RECOVERY[status]
+        recovery = {"issue_code": issue_code, "root_cause": root_cause, "recoverable": recoverable}
         diagnostic_code = ""
     else:
         diagnostic_code = row.get("acquisition_diagnostic_code", "")
@@ -324,6 +340,10 @@ def _not_found_issue(document_type: str, row: Dict[str, str], *, administrative:
             return None
 
     issue_code = str(recovery["issue_code"])
+    if _is_gold(row) and issue_code == "empty_content":
+        issue_code = "empty_gold"
+    elif _is_gold(row) and issue_code == "technical_state_unknown":
+        issue_code = "unverified_gold"
     is_documentary_absence = issue_code == "document_not_found"
     if administrative and is_documentary_absence:
         issue_code = "administrative_document_not_found"
@@ -334,6 +354,8 @@ def _not_found_issue(document_type: str, row: Dict[str, str], *, administrative:
         "technical_access_restricted": "Acesso ao documento foi explicitamente identificado como restrito.",
         "empty_content": "Documento acessivel foi extraido sem conteudo.",
         "technical_state_unknown": "Estado tecnico insuficientemente observado para adjudicar recuperabilidade.",
+        "empty_gold": "Documento publicado como gold foi extraido sem conteudo verificavel.",
+        "unverified_gold": "Documento publicado como gold nao possui estado tecnico verificavel.",
     }
     if is_documentary_absence:
         message = "Documento administrativo nao encontrado." if administrative else f"Documento {document_type} nao encontrado."

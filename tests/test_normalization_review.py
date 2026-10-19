@@ -193,6 +193,30 @@ class NormalizationReviewTests(unittest.TestCase):
         self.assertEqual(rows[-1]["code"], "administrative_document_not_found")
         self.assertEqual(rows[-1]["is_not_found"], "True")
 
+    def test_root_causes_and_recoverability_are_explicit(self) -> None:
+        from app.services.normalization_review import _not_found_issue
+
+        cases = (
+            ("empty_content", "published_gold", "empty_gold", True),
+            ("unverified", "published_gold", "unverified_gold", None),
+            ("iframe_unavailable", "retained_silver", "technical_access", True),
+            ("timeout", "retained_silver", "technical_timeout", True),
+            ("access_restricted", "retained_silver", "technical_access_restricted", False),
+            ("extraction_failure", "retained_silver", "technical_extraction", True),
+        )
+        for status, publication, code, recoverable in cases:
+            with self.subTest(status=status):
+                issue = _not_found_issue("pt", {
+                    "processo": "60090.000001/2026-01",
+                    "candidate_id": "candidate-1",
+                    "validation_status": status,
+                    "publication_status": publication,
+                })
+                self.assertEqual(issue["code"], code)
+                self.assertEqual(issue["is_recoverable"], recoverable)
+                self.assertEqual(issue["candidate_id"], "candidate-1")
+                self.assertFalse(issue["is_not_found"])
+
 
 if __name__ == "__main__":
     unittest.main()
