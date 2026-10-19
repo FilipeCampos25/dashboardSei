@@ -611,8 +611,8 @@ class DashboardExporterTests(unittest.TestCase):
 
             row_2 = next(row for row in rows if row["processo"] == "60090.000002/2026-02")
             self.assertEqual(row_2["act_numero"], "")
-            self.assertEqual(row_2["documento_principal_tipo"], "ACT")
-            self.assertEqual(row_2["documento_principal_numero"], "2/2026")
+            self.assertEqual(row_2["documento_principal_tipo"], "Parceria")
+            self.assertEqual(row_2["documento_principal_numero"], "")
             self.assertEqual(row_2["act_gold"], "False")
             self.assertEqual(row_2["act_numero_acordo"], "")
             self.assertEqual(row_2["act_quality"], "silver_only")
@@ -634,7 +634,7 @@ class DashboardExporterTests(unittest.TestCase):
 
             row_4 = next(row for row in rows if row["processo"] == "60090.000004/2026-04")
             self.assertEqual(row_4["source_universe"], "parcerias_vigentes")
-            self.assertEqual(row_4["documento_principal_tipo"], "ACT")
+            self.assertEqual(row_4["documento_principal_tipo"], "TED")
             self.assertEqual(row_4["ted_gold"], "True")
             self.assertEqual(row_4["ted_json_path"], str(ted_json_path))
             self.assertEqual(row_4["ted_objeto"], "Execucao descentralizada de atividades")

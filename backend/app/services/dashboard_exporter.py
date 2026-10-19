@@ -594,12 +594,32 @@ def _overall_quality_status(
     memorando_document_gold: bool,
     ted_document_gold: bool,
     has_process_mismatch: bool,
+    has_field_conflict: bool = False,
 ) -> str:
-    if act_quality == "gold_complete" and not has_process_mismatch:
+    if act_quality == "gold_complete" and not has_process_mismatch and not has_field_conflict:
         return "high"
-    if act_quality.startswith("gold") or pt_quality == "gold" or memorando_document_gold or ted_document_gold:
+    if not has_field_conflict and (
+        act_quality.startswith("gold") or pt_quality == "gold" or memorando_document_gold or ted_document_gold
+    ):
         return "medium"
     return "low"
+
+
+def _primary_document(
+    *,
+    ted_gold: bool,
+    ted_row: Dict[str, str],
+    act_gold: bool,
+    act_row: Dict[str, str],
+    pt_gold: bool,
+) -> tuple[str, str]:
+    if ted_gold:
+        return "TED", _ted_document_number(ted_row)
+    if act_gold:
+        return "ACT", _clean_spaces(act_row.get("numero_acordo", ""))
+    if pt_gold:
+        return "Plano de Trabalho", ""
+    return "Parceria", ""
 
 
 def export_dashboard_ready_csv(output_dir: Path, logger: Any = None) -> Dict[str, Any]:
@@ -662,12 +682,13 @@ def export_dashboard_ready_csv(output_dir: Path, logger: Any = None) -> Dict[str
         act_numero = _clean_spaces(act_row.get("numero_acordo", "")) if act_gold else ""
         ted_numero = _clean_spaces(ted_row.get("numero_ted", "")) if ted_gold else ""
         ted_ano = _clean_spaces(ted_row.get("ano_ted", "")) if ted_gold else ""
-        if source_universe == "ted_normalizado" and ted_gold:
-            documento_principal_tipo = "TED"
-            documento_principal_numero = _ted_document_number(ted_row)
-        else:
-            documento_principal_numero = best_numero["value"]
-            documento_principal_tipo = "ACT" if documento_principal_numero else "Parceria"
+        documento_principal_tipo, documento_principal_numero = _primary_document(
+            ted_gold=ted_gold,
+            ted_row=ted_row,
+            act_gold=act_gold,
+            act_row=act_row,
+            pt_gold=pt_gold,
+        )
         best_parceiro = _best_partner(preview, pt_row, act_row, act_gold=act_gold, pt_gold=pt_gold)
         best_vigencia = _best_vigencia(preview, pt_row, act_row, act_gold=act_gold, pt_gold=pt_gold)
         best_data_assinatura = _best_data_assinatura(
@@ -679,6 +700,10 @@ def export_dashboard_ready_csv(output_dir: Path, logger: Any = None) -> Dict[str
             memorando_gold=memorando_gold,
         )
         best_objeto = _best_object(preview, pt_row, act_row, act_gold=act_gold, pt_gold=pt_gold)
+        has_field_conflict = any(
+            resolution.get("conflicts")
+            for resolution in (best_parceiro, best_objeto, best_vigencia, best_data_assinatura)
+        ) or bool(best_numero.get("warning"))
 
         notes: List[str] = []
         issues: List[str] = []
@@ -780,6 +805,7 @@ def export_dashboard_ready_csv(output_dir: Path, logger: Any = None) -> Dict[str
                     memorando_document_gold=_has_document_gold(memorando_row, memorando_document_gold),
                     ted_document_gold=_has_document_gold(ted_row, ted_document_gold),
                     has_process_mismatch=has_process_mismatch,
+                    has_field_conflict=has_field_conflict,
                 ),
                 "quality_notes": "; ".join(note for note in notes if note),
                 "act_attempts_count": len(act_attempt_rows),
