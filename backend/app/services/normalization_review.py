@@ -83,6 +83,8 @@ COLUMNS = [
     "is_not_found",
     "acquisition_root_cause",
     "acquisition_diagnostic_code",
+    "causal_group",
+    "root_issue_code",
 ]
 
 
@@ -188,6 +190,11 @@ def _issue(
 
 def _required_field_issues(document_type: str, row: Dict[str, str]) -> List[Dict[str, Any]]:
     issues: List[Dict[str, Any]] = []
+    resolved_function = row.get("resolved_function", "") or row.get("doc_function", "")
+    if document_type == "act" and (resolved_function or row.get("doc_class", "")) not in {"act.instrument", "act_final"}:
+        return issues
+    if document_type == "pt" and resolved_function and resolved_function not in {"pt.work_plan", "pt.instrument"}:
+        return issues
     if document_type in {"ted", "documento_administrativo"} and isinstance(row.get("_field_results_v2"), list):
         required = [
             str(item.get("field_name", ""))
@@ -697,14 +704,18 @@ def _dedupe(issues: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     deduped: List[Dict[str, Any]] = []
     seen = set()
     for issue in issues:
+        identity = (
+            issue.get("candidate_id", ""),
+            issue.get("document_id", ""),
+            issue.get("source_url", ""),
+            issue.get("json_path", ""),
+            issue.get("documento", ""),
+        )
         key = (
             issue.get("code", ""),
             issue.get("document_type", ""),
             issue.get("processo", ""),
-            issue.get("documento", ""),
-            issue.get("document_id", ""),
-            issue.get("candidate_id", ""),
-            issue.get("source_url", ""),
+            identity,
             issue.get("field", ""),
         )
         if key in seen:
@@ -712,6 +723,33 @@ def _dedupe(issues: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
         seen.add(key)
         deduped.append(issue)
     return deduped
+
+
+def _link_causal_groups(issues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    roots: Dict[tuple[Any, ...], str] = {}
+    root_codes = {
+        "document_not_found", "administrative_document_not_found", "technical_access",
+        "technical_timeout", "technical_extraction", "technical_access_restricted",
+        "empty_content", "technical_state_unknown", "empty_gold", "unverified_gold",
+    }
+    for issue in issues:
+        identity = (
+            issue.get("document_type", ""), issue.get("process_id", ""),
+            issue.get("candidate_id", ""), issue.get("document_id", ""),
+            issue.get("source_url", ""), issue.get("json_path", ""), issue.get("documento", ""),
+        )
+        if issue.get("code") in root_codes:
+            roots[identity] = str(issue["code"])
+    for issue in issues:
+        identity = (
+            issue.get("document_type", ""), issue.get("process_id", ""),
+            issue.get("candidate_id", ""), issue.get("document_id", ""),
+            issue.get("source_url", ""), issue.get("json_path", ""), issue.get("documento", ""),
+        )
+        root_code = roots.get(identity, str(issue.get("code", "")))
+        issue["root_issue_code"] = root_code
+        issue["causal_group"] = "|".join(str(value or "-") for value in identity) + f"|{root_code}"
+    return issues
 
 
 def _sort_key(issue: Dict[str, Any]) -> tuple:
@@ -744,7 +782,7 @@ def collect_review_issues(output_dir: Path | str, logger: Any = None) -> List[Di
         )
     )
     issues.extend(_dashboard_issues(_read_csv_rows(output_path / "dashboard_ready_latest.csv", logger)))
-    return sorted(_dedupe(issues), key=_sort_key)
+    return sorted(_link_causal_groups(_dedupe(issues)), key=_sort_key)
 
 
 def export_review_queue(output_dir: Path | str, logger: Any = None) -> Dict[str, Any]:

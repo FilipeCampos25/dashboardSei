@@ -217,6 +217,26 @@ class NormalizationReviewTests(unittest.TestCase):
                 self.assertEqual(issue["candidate_id"], "candidate-1")
                 self.assertFalse(issue["is_not_found"])
 
+    def test_applicability_causal_grouping_and_candidate_identity(self) -> None:
+        from app.services.normalization_review import _dedupe, _link_causal_groups, _required_field_issues
+
+        related = {"doc_class": "termo_aditivo", "processo": "60090.000001/2026-01"}
+        self.assertEqual(_required_field_issues("act", related), [])
+
+        root = {
+            "code": "technical_extraction", "document_type": "pt", "processo": "p", "process_id": "p",
+            "candidate_id": "c1", "document_id": "d1", "source_url": "", "json_path": "one.json",
+            "documento": "PT", "field": "documento",
+        }
+        symptom = {**root, "code": "required_field_missing", "field": "objeto"}
+        other_candidate = {**symptom, "candidate_id": "c2", "json_path": "two.json"}
+        linked = _link_causal_groups(_dedupe([root, symptom, other_candidate]))
+        self.assertEqual(len(linked), 3)
+        first = next(issue for issue in linked if issue["candidate_id"] == "c1" and issue["field"] == "objeto")
+        second = next(issue for issue in linked if issue["candidate_id"] == "c2")
+        self.assertEqual(first["root_issue_code"], "technical_extraction")
+        self.assertNotEqual(first["causal_group"], second["causal_group"])
+
 
 if __name__ == "__main__":
     unittest.main()
