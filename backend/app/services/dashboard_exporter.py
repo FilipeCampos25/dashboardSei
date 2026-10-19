@@ -13,6 +13,14 @@ from app.services.act_normalizer import (
     VALIDATION_STATUS_VALID,
 )
 from app.services.pt_normalizer import PUBLICATION_STATUS_GOLD as PT_PUBLICATION_STATUS_GOLD
+from app.services.dashboard_field_resolver import (
+    COMPLEMENT,
+    PREVIEW,
+    PRIMARY,
+    FieldCandidate,
+    ResolutionPolicy,
+    resolve_field,
+)
 
 
 def _log(logger: Any, level: str, msg: str, *args: Any) -> None:
@@ -157,6 +165,18 @@ def _confidence(source: str) -> str:
 
 def _value_source(value: str, source: str) -> Dict[str, str]:
     return {"value": _clean_spaces(value), "source": source, "confidence": _confidence(source)}
+
+
+def _resolved_value(field_name: str, candidates: List[FieldCandidate], precedence: tuple[tuple[str, str], ...]) -> Dict[str, Any]:
+    resolution = resolve_field(ResolutionPolicy(field_name, precedence), candidates)
+    if resolution.winner is None:
+        return {**_value_source("", "missing"), "conflicts": (), "rule_id": resolution.rule_id}
+    result: Dict[str, Any] = {
+        **_value_source(str(resolution.value), resolution.winner.source),
+        "conflicts": tuple(str(candidate.value) for candidate in resolution.conflicts),
+        "rule_id": resolution.rule_id,
+    }
+    return result
 
 
 def _numero_comparison_key(value: str) -> str:
@@ -409,16 +429,24 @@ def _pt_field_source(row: Dict[str, str], field_name: str, pt_gold: bool) -> str
 
 def _best_numero(preview: Dict[str, str], act_row: Dict[str, str], act_gold: bool) -> Dict[str, str]:
     act_numero = _clean_spaces(act_row.get("numero_acordo", "")) if act_gold else ""
-    if _is_valid_numero_acordo(act_numero):
-        result = _value_source(act_numero, "act_gold")
-        preview_numero = _clean_spaces(preview.get("numero_act", ""))
-        if _is_valid_numero_acordo(preview_numero) and _numero_comparison_key(preview_numero) != _numero_comparison_key(act_numero):
-            result["warning"] = f"numero_acordo_conflict: act_gold={act_numero}; preview={preview_numero}"
-        return result
     preview_numero = _clean_spaces(preview.get("numero_act", ""))
+    candidates = []
+    if _is_valid_numero_acordo(act_numero):
+        candidates.append(FieldCandidate("numero_acordo", act_numero, "act_gold", "act.instrument", PRIMARY))
     if _is_valid_numero_acordo(preview_numero):
-        return _value_source(preview_numero, "preview_fallback")
-    return _value_source("", "missing")
+        candidates.append(FieldCandidate("numero_acordo", preview_numero, "preview_fallback", "preview", PREVIEW))
+    resolution = resolve_field(
+        ResolutionPolicy("numero_acordo", (("act.instrument", PRIMARY), ("preview", PREVIEW)), _numero_comparison_key),
+        candidates,
+    )
+    if resolution.winner is None:
+        return _value_source("", "missing")
+    result = _value_source(str(resolution.value), resolution.winner.source)
+    if resolution.conflicts:
+        result["warning"] = f"numero_acordo_conflict: {resolution.winner.source}={resolution.value}; " + "; ".join(
+            f"{candidate.source}={candidate.value}" for candidate in resolution.conflicts
+        )
+    return result
 
 
 def _ted_document_number(ted_row: Dict[str, str]) -> str:
@@ -438,15 +466,13 @@ def _best_partner(
     pt_gold: bool,
 ) -> Dict[str, str]:
     act_partner = _clean_spaces(act_row.get("orgao_convenente", "")) if act_gold else ""
-    if act_partner:
-        return _value_source(act_partner, "act_gold")
     pt_partner = _clean_spaces(pt_row.get("parceiro", ""))
-    if pt_partner:
-        return _value_source(pt_partner, _pt_field_source(pt_row, "parceiro", pt_gold))
     preview_partner = _clean_spaces(preview.get("parceiro", ""))
-    if preview_partner:
-        return _value_source(preview_partner, "preview_fallback")
-    return _value_source("", "missing")
+    return _resolved_value("parceiro", [
+        FieldCandidate("parceiro", act_partner, "act_gold", "act.instrument", PRIMARY),
+        FieldCandidate("parceiro", pt_partner, _pt_field_source(pt_row, "parceiro", pt_gold), "pt.work_plan", COMPLEMENT),
+        FieldCandidate("parceiro", preview_partner, "preview_fallback", "preview", PREVIEW),
+    ], (("act.instrument", PRIMARY), ("pt.work_plan", COMPLEMENT), ("preview", PREVIEW)))
 
 
 def _best_object(
@@ -458,33 +484,43 @@ def _best_object(
     pt_gold: bool,
 ) -> Dict[str, str]:
     act_objeto = _clean_spaces(act_row.get("objeto", "")) if act_gold else ""
-    if act_objeto:
-        return _value_source(act_objeto, "act_gold")
     pt_objeto = _clean_spaces(pt_row.get("objeto", ""))
-    if pt_objeto:
-        return _value_source(pt_objeto, _pt_field_source(pt_row, "objeto", pt_gold))
     preview_objeto = _clean_spaces(preview.get("objeto", ""))
-    if preview_objeto:
-        return _value_source(preview_objeto, "preview_fallback")
-    return _value_source("", "missing")
+    return _resolved_value("objeto", [
+        FieldCandidate("objeto", act_objeto, "act_gold", "act.instrument", PRIMARY),
+        FieldCandidate("objeto", pt_objeto, _pt_field_source(pt_row, "objeto", pt_gold), "pt.work_plan", COMPLEMENT),
+        FieldCandidate("objeto", preview_objeto, "preview_fallback", "preview", PREVIEW),
+    ], (("act.instrument", PRIMARY), ("pt.work_plan", COMPLEMENT), ("preview", PREVIEW)))
 
 
 def _best_vigencia(preview: Dict[str, str], pt_row: Dict[str, str], act_row: Dict[str, str], *, act_gold: bool, pt_gold: bool) -> Dict[str, str]:
     act_start = _clean_spaces(act_row.get("data_inicio_vigencia", "")) if act_gold else ""
     act_end = _clean_spaces(act_row.get("data_fim_vigencia", "")) if act_gold else ""
-    if act_start and act_end:
-        return {"inicio": act_start, "fim": act_end, "raw": _period_label(act_row), "source": "act_gold", "confidence": "high"}
-
     pt_start = _clean_spaces(pt_row.get("vigencia_inicio", ""))
     pt_end = _clean_spaces(pt_row.get("vigencia_fim", ""))
-    if pt_start and pt_end:
-        source = _pt_field_source(pt_row, "vigencia", pt_gold)
-        return {"inicio": pt_start, "fim": pt_end, "raw": _period_label(pt_row), "source": source, "confidence": _confidence(source)}
-
     preview_raw = _clean_spaces(preview.get("vigencia", ""))
-    if preview_raw:
-        return {"inicio": "", "fim": "", "raw": preview_raw, "source": "preview_fallback", "confidence": "low"}
-    return {"inicio": "", "fim": "", "raw": "", "source": "missing", "confidence": "missing"}
+    candidates = [
+        FieldCandidate("vigencia", (act_start, act_end, _period_label(act_row)), "act_gold", "act.instrument", PRIMARY),
+        FieldCandidate("vigencia", (pt_start, pt_end, _period_label(pt_row)), _pt_field_source(pt_row, "vigencia", pt_gold), "pt.work_plan", COMPLEMENT),
+        FieldCandidate("vigencia", ("", "", preview_raw), "preview_fallback", "preview", PREVIEW),
+    ]
+    candidates = [candidate for candidate in candidates if any(candidate.value)]
+    resolution = resolve_field(
+        ResolutionPolicy("vigencia", (("act.instrument", PRIMARY), ("pt.work_plan", COMPLEMENT), ("preview", PREVIEW))),
+        candidates,
+    )
+    if resolution.winner is None:
+        return {"inicio": "", "fim": "", "raw": "", "source": "missing", "confidence": "missing", "conflicts": ()}
+    inicio, fim, raw = resolution.value
+    return {
+        "inicio": inicio,
+        "fim": fim,
+        "raw": raw,
+        "source": resolution.winner.source,
+        "confidence": _confidence(resolution.winner.source),
+        "conflicts": tuple(candidate.value for candidate in resolution.conflicts),
+        "rule_id": resolution.rule_id,
+    }
 
 
 def _last_signature_date(datas_assinatura: str) -> str:
@@ -503,36 +539,47 @@ def _best_data_assinatura(
 ) -> Dict[str, str]:
     act_data = _clean_spaces(act_row.get("data_assinatura", "")) if act_gold else ""
     act_datas = _clean_spaces(act_row.get("datas_assinatura", "")) if act_gold else ""
-    if act_data or act_datas:
-        return {
-            "data": act_data or _last_signature_date(act_datas),
-            "datas": act_datas or act_data,
-            "source": "act_gold",
-            "confidence": "high",
-        }
-
     pt_data = _clean_spaces(pt_row.get("data_assinatura", ""))
     pt_datas = _clean_spaces(pt_row.get("datas_assinatura", ""))
-    if pt_data or pt_datas:
-        source = "pt_gold" if pt_gold else "pt_silver_structured"
-        return {
-            "data": pt_data or _last_signature_date(pt_datas),
-            "datas": pt_datas or pt_data,
-            "source": source,
-            "confidence": _confidence(source),
-        }
-
     memorando_data = _clean_spaces(memorando_row.get("data_assinatura", "")) if memorando_gold else ""
     memorando_datas = _clean_spaces(memorando_row.get("datas_assinatura", "")) if memorando_gold else ""
-    if memorando_data or memorando_datas:
-        return {
-            "data": memorando_data or _last_signature_date(memorando_datas),
-            "datas": memorando_datas or memorando_data,
-            "source": "memorando_gold",
-            "confidence": "medium",
-        }
-
-    return {"data": "", "datas": "", "source": "missing", "confidence": "missing"}
+    candidates = [
+        FieldCandidate("data_assinatura", (act_data or _last_signature_date(act_datas), act_datas or act_data), "act_gold", "act.instrument", PRIMARY),
+        FieldCandidate(
+            "data_assinatura",
+            (pt_data or _last_signature_date(pt_datas), pt_datas or pt_data),
+            "pt_gold" if pt_gold else "pt_silver_structured",
+            "pt.work_plan",
+            COMPLEMENT,
+        ),
+        FieldCandidate(
+            "data_assinatura",
+            (memorando_data or _last_signature_date(memorando_datas), memorando_datas or memorando_data),
+            "memorando_gold",
+            "admin.memorandum",
+            COMPLEMENT,
+        ),
+    ]
+    candidates = [candidate for candidate in candidates if any(candidate.value)]
+    resolution = resolve_field(
+        ResolutionPolicy(
+            "data_assinatura",
+            (("act.instrument", PRIMARY), ("pt.work_plan", COMPLEMENT), ("admin.memorandum", COMPLEMENT)),
+        ),
+        candidates,
+    )
+    if resolution.winner is None:
+        return {"data": "", "datas": "", "source": "missing", "confidence": "missing", "conflicts": ()}
+    data, datas = resolution.value
+    confidence = "medium" if resolution.winner.source == "memorando_gold" else _confidence(resolution.winner.source)
+    return {
+        "data": data,
+        "datas": datas,
+        "source": resolution.winner.source,
+        "confidence": confidence,
+        "conflicts": tuple(candidate.value for candidate in resolution.conflicts),
+        "rule_id": resolution.rule_id,
+    }
 
 
 def _has_process_mismatch(act_row: Dict[str, str]) -> bool:
@@ -637,6 +684,14 @@ def export_dashboard_ready_csv(output_dir: Path, logger: Any = None) -> Dict[str
         issues: List[str] = []
         if best_numero.get("warning"):
             issues.append(best_numero["warning"])
+        for field_name, resolution in (
+            ("parceiro", best_parceiro),
+            ("objeto", best_objeto),
+            ("vigencia", best_vigencia),
+            ("data_assinatura", best_data_assinatura),
+        ):
+            if resolution.get("conflicts"):
+                issues.append(f"{field_name}_conflict")
         if act_quality != "gold_complete":
             notes.append(f"act={act_quality}")
         if pt_quality != "gold":
