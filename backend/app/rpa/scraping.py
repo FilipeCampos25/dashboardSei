@@ -2241,14 +2241,15 @@ class SEIScraper:
             "xlsx": 220,
             "csv": 220,
         }
-        if any(marker in normalized for marker in rejection_penalties):
+        if any(self._normalize_text(marker) in normalized for marker in rejection_penalties):
             score -= 200
 
         if document_type.key == "act":
             for marker in TREE_PENALTY_MARKERS:
-                if marker not in normalized:
+                normalized_marker = self._normalize_text(marker)
+                if normalized_marker not in normalized:
                     continue
-                score -= 40 if marker == "anexo" else 120
+                score -= 40 if normalized_marker == self._normalize_text("anexo") else 120
             for marker in (
                 "portaria",
                 "publicacao",
@@ -2259,7 +2260,7 @@ class SEIScraper:
                 "memorando",
                 "termo de execucao descentralizada",
             ):
-                if marker in normalized:
+                if self._normalize_text(marker) in normalized:
                     score -= 180
         elif document_type.key == "pt":
             if "DOCUMENTACAO" in normalized:

@@ -27,6 +27,27 @@ SPEC = DocumentTypeSpec(
 
 
 class CandidateInventoryTests(unittest.TestCase):
+    def _scraper_for_scoring(self):
+        scraper = scraping.SEIScraper.__new__(scraping.SEIScraper)
+        scraper._normalize_text = scraping.SEIScraper._normalize_text.__get__(scraper, scraping.SEIScraper)
+        return scraper
+
+    def test_tree_ranking_penalties_ignore_case_and_accents(self) -> None:
+        scraper = self._scraper_for_scoring()
+        titles = (
+            "ACT 1/2026",
+            "aNeXo do act 1/2026",
+            "E-MAIL sobre o act 1/2026",
+            "PUBLICAÇÃO do Act 1/2026",
+        )
+
+        scores = [scraping.SEIScraper._score_tree_candidate(scraper, SPEC, title)[0] for title in titles]
+
+        self.assertEqual(scores, sorted(scores, reverse=True))
+        self.assertGreater(scores[0], scores[1])
+        self.assertGreater(scores[1], scores[2])
+        self.assertGreater(scores[2], scores[3])
+
     def test_tree_inventory_retains_instrument_and_related_documents(self) -> None:
         titles = (
             "Acordo de Cooperacao Tecnica ACT 1/2026",
