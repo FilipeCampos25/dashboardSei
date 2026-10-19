@@ -49,6 +49,15 @@ DASHBOARD_READY_COLUMNS = [
     "quality_notes",
 ]
 
+DASHBOARD_V2_AUDIT_COLUMNS = [
+    "v2_primary_document_identity",
+    "v2_numero_resolution",
+    "v2_parceiro_resolution",
+    "v2_objeto_resolution",
+    "v2_vigencia_resolution",
+    "v2_data_assinatura_resolution",
+]
+
 TED_COLUMNS = [
     "processo",
     "documento",
@@ -219,7 +228,7 @@ def _latest_mtime(paths: Iterable[Path]) -> str:
     return pd.Timestamp.fromtimestamp(max(mtimes)).strftime("%Y-%m-%dT%H:%M:%S")
 
 
-def load_dashboard_bundle(root_dir: Path) -> dict[str, Any]:
+def load_dashboard_bundle(root_dir: Path, *, use_v2: bool = False) -> dict[str, Any]:
     backend_output = root_dir / "backend" / "output"
     log_entries = read_json_lines_safe(root_dir / "output" / "execution_log_latest.json")
     source_paths = dashboard_source_paths(root_dir)
@@ -234,11 +243,14 @@ def load_dashboard_bundle(root_dir: Path) -> dict[str, Any]:
         or _latest_mtime(source_paths)
     )
 
+    dashboard_path = backend_output / ("dashboard_ready_v2_latest.csv" if use_v2 else "dashboard_ready_latest.csv")
+    dashboard_columns = DASHBOARD_READY_COLUMNS + (DASHBOARD_V2_AUDIT_COLUMNS if use_v2 else [])
     return {
         "root_dir": root_dir,
         "backend_output_dir": backend_output,
         "parcerias_vigentes": read_csv_safe(backend_output / "parcerias_vigentes_latest.csv", PARCERIAS_VIGENTES_COLUMNS),
-        "dashboard_ready": read_csv_safe(backend_output / "dashboard_ready_latest.csv", DASHBOARD_READY_COLUMNS),
+        "dashboard_ready": read_csv_safe(dashboard_path, dashboard_columns),
+        "dashboard_contract": "v2" if use_v2 else "legacy",
         "pt_normalized": pt_normalized,
         "pt_audit": pt_audit,
         "act_normalized": read_csv_safe(backend_output / "act_normalizado_latest.csv"),

@@ -622,6 +622,18 @@ def _primary_document(
     return "Parceria", ""
 
 
+def _field_audit(value: Dict[str, Any]) -> str:
+    return json.dumps(
+        {
+            "source": value.get("source", "missing"),
+            "rule_id": value.get("rule_id", ""),
+            "conflicts": list(value.get("conflicts", ())),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+
+
 def export_dashboard_ready_csv(output_dir: Path, logger: Any = None) -> Dict[str, Any]:
     csv_writer.ensure_output_dir(output_dir)
     ted_rows = _read_csv_rows(output_dir / "ted_normalizado_latest.csv", logger=logger)
@@ -829,6 +841,25 @@ def export_dashboard_ready_csv(output_dir: Path, logger: Any = None) -> Dict[str
                 "best_objeto_source": best_objeto["source"],
                 "best_objeto_confidence": best_objeto["confidence"],
                 "normalization_issues": "; ".join(dict.fromkeys(issue for issue in issues if issue)),
+                "v2_primary_document_identity": json.dumps(
+                    {
+                        "type": documento_principal_tipo,
+                        "number": documento_principal_numero,
+                        "source_path": (
+                            ted_row.get("json_path", "") if documento_principal_tipo == "TED"
+                            else act_row.get("json_path", "") if documento_principal_tipo == "ACT"
+                            else pt_row.get("json_path", "") if documento_principal_tipo == "Plano de Trabalho"
+                            else ""
+                        ),
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                "v2_numero_resolution": _field_audit(best_numero),
+                "v2_parceiro_resolution": _field_audit(best_parceiro),
+                "v2_objeto_resolution": _field_audit(best_objeto),
+                "v2_vigencia_resolution": _field_audit(best_vigencia),
+                "v2_data_assinatura_resolution": _field_audit(best_data_assinatura),
             }
         )
         rows.append(dashboard_row)
@@ -938,6 +969,16 @@ def export_dashboard_ready_csv(output_dir: Path, logger: Any = None) -> Dict[str
     ]
     csv_path = output_dir / "dashboard_ready_latest.csv"
     csv_writer.write_csv(rows, csv_path, columns=columns)
+    v2_columns = columns + [
+        "v2_primary_document_identity",
+        "v2_numero_resolution",
+        "v2_parceiro_resolution",
+        "v2_objeto_resolution",
+        "v2_vigencia_resolution",
+        "v2_data_assinatura_resolution",
+    ]
+    v2_path = output_dir / "dashboard_ready_v2_latest.csv"
+    csv_writer.write_csv(rows, v2_path, columns=v2_columns)
     divergence_columns = [
         "processo",
         "source_universe",
@@ -989,6 +1030,7 @@ def export_dashboard_ready_csv(output_dir: Path, logger: Any = None) -> Dict[str
         "records": len(rows),
         "csv_path": csv_path,
         "latest_path": csv_path,
+        "v2_path": v2_path,
         "divergence_path": divergence_path,
         "review_queue_path": review_queue_path,
     }

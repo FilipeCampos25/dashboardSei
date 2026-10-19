@@ -578,6 +578,14 @@ class DashboardExporterTests(unittest.TestCase):
                 rows = list(csv.DictReader(file_obj))
 
             self.assertEqual(len(rows), 22)
+            v2_path = output_dir / "dashboard_ready_v2_latest.csv"
+            self.assertTrue(v2_path.exists())
+            with v2_path.open("r", encoding="utf-8-sig", newline="") as file_obj:
+                v2_rows = list(csv.DictReader(file_obj))
+            self.assertNotIn("v2_primary_document_identity", rows[0])
+            self.assertIn("source_path", json.loads(v2_rows[0]["v2_primary_document_identity"]))
+            self.assertIn("rule_id", json.loads(v2_rows[0]["v2_parceiro_resolution"]))
+            self.assertIn("conflicts", json.loads(v2_rows[0]["v2_objeto_resolution"]))
 
             row_1 = next(row for row in rows if row["processo"] == "60090.000001/2026-01")
             self.assertEqual(row_1["source_universe"], "parcerias_vigentes")

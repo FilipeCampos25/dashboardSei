@@ -75,6 +75,12 @@ OVERVIEW_COLUMNS = [
     "best_objeto_source",
     "best_objeto_confidence",
     "normalization_issues",
+    "v2_primary_document_identity",
+    "v2_numero_resolution",
+    "v2_parceiro_resolution",
+    "v2_objeto_resolution",
+    "v2_vigencia_resolution",
+    "v2_data_assinatura_resolution",
 ]
 
 PT_DETAIL_COLUMNS = [
@@ -388,9 +394,10 @@ def build_file_signature(paths: Iterable[Path]) -> tuple[tuple[str, bool, int, i
     return tuple(signature)
 
 
-def load_dashboard_bundle(root_dir: Path) -> Dict[str, Any]:
+def load_dashboard_bundle(root_dir: Path, *, use_v2: bool = False) -> Dict[str, Any]:
     backend_output_dir = root_dir / "backend" / "output"
-    overview_df = _prepare_overview_df(_read_csv(backend_output_dir / "dashboard_ready_latest.csv", OVERVIEW_COLUMNS))
+    dashboard_name = "dashboard_ready_v2_latest.csv" if use_v2 else "dashboard_ready_latest.csv"
+    overview_df = _prepare_overview_df(_read_csv(backend_output_dir / dashboard_name, OVERVIEW_COLUMNS))
     parcerias_vigentes_df = _read_csv(backend_output_dir / "parcerias_vigentes_latest.csv", PARCERIAS_VIGENTES_COLUMNS)
     parcerias_descontinuadas_df = _read_csv(
         backend_output_dir / "parcerias_descontinuadas_normalizado_latest.csv",
@@ -408,6 +415,7 @@ def load_dashboard_bundle(root_dir: Path) -> Dict[str, Any]:
     performance = _read_json(backend_output_dir / "performance_analysis.json")
     log_entries = _read_json_lines(root_dir / "output" / "execution_log_latest.json")
     return {
+        "dashboard_contract": "v2" if use_v2 else "legacy",
         "root_dir": root_dir,
         "backend_output_dir": backend_output_dir,
         "overview": overview_df,

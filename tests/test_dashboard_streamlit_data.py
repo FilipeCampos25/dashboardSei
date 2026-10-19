@@ -186,6 +186,27 @@ class DashboardStreamlitDataTests(unittest.TestCase):
         self.assertEqual(bundle["log_entries"], [])
         self.assertEqual(bundle["performance"], {})
 
+    def test_load_dashboard_bundle_selects_v2_only_by_explicit_flag(self) -> None:
+        backend_output = self.root_dir / "backend" / "output"
+        _write_csv(backend_output / "dashboard_ready_latest.csv", ["processo"], [{"processo": "legacy"}])
+        _write_csv(
+            backend_output / "dashboard_ready_v2_latest.csv",
+            ["processo", "v2_primary_document_identity", "v2_parceiro_resolution"],
+            [{
+                "processo": "v2",
+                "v2_primary_document_identity": '{"document_id":"123"}',
+                "v2_parceiro_resolution": '{"rule_id":"dashboard.field_resolution.parceiro.v1","conflicts":[]}',
+            }],
+        )
+
+        legacy = load_dashboard_bundle(self.root_dir)
+        v2 = load_dashboard_bundle(self.root_dir, use_v2=True)
+        self.assertEqual(legacy["dashboard_contract"], "legacy")
+        self.assertEqual(legacy["overview"].iloc[0]["processo"], "legacy")
+        self.assertEqual(v2["dashboard_contract"], "v2")
+        self.assertEqual(v2["overview"].iloc[0]["processo"], "v2")
+        self.assertIn("rule_id", v2["overview"].iloc[0]["v2_parceiro_resolution"])
+
     def test_classify_deadline_uses_project_thresholds(self) -> None:
         today = date(2026, 1, 1)
 
