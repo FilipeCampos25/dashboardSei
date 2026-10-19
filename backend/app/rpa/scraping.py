@@ -33,6 +33,7 @@ from app.documents.common import (
     sanitize_snapshot,
 )
 from app.documents.document_utils import should_skip_candidate
+from app.services.candidate_inventory import describe_candidate_relation
 from app.documents.ted import build_ted_document_type
 from app.documents.types import DocumentTypeSpec
 from app.integrations.transferegov_client import consultar_ted, normalize_processo_sei
@@ -2302,7 +2303,7 @@ class SEIScraper:
                         continue
                     normalized = self._normalize_text(raw_text)
                     score, matched_terms = self._score_tree_candidate(document_type, raw_text)
-                    if score <= 0:
+                    if not matched_terms:
                         continue
                     detail = {
                         "text": raw_text,
@@ -2310,6 +2311,7 @@ class SEIScraper:
                         "score": score,
                         "matched_terms": matched_terms,
                     }
+                    detail.update(describe_candidate_relation(raw_text))
                     try:
                         source_url = str(elem.get_attribute("href") or "").strip()
                     except WebDriverException:
