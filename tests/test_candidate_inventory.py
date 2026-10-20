@@ -12,6 +12,7 @@ if str(BACKEND_DIR) not in sys.path:
 
 from app.documents.types import DocumentTypeSpec  # noqa: E402
 from app.rpa import scraping  # noqa: E402
+from app.services.candidate_inventory import prioritize_candidates  # noqa: E402
 
 
 SPEC = DocumentTypeSpec(
@@ -27,6 +28,25 @@ SPEC = DocumentTypeSpec(
 
 
 class CandidateInventoryTests(unittest.TestCase):
+    def test_selective_plan_prioritizes_opening_and_preserves_complements(self) -> None:
+        inventory = [
+            {"text": "Publicacao do ACT 1/2026", "score": 90},
+            {"text": "ACT 1/2026", "score": 40},
+            {"text": "Anexo do ACT 1/2026", "score": 80},
+        ]
+
+        plan = prioritize_candidates(inventory)
+
+        self.assertEqual([item["text"] for item in plan], [
+            "ACT 1/2026",
+            "Publicacao do ACT 1/2026",
+            "Anexo do ACT 1/2026",
+        ])
+        self.assertEqual(plan[0]["extraction_decision"], "open_and_extract")
+        self.assertEqual(plan[0]["extraction_priority"], 1)
+        self.assertTrue(all(item["extraction_decision"] == "retain_without_extraction" for item in plan[1:]))
+        self.assertTrue(all(item["extraction_priority"] is None for item in plan[1:]))
+
     def _scraper_for_scoring(self):
         scraper = scraping.SEIScraper.__new__(scraping.SEIScraper)
         scraper._normalize_text = scraping.SEIScraper._normalize_text.__get__(scraper, scraping.SEIScraper)

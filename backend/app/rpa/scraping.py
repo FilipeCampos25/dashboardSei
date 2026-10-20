@@ -33,7 +33,7 @@ from app.documents.common import (
     sanitize_snapshot,
 )
 from app.documents.document_utils import should_skip_candidate
-from app.services.candidate_inventory import describe_candidate_relation
+from app.services.candidate_inventory import describe_candidate_relation, prioritize_candidates
 from app.documents.ted import build_ted_document_type
 from app.documents.types import DocumentTypeSpec
 from app.integrations.transferegov_client import consultar_ted, normalize_processo_sei
@@ -2358,7 +2358,7 @@ class SEIScraper:
             self.performance_profiler.end_span(span_name)
 
     def _find_document_link_in_tree(self, document_type: DocumentTypeSpec) -> Optional[Tuple[Any, Dict[str, Any]]]:
-        candidates = self._find_document_candidates_in_tree(document_type)
+        candidates = prioritize_candidates(self._find_document_candidates_in_tree(document_type))
         if not candidates:
             return None
         link = self._locate_tree_link_by_text(
@@ -2450,7 +2450,8 @@ class SEIScraper:
         collected_valid_candidates = 0
         for attempt_index, candidate in enumerate(candidates, start=1):
             candidate_text = str(candidate.get("text", "") or "")
-            if self._should_skip_candidate_pre_open(candidate_text):
+            if not bool(candidate.get("eligible_for_opening", True)):
+                self._should_skip_candidate_pre_open(candidate_text)
                 self._log_related_candidate_skip(
                     processo,
                     document_type,
