@@ -178,7 +178,7 @@ Observacao: `backend/main.py` e `dashboard_streamlit.py` nao entram no Postman p
    - `parcerias_descontinuadas`
    - `ted`
 7. Para `PARCERIAS VIGENTES`, coleta a previa da grade e depois abre cada processo.
-8. Para cada processo, abre todas as pastas, usa `Pesquisar no Processo`, tenta aliases por tipo documental e faz fallback pela arvore quando necessario.
+8. Para cada processo, abre todas as pastas e executa o modo produtivo `tree_only`, inventariando e priorizando links da arvore. Filtro/aliases permanecem legados e fora do loop principal.
 9. Extrai snapshot do documento: texto, tabelas, URL, titulo e modo de extracao.
 10. Classifica o snapshot e separa registros em camadas bronze/silver/gold.
 11. Normaliza PT, ACT, Memorando, TED e parcerias descontinuadas quando aplicavel.
@@ -288,7 +288,7 @@ Saidas principais:
 
 ### Termo de Execucao Descentralizada (TED)
 
-Busca TED no SEI e tambem consulta a API publica do Transferegov quando ha numero de instrumento.
+Busca TED pela arvore do SEI no modo produtivo `tree_only`. A integracao com a API publica do Transferegov permanece dormente e nao e chamada pelo loop principal.
 
 Campos principais:
 

@@ -155,10 +155,10 @@ Para cada processo do interno:
 1. abre o processo em nova aba/janela;
 2. aguarda pagina pronta;
 3. aciona `Abrir todas as Pastas`;
-4. abre `Pesquisar no Processo`;
+4. abre todas as pastas da arvore do processo;
 5. itera as familias documentais configuradas;
-6. para cada familia, tenta primeiro os aliases de filtro;
-7. consolida candidatos semanticamente validos ou, se necessario, usa fallback pela arvore;
+6. inventaria e prioriza os candidatos da arvore no modo produtivo `tree_only`;
+7. abre seletivamente candidatos elegiveis e preserva relacionados sem publicacao automatica;
 8. registra na silver os casos `not_found`, `extraction_failure`, `minuta` ou `related_but_not_canonical`.
 
 ### 6. Extracao e classificacao de documento

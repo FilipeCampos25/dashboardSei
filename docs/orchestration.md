@@ -24,9 +24,9 @@ O backend executa uma rodada multi-documento no SEI e gera artefatos em camadas 
    - gera a previa de `PARCERIAS VIGENTES`, quando aplicavel;
    - lista os processos;
    - abre cada processo;
-   - abre `Pesquisar no Processo`;
+   - abre todas as pastas da arvore do processo;
    - tenta localizar, nesta ordem, os tipos documentais configurados;
-   - itera candidatos do filtro por alias e, se necessario, faz fallback para a arvore;
+   - inventaria, prioriza e abre seletivamente candidatos da arvore em `tree_only`;
    - extrai snapshot do documento;
    - classifica semanticamente o snapshot;
    - salva JSON bruto e registra o resultado em silver ou gold.
