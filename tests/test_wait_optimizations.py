@@ -595,6 +595,48 @@ def make_document_type(key: str, display_name: str) -> DocumentTypeSpec:
 
 
 class WaitOptimizationTests(unittest.TestCase):
+    def test_conditional_wait_benchmark_preserves_results_and_reduces_simulated_wait(self) -> None:
+        legacy_fixed_wait_seconds = 2.0
+
+        overlay_clock = FakeClock()
+        overlay_scraper = scraping.SEIScraper.__new__(scraping.SEIScraper)
+        overlay_scraper.driver = DelayedOverlayDriver(overlay_clock, visible_until=0.2)
+        with patch("app.rpa.scraping.WebDriverWait", FakeConditionalWait), patch(
+            "app.rpa.scraping.profiler_sleep"
+        ) as overlay_fallback:
+            overlay_cleared = scraping.SEIScraper._wait_for_overlay_to_clear(
+                overlay_scraper,
+                timeout_seconds=1.0,
+            )
+
+        window_clock = FakeClock()
+        window_scraper = scraping.SEIScraper.__new__(scraping.SEIScraper)
+        window_scraper.driver = DelayedWindowDriver(window_clock, open_at=0.2)
+        window_scraper.logger = DummyLogger()
+        with patch("app.rpa.scraping.WebDriverWait", FakeConditionalWait), patch(
+            "app.rpa.scraping.profiler_sleep"
+        ) as window_fallback:
+            opened_handle = scraping.SEIScraper._switch_to_newly_opened_window(
+                window_scraper,
+                handles_before={"main"},
+                reason="benchmark",
+                timeout_seconds=1,
+            )
+
+        optimized_wait_seconds = overlay_clock.time() + window_clock.time()
+
+        self.assertTrue(overlay_cleared)
+        self.assertEqual(opened_handle, "doc")
+        self.assertEqual(window_scraper.driver.current_window_handle, "doc")
+        self.assertAlmostEqual(optimized_wait_seconds, 0.4, places=6)
+        self.assertLess(optimized_wait_seconds, legacy_fixed_wait_seconds)
+        self.assertGreaterEqual(
+            1.0 - (optimized_wait_seconds / legacy_fixed_wait_seconds),
+            0.8,
+        )
+        overlay_fallback.assert_not_called()
+        window_fallback.assert_not_called()
+
     def test_click_optional_popup_returns_immediately_when_absent(self) -> None:
         clock = FakeClock()
         driver = PopupDriver(elements=[])
