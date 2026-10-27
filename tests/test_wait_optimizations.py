@@ -595,6 +595,30 @@ def make_document_type(key: str, display_name: str) -> DocumentTypeSpec:
 
 
 class WaitOptimizationTests(unittest.TestCase):
+    def test_legacy_pt_wrappers_warn_and_delegate_to_generic_paths(self) -> None:
+        scraper = scraping.SEIScraper.__new__(scraping.SEIScraper)
+        document_type = make_document_type("pt", "Plano de Trabalho")
+        scraper._get_document_type = Mock(return_value=document_type)
+        scraper._find_document_link_in_tree = Mock(return_value=("tree-link", {"candidate_id": "pt-1"}))
+        scraper._open_document_via_tree = Mock(return_value=True)
+        scraper._buscar_e_abrir_documento_mais_recente = Mock(return_value=True)
+
+        with self.assertWarnsRegex(DeprecationWarning, "_find_plano_trabalho_link_in_tree"):
+            link = scraping.SEIScraper._find_plano_trabalho_link_in_tree(scraper)
+        with self.assertWarnsRegex(DeprecationWarning, "_abrir_plano_trabalho_pela_arvore"):
+            opened = scraping.SEIScraper._abrir_plano_trabalho_pela_arvore(scraper, "P1")
+        with self.assertWarnsRegex(
+            DeprecationWarning,
+            "_buscar_e_abrir_plano_de_trabalho_mais_recente",
+        ):
+            scraping.SEIScraper._buscar_e_abrir_plano_de_trabalho_mais_recente(scraper, "P1")
+
+        self.assertEqual(link, "tree-link")
+        self.assertTrue(opened)
+        scraper._find_document_link_in_tree.assert_called_once_with(document_type)
+        scraper._open_document_via_tree.assert_called_once_with("P1", document_type)
+        scraper._buscar_e_abrir_documento_mais_recente.assert_called_once_with("P1", document_type)
+
     def test_conditional_wait_benchmark_preserves_results_and_reduces_simulated_wait(self) -> None:
         legacy_fixed_wait_seconds = 2.0
 

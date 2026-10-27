@@ -6,6 +6,7 @@ import re
 import sys
 import time
 import unicodedata
+import warnings
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -3069,7 +3070,19 @@ class SEIScraper:
             )
             return False
 
+    @staticmethod
+    def _warn_legacy_pt_wrapper(name: str, replacement: str) -> None:
+        warnings.warn(
+            f"{name} is deprecated; use {replacement}",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+
     def _find_plano_trabalho_link_in_tree(self) -> Optional[Any]:
+        self._warn_legacy_pt_wrapper(
+            "_find_plano_trabalho_link_in_tree",
+            "_find_document_link_in_tree(document_type)",
+        )
         document_type = self._get_document_type("pt")
         if document_type is None:
             return None
@@ -3079,12 +3092,20 @@ class SEIScraper:
         return tree_result[0]
 
     def _abrir_plano_trabalho_pela_arvore(self, processo: str) -> bool:
+        self._warn_legacy_pt_wrapper(
+            "_abrir_plano_trabalho_pela_arvore",
+            "_open_document_via_tree(processo, document_type)",
+        )
         document_type = self._get_document_type("pt")
         if document_type is None:
             return False
         return self._open_document_via_tree(processo, document_type)
 
     def _buscar_e_abrir_plano_de_trabalho_mais_recente(self, processo: str) -> None:
+        self._warn_legacy_pt_wrapper(
+            "_buscar_e_abrir_plano_de_trabalho_mais_recente",
+            "_buscar_e_abrir_documento_mais_recente(processo, document_type)",
+        )
         document_type = self._get_document_type("pt")
         if document_type is None:
             return
