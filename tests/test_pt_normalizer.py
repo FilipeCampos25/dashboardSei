@@ -814,11 +814,14 @@ class PTNormalizerTests(unittest.TestCase):
                 audit_rows = list(csv.DictReader(file_obj))
             with (output_dir / "pt_normalizado_latest.csv").open("r", encoding="utf-8-sig", newline="") as file_obj:
                 published_rows = list(csv.DictReader(file_obj))
+            canonical_bytes = (output_dir / "pt_normalizado_latest.csv").read_bytes()
+            compatibility_bytes = (output_dir / "pt_normalizado_completo_latest.csv").read_bytes()
         finally:
             shutil.rmtree(output_dir, ignore_errors=True)
 
         self.assertEqual(len(audit_rows), 2)
         self.assertEqual(len(published_rows), 1)
+        self.assertEqual(compatibility_bytes, canonical_bytes)
         self.assertEqual(published_rows[0]["documento"], "PT-FORTE")
         self.assertEqual(sum(row["publication_status"] == PUBLICATION_STATUS_GOLD for row in audit_rows), 1)
         strong_audit = next(row for row in audit_rows if row["documento"] == "PT-FORTE")

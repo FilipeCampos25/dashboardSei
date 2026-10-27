@@ -144,7 +144,7 @@ Comportamento importante:
 - os JSONs brutos sao a camada bronze;
 - os arquivos `*_status_execucao_latest.csv` e `pt_auditoria_latest.csv` sao a camada silver;
 - os arquivos `*_normalizado_latest.csv` sao a camada gold;
-- `pt_normalizado_completo_latest.csv` contem apenas os registros classificados como `completo_padronizado`.
+- `pt_normalizado_latest.csv` é o artefato PT canônico publicado; `pt_normalizado_completo_latest.csv` é um alias legado preservado como cópia byte a byte para consumidores compatíveis.
 
 ## Extracao de documento
 

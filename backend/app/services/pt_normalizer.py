@@ -3,6 +3,7 @@ from __future__ import annotations
 import calendar
 import json
 import re
+import shutil
 import unicodedata
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -1907,9 +1908,9 @@ def export_normalized_csv(output_dir: Path, logger: Any = None) -> Dict[str, Any
     published_rows = _select_published_pt_rows(records)
     csv_path = output_dir / "pt_normalizado_latest.csv"
     complete_path = output_dir / "pt_normalizado_completo_latest.csv"
-    # Ambos os arquivos publicam apenas o subconjunto gold; a dashboard deve consumir o export consolidado.
+    # O primeiro nome e canonico. O segundo permanece como alias legado byte a byte.
     csv_writer.write_csv(published_rows, csv_path, columns=columns)
-    csv_writer.write_csv(published_rows, complete_path, columns=columns)
+    shutil.copyfile(csv_path, complete_path)
     v2_path = None
     if settings.v2_dual_write:
         envelope = {

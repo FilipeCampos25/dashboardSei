@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import unittest
+import warnings
 import zipfile
 from io import BytesIO
 from pathlib import Path
@@ -74,6 +75,16 @@ class ReleasePackageTests(unittest.TestCase):
     def test_rejects_high_confidence_secret_content(self) -> None:
         with self.assertRaises(ReleasePackageError):
             validate_release_package(archive_with({"backend/settings.ini": "SERVICE_TOKEN=real-value\n"}))
+
+    def test_rejects_duplicate_archive_member(self) -> None:
+        buffer = archive_with()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            with zipfile.ZipFile(buffer, "a") as archive:
+                archive.writestr("README.md", "duplicate\n")
+        buffer.seek(0)
+        with self.assertRaisesRegex(ReleasePackageError, "duplicate archive member"):
+            validate_release_package(buffer)
 
     def test_rejects_missing_required_member(self) -> None:
         buffer = BytesIO()
