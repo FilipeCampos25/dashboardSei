@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import importlib
+import io
 import sys
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
@@ -9,11 +12,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 from app.documents.act import build_act_document_type
 from app.documents.document_utils import should_skip_candidate
 from app.documents.memorando import build_memorando_document_type
+from app.documents import registry
 from app.documents.registry import resolve_document_types
 from app.documents.ted import build_ted_document_type
 
 
 class DocumentTypesTests(unittest.TestCase):
+    def test_registry_reload_is_silent_on_stdout(self) -> None:
+        captured = io.StringIO()
+        with redirect_stdout(captured):
+            importlib.reload(registry)
+        self.assertEqual(captured.getvalue(), "")
+
     def test_default_document_type_is_pt(self) -> None:
         specs = resolve_document_types(None)
         self.assertEqual([spec.key for spec in specs], ["pt"])

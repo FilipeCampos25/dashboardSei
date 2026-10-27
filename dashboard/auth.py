@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 import hashlib
 import secrets
 import sqlite3
-from typing import Any
+from typing import Any, Iterator
 
 
 AUTH_DB_RELATIVE_PATH = Path("backend") / "data" / "dashboard_auth.db"
@@ -15,11 +16,16 @@ def get_auth_db_path(root_dir: Path) -> Path:
     return root_dir / AUTH_DB_RELATIVE_PATH
 
 
-def _get_auth_connection(db_path: Path) -> sqlite3.Connection:
+@contextmanager
+def _get_auth_connection(db_path: Path) -> Iterator[sqlite3.Connection]:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
-    return conn
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
 
 
 def init_auth_db(db_path: Path) -> None:

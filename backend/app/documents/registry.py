@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import inspect
 from typing import Any, Dict, List
 
 from app.documents.act import build_act_document_type
@@ -8,9 +7,6 @@ from app.documents.memorando import build_memorando_document_type
 from app.documents.pt import build_pt_document_type
 from app.documents.ted import build_ted_document_type
 from app.documents.types import DocumentTypeSpec
-
-print("DEBUG registry loaded from:", inspect.getfile(inspect.currentframe()))
-
 
 def _build_registry() -> Dict[str, DocumentTypeSpec]:
     act = build_act_document_type()

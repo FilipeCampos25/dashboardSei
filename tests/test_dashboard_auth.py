@@ -9,7 +9,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from dashboard.auth import authenticate_user, count_users, create_user, init_auth_db
+from dashboard.auth import _get_auth_connection, authenticate_user, count_users, create_user, init_auth_db
 
 
 class DashboardAuthTests(unittest.TestCase):
@@ -54,6 +54,13 @@ class DashboardAuthTests(unittest.TestCase):
         self.assertTrue(first)
         self.assertFalse(second)
         self.assertEqual(count_users(self.db_path), 1)
+
+    def test_auth_connection_is_closed_after_context(self) -> None:
+        with _get_auth_connection(self.db_path) as conn:
+            self.assertEqual(conn.execute("SELECT 1").fetchone()[0], 1)
+
+        with self.assertRaises(sqlite3.ProgrammingError):
+            conn.execute("SELECT 1")
 
 
 if __name__ == "__main__":
