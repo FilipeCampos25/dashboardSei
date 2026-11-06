@@ -345,6 +345,18 @@ class SEIScraper:
                 self.descricao_match_mode,
             )
             self.descricao_match_mode = "contains"
+        self.logger.info(
+            "Filtros de descricao carregados: %s; modo=%s.",
+            self.descricoes_busca or "(nenhum)",
+            self.descricao_match_mode,
+        )
+        generic_filters = [target for target in self.descricoes_busca if len(target) < 3]
+        if generic_filters:
+            self.logger.warning(
+                "Filtros de descricao excessivamente genericos: %s. "
+                "A selecao respeitara a configuracao, mas pode abranger blocos indesejados.",
+                generic_filters,
+            )
 
     def _prepare_output_dir_for_run(self) -> None:
         published_dir = self._resolve_published_output_dir()
@@ -3342,7 +3354,14 @@ class SEIScraper:
     def _parse_descricoes_busca(self, raw_value: str | None) -> List[str]:
         if not raw_value:
             return []
-        return [part for part in (self._normalize_text(x) for x in raw_value.split("|")) if part]
+        parsed: List[str] = []
+        seen: Set[str] = set()
+        for part in (self._normalize_text(x) for x in raw_value.split("|")):
+            if not part or part in seen:
+                continue
+            seen.add(part)
+            parsed.append(part)
+        return parsed
 
     def _descricao_match(self, descricao_normalizada: str, alvo_normalizado: str) -> bool:
         if self.descricao_match_mode == "equals":
@@ -3354,21 +3373,34 @@ class SEIScraper:
         if not descricao_normalizada:
             return None
 
-        for profile in INTERNAL_BLOCK_PROFILES:
-            if not profile.enabled:
-                continue
+        profiles_by_key = {profile.key: profile for profile in INTERNAL_BLOCK_PROFILES if profile.enabled}
+        profile_key: str | None = None
+        reason = "descricao nao corresponde a uma regra explicita"
+        if descricao_normalizada == "PARCERIAS VIGENTES":
+            profile_key = "parcerias_vigentes"
+            reason = "descricao normalizada exata"
+        elif descricao_normalizada == "PARCERIAS DESCONTINUADAS / NAO REALIZADAS":
+            profile_key = "parcerias_descontinuadas"
+            reason = "descricao normalizada exata"
+        elif descricao_normalizada.startswith("TERMO DE EXECUCAO DESCENTRALIZADA"):
+            profile_key = "ted"
+            reason = "prefixo documental explicito TERMO DE EXECUCAO DESCENTRALIZADA"
 
-            for pattern in profile.description_patterns:
-                pattern_normalizado = self._normalize_text(pattern)
-                if pattern_normalizado and pattern_normalizado in descricao_normalizada:
-                    self.logger.debug(
-                        "Resolved internal block profile '%s' for descricao='%s'.",
-                        profile.key,
-                        descricao,
-                    )
-                    return profile
+        profile = profiles_by_key.get(profile_key) if profile_key else None
+        if profile is not None:
+            self.logger.info(
+                "Classificacao de bloco: descricao='%s' profile=%s justificativa='%s'.",
+                descricao,
+                profile.key,
+                reason,
+            )
+            return profile
 
-        self.logger.debug("No internal block profile matched descricao='%s'.", descricao)
+        self.logger.info(
+            "Classificacao de bloco: descricao='%s' profile=(nenhum) justificativa='%s'.",
+            descricao,
+            reason,
+        )
         return None
 
     def _is_valid_descricao_candidate(self, text: str, numero_normalizado: str) -> bool:
@@ -3631,6 +3663,17 @@ class SEIScraper:
             self.logger.warning("Houve match contabilizado, mas nenhum item selecionavel.")
             return []
 
+        self.logger.info("Blocos internos unicos selecionados: %d", len(selected_items))
+        for item, target, _ in selected_items:
+            profile = self._resolve_internal_block_profile(item.descricao)
+            self.logger.info(
+                "Bloco selecionado: numero=%s descricao='%s' filtro='%s' profile=%s.",
+                item.numero_interno,
+                item.descricao,
+                target,
+                profile.key if profile else "(nenhum)",
+            )
+
         return selected_items
 
     def _click_selected_interno(
@@ -3730,8 +3773,13 @@ class SEIScraper:
 
     # Preview (PARCERIAS VIGENTES)
     def _should_collect_preview_for_current_descricao(self, descricao_atual: str) -> bool:
-        descricao_norm = self._normalize_text(descricao_atual)
-        return descricao_norm == "PARCERIAS VIGENTES"
+        profile = self._resolve_internal_block_profile(descricao_atual)
+        return bool(
+            profile
+            and profile.key == "parcerias_vigentes"
+            and profile.collect_preview
+            and profile.preview_strategy == "parcerias_vigentes"
+        )
 
     def _clean_text_value(self, value: str) -> str:
         return " ".join((value or "").replace("\xa0", " ").split()).strip()

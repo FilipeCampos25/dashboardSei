@@ -93,6 +93,16 @@ class InternalBlockProfileResolutionTests(unittest.TestCase):
         self.assertIsNotNone(profile)
         self.assertEqual(profile.key, "ted")
 
+    def test_compound_ted_description_does_not_resolve_as_parcerias(self) -> None:
+        scraper = self._make_scraper()
+
+        profile = scraper._resolve_internal_block_profile(
+            "Termo de Execução Descentralizada e Outras Parcerias Vigentes com Transferência de Recursos"
+        )
+
+        self.assertIsNotNone(profile)
+        self.assertEqual(profile.key, "ted")
+
     def test_ted_resolves_profile_without_accent(self) -> None:
         scraper = self._make_scraper()
 
@@ -107,6 +117,94 @@ class InternalBlockProfileResolutionTests(unittest.TestCase):
         profile = scraper._resolve_internal_block_profile("BLOCO INTERNO DESCONHECIDO")
 
         self.assertIsNone(profile)
+
+    def test_preview_is_allowed_only_for_parcerias_vigentes_profile(self) -> None:
+        scraper = self._make_scraper()
+
+        self.assertTrue(scraper._should_collect_preview_for_current_descricao("PARCERIAS VIGENTES"))
+        self.assertFalse(
+            scraper._should_collect_preview_for_current_descricao(
+                "Termo de Execução Descentralizada e Outras Parcerias Vigentes com Transferência de Recursos"
+            )
+        )
+
+
+class InternalBlockSelectionTests(unittest.TestCase):
+    def _make_scraper(self, mode: str, filters: str) -> scraping.SEIScraper:
+        scraper = scraping.SEIScraper.__new__(scraping.SEIScraper)
+        scraper.logger = Mock()
+        scraper.descricao_match_mode = mode
+        scraper.descricoes_busca = scraper._parse_descricoes_busca(filters)
+        scraper.driver = Mock(current_url="https://sei.example.local/lista")
+        scraper._collect_interno_rows_with_pagination = Mock(
+            return_value=[
+                scraping.InternoRow(
+                    numero_interno="274752",
+                    descricao="PARCERIAS VIGENTES",
+                    descricao_normalizada="PARCERIAS VIGENTES",
+                    link=None,
+                    page=1,
+                    row_index=1,
+                ),
+                scraping.InternoRow(
+                    numero_interno="675007",
+                    descricao="Termo de Execução Descentralizada e Outras Parcerias Vigentes com Transferência de Recursos",
+                    descricao_normalizada=(
+                        "TERMO DE EXECUCAO DESCENTRALIZADA E OUTRAS PARCERIAS VIGENTES "
+                        "COM TRANSFERENCIA DE RECURSOS"
+                    ),
+                    link=None,
+                    page=1,
+                    row_index=2,
+                ),
+            ]
+        )
+        return scraper
+
+    def test_equals_selects_only_exact_parcerias_block(self) -> None:
+        scraper = self._make_scraper("equals", "PARCERIAS VIGENTES")
+
+        selected = scraper._select_guided_internos_by_descricao()
+
+        self.assertEqual([item.numero_interno for item, _, _ in selected], ["274752"])
+
+    def test_contains_selects_both_but_keeps_distinct_profiles(self) -> None:
+        scraper = self._make_scraper("contains", "PARCERIAS VIGENTES")
+
+        selected = scraper._select_guided_internos_by_descricao()
+
+        self.assertEqual([item.numero_interno for item, _, _ in selected], ["274752", "675007"])
+        self.assertEqual(
+            [scraper._resolve_internal_block_profile(item.descricao).key for item, _, _ in selected],
+            ["parcerias_vigentes", "ted"],
+        )
+
+    def test_repeated_filters_do_not_duplicate_selected_block(self) -> None:
+        scraper = self._make_scraper("contains", "X|X|X")
+        scraper._collect_interno_rows_with_pagination.return_value = [
+            scraping.InternoRow("1", "BLOCO X", "BLOCO X", None, 1, 1)
+        ]
+
+        selected = scraper._select_guided_internos_by_descricao()
+
+        self.assertEqual(scraper.descricoes_busca, ["X"])
+        self.assertEqual(len(selected), 1)
+
+
+class ParceriasVigentesAnnotationParserTests(unittest.TestCase):
+    def test_existing_parser_preserves_partner_term_and_object(self) -> None:
+        scraper = scraping.SEIScraper.__new__(scraping.SEIScraper)
+        scraper.logger = DummyLogger()
+
+        parsed = scraper._parse_preview_anotacoes(
+            "PARCEIRO: Instituto Exemplo\n"
+            "VIGÊNCIA: 01/01/2026 a 31/12/2026\n"
+            "OBJETO: Cooperação institucional para pesquisa aplicada"
+        )
+
+        self.assertEqual(parsed["parceiro"], "Instituto Exemplo")
+        self.assertEqual(parsed["vigencia"], "01/01/2026 a 31/12/2026")
+        self.assertEqual(parsed["objeto"], "Cooperação institucional para pesquisa aplicada")
 
 
 class InternalBlockProfileDocumentTypesTests(unittest.TestCase):
