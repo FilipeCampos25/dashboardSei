@@ -335,7 +335,7 @@ O dashboard:
 4. calcula vigencia com a regra centralizada apenas onde ha acompanhamento operacional de prazo;
 5. renderiza exatamente as tres categorias principais, sem total geral ou metricas misturadas.
 
-No universo de parcerias descontinuadas, o normalizador preserva `status_raw` e produz separadamente `status_calculado`, `status_categoria`, `status_evidencia` e `status_data_referencia`. Termo de encerramento identificado tem precedência sobre situação por data; uma data final anterior à referência gera `Vencido`, uma data igual ou posterior gera `Vigente` e a ausência de evidência suficiente gera `Indeterminado`. A data de referência vem do início da execução e é persistida no CSV normalizado.
+No universo de parcerias descontinuadas, o normalizador preserva `status_raw` e produz separadamente `status_calculado`, `status_categoria`, `status_evidencia` e `status_data_referencia`. O contrato aditivo `status_final_v2` considera a própria origem “Parcerias Descontinuadas / Não Realizadas” como evidência de que o instrumento não está ativo: termo identificado tem precedência para `Encerrado`, seguido de status explícito de não realização, status explícito de encerramento e prazo vencido; sem causa conclusiva, o resultado é `Indeterminado`, nunca `Vigente`. `status_final_justificativa` registra a regra aplicada e qualquer divergência entre os status normalizado e calculado. Os campos legados permanecem inalterados. A data de referência vem do início da execução e é persistida no CSV normalizado.
 
 Se uma fonte nao existir ou estiver vazia, a dashboard mostra estado vazio e cobertura, sem dados de exemplo.
 

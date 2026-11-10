@@ -12,6 +12,7 @@ from app.services.parcerias_descontinuadas_normalizer import (  # noqa: E402
     NORMALIZED_COLUMNS,
     build_normalized_record,
     export_normalized_csv,
+    normalize_rows,
 )
 
 
@@ -47,6 +48,8 @@ class ParceriasDescontinuadasNormalizerTests(unittest.TestCase):
         self.assertEqual(record["data_assinatura"], "01/02/2020")
         self.assertEqual(record["data_vencimento"], "01/02/2025")
         self.assertEqual(record["status_normalizado"], "Nao Realizado")
+        self.assertEqual(record["status_final_v2"], "Nao Realizado")
+        self.assertEqual(record["status_final_justificativa"], "status_raw_nao_realizado")
         self.assertEqual(record["status_categoria"], "nao_realizado")
         self.assertEqual(record["normalization_status"], "completo")
 
@@ -130,6 +133,8 @@ class ParceriasDescontinuadasNormalizerTests(unittest.TestCase):
         self.assertEqual(record["status_raw"], "")
         self.assertEqual(record["status_normalizado"], "")
         self.assertEqual(record["status_calculado"], "Encerrado")
+        self.assertEqual(record["status_final_v2"], "Encerrado")
+        self.assertEqual(record["status_final_justificativa"], "termo_encerramento_identificado")
         self.assertEqual(record["status_categoria"], "encerrado")
         self.assertEqual(record["status_evidencia"], "termo_encerramento_identificado")
         self.assertEqual(record["numero_termo_encerramento"], "3/2025")
@@ -224,6 +229,49 @@ class ParceriasDescontinuadasNormalizerTests(unittest.TestCase):
                 self.assertEqual(record["status_calculado"], calculated)
                 self.assertEqual(record["status_categoria"], category)
                 self.assertEqual(record["status_data_referencia"], "2026-01-01")
+
+    def test_final_v2_never_promotes_discontinued_source_to_active(self) -> None:
+        record = build_normalized_record(
+            {
+                "processo": "60090.000000/2020-00",
+                "anotacoes": (
+                    "TIPO: ACT\nPARCEIRO: Parceiro\nOBJETO: Objeto\n"
+                    "STATUS: Vigente\nDATA DE VENCIMENTO: 02/01/2026"
+                ),
+            },
+            reference_date=date(2026, 1, 1),
+        )
+
+        self.assertEqual(record["status_calculado"], "Vigente")
+        self.assertEqual(record["status_final_v2"], "Indeterminado")
+        self.assertEqual(
+            record["status_final_justificativa"],
+            "origem_descontinuadas_sem_motivo_conclusivo;"
+            "status_ativo_incompativel_com_origem_descontinuadas",
+        )
+
+    def test_approved_precedence_adjudicates_all_21_baseline_conflicts(self) -> None:
+        source_path = Path(__file__).resolve().parents[1] / "backend" / "output" / "parcerias_descontinuadas_latest.csv"
+        with source_path.open("r", encoding="utf-8-sig", newline="") as file_obj:
+            rows = list(csv.DictReader(file_obj))
+
+        normalized = normalize_rows(rows, reference_date=date(2026, 8, 5))
+        conflicts = [
+            row
+            for row in normalized
+            if row["status_normalizado"]
+            and row["status_calculado"]
+            and row["status_normalizado"].casefold() != row["status_calculado"].casefold()
+        ]
+
+        self.assertEqual(len(conflicts), 21)
+        self.assertEqual({row["status_final_v2"] for row in conflicts}, {"Encerrado"})
+        self.assertTrue(
+            all(
+                "divergencia_status_normalizado_calculado" in row["status_final_justificativa"]
+                for row in conflicts
+            )
+        )
 
     def test_free_encerramento_text_and_unidentified_term_are_insufficient(self) -> None:
         for annotation in (

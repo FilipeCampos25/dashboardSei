@@ -36,6 +36,8 @@ NORMALIZED_COLUMNS = [
     "status_raw",
     "status_normalizado",
     "status_calculado",
+    "status_final_v2",
+    "status_final_justificativa",
     "status_categoria",
     "status_evidencia",
     "status_data_referencia",
@@ -263,7 +265,7 @@ def _normalized_raw_status(raw: str) -> str:
 
 def _status_from_record(
     record: Dict[str, str], reference_date: date
-) -> tuple[str, str, str, str, str]:
+) -> tuple[str, str, str, str, str, str, str]:
     raw = _clean_spaces(record.get("status_raw"))
     key = _normalize_status_key(raw)
     normalized = _normalized_raw_status(raw)
@@ -301,7 +303,30 @@ def _status_from_record(
     else:
         calculated, category = "Indeterminado", "indeterminado"
 
-    return raw, normalized, calculated, category, ";".join(evidence)
+    if has_term:
+        final_v2 = "Encerrado"
+        final_reason = "termo_encerramento_identificado"
+    elif _is_not_realized_status(key):
+        final_v2 = "Nao Realizado"
+        final_reason = "status_raw_nao_realizado"
+    elif key in {"ENCERRADO", "ENCERRADA"} or key.startswith("ENCERRADO PELA"):
+        final_v2 = "Encerrado"
+        final_reason = "status_raw_encerrado"
+    elif not pd.isna(parsed_end) and parsed_end.date() < reference_date:
+        final_v2 = "Vencido"
+        final_reason = "data_final_anterior_referencia"
+    else:
+        final_v2 = "Indeterminado"
+        final_reason = "origem_descontinuadas_sem_motivo_conclusivo"
+
+    if normalized and calculated and normalized.casefold() != calculated.casefold():
+        final_reason += ";divergencia_status_normalizado_calculado"
+    if final_v2 != "Vigente" and any(
+        status.casefold() == "vigente" for status in (normalized, calculated) if status
+    ):
+        final_reason += ";status_ativo_incompativel_com_origem_descontinuadas"
+
+    return raw, normalized, calculated, final_v2, final_reason, category, ";".join(evidence)
 
 
 def build_normalized_record(
@@ -316,12 +341,20 @@ def build_normalized_record(
     if not record.get("numero_termo_encerramento") and record.get("termo_encerramento_raw"):
         record["numero_termo_encerramento"] = _extract_termo_number(record["termo_encerramento_raw"])
 
-    status_raw, status_normalizado, status_calculado, status_categoria, status_evidencia = _status_from_record(
-        record, resolved_reference
-    )
+    (
+        status_raw,
+        status_normalizado,
+        status_calculado,
+        status_final_v2,
+        status_final_justificativa,
+        status_categoria,
+        status_evidencia,
+    ) = _status_from_record(record, resolved_reference)
     record["status_raw"] = status_raw
     record["status_normalizado"] = status_normalizado
     record["status_calculado"] = status_calculado
+    record["status_final_v2"] = status_final_v2
+    record["status_final_justificativa"] = status_final_justificativa
     record["status_categoria"] = status_categoria
     record["status_evidencia"] = status_evidencia
     record["status_data_referencia"] = resolved_reference.isoformat()
@@ -348,6 +381,8 @@ def build_descontinuada_v2_record(row: Dict[str, Any], record: Dict[str, str]) -
         "numero_termo_encerramento": "descontinuadas.termo.number",
         "status_normalizado": "descontinuadas.status.normalize_legacy",
         "status_calculado": "descontinuadas.status.calculate_legacy",
+        "status_final_v2": "descontinuadas.status.adjudicate_v2",
+        "status_final_justificativa": "descontinuadas.status.adjudicate_v2",
         "status_categoria": "descontinuadas.status.category_legacy",
         "status_evidencia": "descontinuadas.status.evidence_codes",
         "status_data_referencia": "descontinuadas.status.reference_date",
@@ -368,7 +403,14 @@ def build_descontinuada_v2_record(row: Dict[str, Any], record: Dict[str, str]) -
             derived = field_name in derived_rules
             if field_name == "numero_termo_encerramento" and "termo_encerramento_raw" in annotation_fields:
                 raw = annotation_fields["termo_encerramento_raw"]["raw"]
-            elif field_name in {"status_normalizado", "status_calculado", "status_categoria", "status_evidencia"}:
+            elif field_name in {
+                "status_normalizado",
+                "status_calculado",
+                "status_final_v2",
+                "status_final_justificativa",
+                "status_categoria",
+                "status_evidencia",
+            }:
                 raw = status_inputs
             else:
                 raw = annotation["raw"] if annotation else _clean_spaces(value)

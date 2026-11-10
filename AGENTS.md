@@ -317,7 +317,7 @@ Trate cada tarefa como uma unidade lógica rastreável.
 - Evite misturar mudanças independentes.
 - Não reescreva histórico publicado.
 - Não execute `git reset --hard`, force-push, exclusões destrutivas ou operações equivalentes sem autorização explícita.
-- Não faça commit ou push automaticamente salvo quando o prompt autorizar.
+- Não faça commit ou push automaticamente salvo quando o prompt autorizar. No modo AUTOPILOT, a autorização antecipada, explícita e vinculada ao repositório, branch e checklist permite commits locais individuais sem nova confirmação humana por item. Push não é abrangido.
 - Quando não houver autorização para commit, sugira uma mensagem de commit adequada no relatório final.
 
 Um commit deve representar uma unidade lógica compreensível e reversível.
@@ -336,8 +336,9 @@ Esta seção se aplica quando a tarefa estiver vinculada a uma checklist com IDs
 
 Quando uma tarefa possuir ID da checklist:
 
-- trabalhe somente no ID explicitamente autorizado pelo prompt;
-- não avance automaticamente para o próximo item;
+- no modo NORMAL, trabalhe somente no ID explicitamente autorizado pelo prompt;
+- no modo NORMAL, não avance automaticamente para o próximo item;
+- no modo AUTOPILOT autorizado, selecione um ID pendente e elegível por vez e avance ao próximo somente depois de confirmar o checkpoint e commit do atual;
 - não altere título, prioridade, dependências ou escopo do item sem autorização;
 - atualize somente os campos operacionais do item atual;
 - não marque outros itens como concluídos apenas porque foram parcialmente afetados.
@@ -390,7 +391,7 @@ Ao concluir:
 
 Por padrão, uma implementação termina em `IMPLEMENTED`.
 
-O agente pode promover o item diretamente para `VALIDATED` somente quando o prompt atual contiver autorização explícita para auto-validação e **todos** os seguintes critérios forem satisfeitos:
+O agente pode promover o item diretamente para `VALIDATED` somente quando o prompt atual contiver autorização explícita para auto-validação (inclusive autorização antecipada no modo AUTOPILOT) e **todos** os seguintes critérios forem satisfeitos:
 
 1. o diagnóstico foi confirmado;
 2. o critério de aceite do item foi satisfeito;
@@ -478,9 +479,39 @@ Quando possível, continue com trabalho seguro e isolado; bloqueie apenas a part
 
 ---
 
+## 19-A. Protocolo de execução AUTOPILOT (opt-in)
+
+O modo padrão é **NORMAL**. AUTOPILOT só é ativado mediante instrução explícita que identifique: repositório (raiz e origin conferidos), checklist oficial, branch exata, escopo (todos os itens pendentes elegíveis ou IDs determinados), permissões para validação técnica, atualização de progresso e **commits locais**, além de exclusões (push, merge, deploy, rede e produção). A autorização permanece válida apenas na execução e no escopo declarados; não é uma permissão global ou permanente.
+
+### Separação de responsabilidades
+
+- **Orquestrador:** descobre os IDs existentes, decide a ordem conforme dependências documentadas, controla estados/checkpoints, invoca o fluxo de um item por vez e encerra. Não inventa IDs nem altera critérios de aceite.
+- **Executor por item:** usa `safe-task-execution` ou procedimento equivalente para diagnóstico, mudança mínima, testes offline, revisão e handoff técnico. Subagentes podem investigar/revisar independentemente, mas não editar o mesmo conjunto de arquivos em paralelo.
+- **Runner:** persiste checkpoints e verifica branch/raiz Git, autorização, staging estrito, comando de commit, hash e reconciliação de retomada. Não confundir instrução de skill com mecanismo de enforcement.
+
+### Ciclo por item
+
+1. Leia a checklist e os registros oficiais; escolha o próximo ID **existente**, `TODO`/`READY`/elegível de acordo com as regras efetivas, respeitando dependências. Um item em `IMPLEMENTED` deve ser tratado segundo seus critérios de validação, não implementado novamente por padrão.
+2. Faça preflight: branch esperada, status e diff anteriores, dependências e critérios de aceite; detecte modificações do usuário que possam conflitar com o item. Se houver conflito, interrompa sem descartá-las.
+3. Registre `IN_PROGRESS` para o item atual quando o protocolo de progresso exigir. Implementação deve ser mínima, offline e dentro do escopo.
+4. Execute testes pertinentes e regressões exigidas, revise diff, segredos, artefatos protegidos, documentação e `git diff --check`. Falha material ou teste crítico impossível: não marque `VALIDATED` nem faça commit como conclusão bem-sucedida.
+5. Com critérios comprovados e autorização de autovalidação, atualize apenas os campos oficiais do item para `VALIDATED`, incluindo evidências. Se a atualização e o commit precisarem conter um hash, registre-o de modo consistente sem reescrever histórico ou introduzir ciclos autorreferentes.
+6. Faça staging apenas de caminhos/hunks comprovadamente pertencentes ao item e aos seus registros oficiais, sem `git add .` ou `git add -A`. Verifique `git diff --cached` e ausência de alterações preexistentes não autorizadas. Crie **um commit local por item** na branch aprovada; registre seu hash no checkpoint. Se a regra local exigir separar alteração de estado e commit, use a convenção existente sem falsificar hashes.
+7. Confirme commit, branch e estado do worktree, reconcilie checkpoint/controle; só então selecione o próximo ID. Nunca repita commit de resultado incerto sem checar Git.
+
+### Encerramento e segurança
+
+- Conclusão: todos os IDs em escopo terminalmente validados/concluídos segundo a checklist; então pare, gere relatório agregado, não procure melhorias adicionais.
+- Bloqueio: item materialmente ambíguo, falha crítica, divergência Git/controle, mudança preexistente conflitante, exigência de aprovação técnica, ausência de permissão ou dependência indisponível: pare com checkpoint recuperável. Não contorne autorização nem pule itens para declarar conclusão falsa.
+- Sem push, merge, deploy, acesso ao SEI real, Selenium real, coleta real, requisição externa ou modificação de baselines. Qualquer aprovação de sandbox exigida permanece obrigatória; não mascarar comandos em wrappers para burlar regras.
+- **Revisão humana:** concentrada no fim para o lote concluído, mas a verificação técnica é obrigatória **antes de cada commit**. A revisão final não substitui testes por item.
+- Não prometemos execução ininterrupta só com `AGENTS.md`: continuidade entre sessões depende de runner real, persistência e permissões operacionais efetivas.
+
+---
+
 ## 20. Relatório final obrigatório
 
-Ao concluir uma tarefa de implementação, apresente de forma curta e objetiva:
+Ao concluir uma tarefa de implementação no modo NORMAL, apresente de forma curta e objetiva. No modo AUTOPILOT, registre evidências objetivas em checkpoints por item e apresente o relatório humano consolidado somente no encerramento ou bloqueio:
 
 ### Diagnóstico
 O que estava acontecendo e qual causa foi confirmada.
@@ -539,6 +570,6 @@ Não:
 - adicione dependências desnecessárias;
 - deixe logs ou debug temporários;
 - afirme que algo foi validado sem evidência;
-- avance automaticamente para outra tarefa sem autorização quando houver checklist rastreável.
+- avance automaticamente para outra tarefa sem autorização quando houver checklist rastreável; no modo AUTOPILOT, a autorização inicial da checklist inteira cobre o avanço sequencial elegível, mas não cobre itens inventados ou fora da checklist.
 
 **Código escrito não é automaticamente código validado.**

@@ -11,7 +11,9 @@
 #
 # Filosofia:
 # - FORBIDDEN: operacoes destrutivas que nao devem ser autonomas.
-# - PROMPT: operacoes legitimas, mas com efeito persistente, externo ou sensivel.
+# - PROMPT: operacoes legitimas, mas com efeito remoto, destrutivo ou sensivel.
+# - Commit local normal e Autopilot sao governados por AGENTS.md + runner.
+#   Sem regra para commit != aprovacao automatica de sandbox.
 # - Sem regra: leitura, testes, lint, build e investigacao local rotineira.
 
 # =============================================================================
@@ -82,18 +84,17 @@ prefix_rule(
 )
 
 # =============================================================================
-# 2. GIT — COMMIT E PUBLICACAO REMOTA
+# 2. GIT — COMMIT LOCAL E PUBLICACAO REMOTA
 # =============================================================================
 
-prefix_rule(
-    pattern = ["git", "commit"],
-    decision = "prompt",
-    justification = "Commit deve ser uma decisao explicita: confirme escopo, diff e testes antes de registrar historico.",
-    match = [
-        "git commit -m \"fix: corrigir validacao\"",
-        "git commit --amend",
-    ],
-)
+# Commits locais: intencionalmente sem prefix_rule para `git commit`.
+# Isso NAO autoriza commits por si: AGENTS.md exige AUTOPILOT explicitamente
+# autorizado, branch exata, testes, revisao do staged diff e um ID por commit.
+# Tampouco libera o comando se o sandbox/approval_policy pedir autorizacao.
+# Nao criar uma regra `allow` generica nem liberar powershell, python, cmd ou sh.
+# Formas de alterar/regravar historico, como `git commit --amend`, continuam
+# proibidas pela politica comportamental no AUTOPILOT; se necessario, adicione
+# verificacao real no runner, pois regra por prefixo `git commit` e ampla demais.
 
 # Bloqueia formas comuns de force-push quando a flag aparece logo apos `push`.
 # O `git push` generico abaixo continua exigindo confirmacao, cobrindo outras
